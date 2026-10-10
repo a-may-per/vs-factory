@@ -1,6 +1,6 @@
-// duel 战斗模拟器：确定性实时混战。
-// 输入：双方阵容配置 + 随机种子 → 输出：JSONL 事件日志。
-// 渲染器只吃事件日志回放，保证「配置 → 模拟 → 渲染」解耦、同种子可复现。
+// duel 战斗模拟器 v2：斗蛐蛐式交手节奏（突进贴近 → 交手 → 弹开 → 再接近）。
+// 暴击/吸血/狂暴/闪避全部走 proc 事件，渲染层做技能式演出。
+// 确定性：固定 tick + mulberry32 种子 → JSONL 事件日志，渲染器只回放。
 
 export type Side = "A" | "B";
 
@@ -13,15 +13,12 @@ export interface SkillDef {
   description: string;
 }
 
-export interface PassiveDef {
-  name: string;
-  description: string;
-}
+export interface PassiveDef { name: string; description: string }
 
 export interface FighterConfig {
   id: Side;
   name: string;
-  title: string;          // 称号，如「不眠血裔」
+  title: string;
   maxHp: number;
   attack: number;
   speed: number;          // 模拟坐标 px/s
@@ -46,6 +43,8 @@ export interface FighterState {
   actionTimer: number;
   rageStacks: number;
   alive: boolean;
+  kbVx: number; kbVy: number;   // 击退速度（指数衰减滑行）
+  recoverT: number;             // 交手后的恢复期（期间不追击不攻击）
 }
 
 export interface SimCtx { time: number; rng: () => number }
@@ -58,6 +57,7 @@ export type SimEvent =
   | { tick: number; t: number; type: "skill"; id: Side; name: string; x: number; y: number; fx: SkillDef["fx"] }
   | { tick: number; t: number; type: "heal"; id: Side; value: number; hp: number; text: string; x: number; y: number }
   | { tick: number; t: number; type: "buff"; id: Side; name: string; stacks: number }
+  | { tick: number; t: number; type: "proc"; id: Side; kind: "crit" | "lifesteal" | "rage" | "dodge"; name: string; x: number; y: number; tx?: number; ty?: number; stacks?: number }
   | { tick: number; t: number; type: "fuse"; text: string }
   | { tick: number; t: number; type: "death"; id: Side; x: number; y: number }
   | { tick: number; t: number; type: "end"; winner: Side; duration: number };
@@ -65,7 +65,7 @@ export type SimEvent =
 export const ARENA_W = 960, ARENA_H = 540;
 export const TICK_RATE = 60;
 const DT = 1 / TICK_RATE;
-const MOVE_EVERY = 4; // 每 4 tick 采样一次位置（15Hz，渲染端插值）
+const MOVE_EVERY = 2; // 30Hz 采样位置（击退滑行更平滑）
 
 function mulberry32(seed: number) {
   let s = seed >>> 0;
@@ -86,7 +86,7 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
   const mkState = (cfg: FighterConfig, x: number, y: number): FighterState => ({
     cfg, x, y, hp: cfg.maxHp, facing: x < ARENA_W / 2 ? 1 : -1,
     attackTimer: 0.8, skillCd: 2.5, action: "idle", actionTimer: 0,
-    rageStacks: 0, alive: true,
+    rageStacks: 0, alive: true, kbVx: 0, kbVy: 0, recoverT: 0,
   });
 
   const A = mkState(cfgA, ARENA_W * 0.24, ARENA_H * 0.58);
@@ -95,14 +95,23 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
   emit({ tick: 0, t: 0, type: "spawn", id: "A", name: cfgA.name, title: cfgA.title, x: A.x, y: A.y, color: cfgA.color, color2: cfgA.color2, passive: cfgA.passive.name, passiveDesc: cfgA.passive.description, activeName: cfgA.active.name });
   emit({ tick: 0, t: 0, type: "spawn", id: "B", name: cfgB.name, title: cfgB.title, x: B.x, y: B.y, color: cfgB.color, color2: cfgB.color2, passive: cfgB.passive.name, passiveDesc: cfgB.passive.description, activeName: cfgB.active.name });
 
-  /** 普攻；返回 true 表示战斗结束 */
+  /** 交手后弹开：受击方被击退，攻击方小幅后撤 */
+  function knockback(from: FighterState, to: FighterState, kbTo: number, kbFrom: number, recTo: number, recFrom: number) {
+    const dx = to.x - from.x, dy = to.y - from.y;
+    const d = Math.max(0.001, Math.hypot(dx, dy));
+    const ux = dx / d, uy = dy / d;
+    to.kbVx = ux * kbTo; to.kbVy = uy * kbTo; to.recoverT = recTo;
+    from.kbVx = -ux * kbFrom; from.kbVy = -uy * kbFrom; from.recoverT = recFrom;
+  }
+
   function tryAttack(from: FighterState, to: FighterState, id: Side, tid: Side): boolean {
     const dist = Math.hypot(to.x - from.x, to.y - from.y);
-    if (dist > from.cfg.attackRange || from.attackTimer > 0) return false;
+    if (dist > from.cfg.attackRange || from.attackTimer > 0 || from.recoverT > 0) return false;
     // evasive 风格 10% 闪避
     if (to.cfg.style === "evasive" && rng() < 0.10) {
-      emit({ tick: 0, t: time, type: "fuse", text: `${to.cfg.name} 闪避了攻击！` });
+      emit({ tick: 0, t: time, type: "proc", id: tid, kind: "dodge", name: "闪避", x: to.x, y: to.y });
       from.attackTimer = from.cfg.attackInterval * 0.5;
+      from.recoverT = 0.18;
       return false;
     }
     const roll = 0.9 + rng() * 0.2;                 // ±10% 确定性浮动
@@ -114,11 +123,12 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
     from.attackTimer = effectiveInterval(from);
     emit({ tick: 0, t: time, type: "attack", id, target: tid, x: from.x, y: from.y });
     emit({ tick: 0, t: time, type: "damage", id: tid, value: dmg, from: id, hp: Math.max(0, to.hp), crit, x: to.x, y: to.y });
-    // 吸血被动：造成伤害的 30% 转化治疗
+    if (crit) emit({ tick: 0, t: time, type: "proc", id, kind: "crit", name: "会心一击", x: to.x, y: to.y });
     if (from.cfg.passiveKind === "lifesteal") {
-      const heal = Math.round(dmg * 0.45);
+      const heal = Math.round(dmg * 0.3);
       from.hp = Math.min(from.cfg.maxHp, from.hp + heal);
       emit({ tick: 0, t: time, type: "heal", id, value: heal, hp: Math.round(from.hp), text: `吸血 +${heal}`, x: from.x, y: from.y });
+      if (heal >= 14) emit({ tick: 0, t: time, type: "proc", id, kind: "lifesteal", name: "鲜血汲取", x: from.x, y: from.y, tx: to.x, ty: to.y });
     }
     if (to.hp <= 0) {
       to.hp = 0; to.alive = false; to.action = "death";
@@ -126,24 +136,30 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
       emit({ tick: 0, t: time, type: "end", winner: id, duration: time });
       return true;
     }
+    knockback(from, to, crit ? 340 : 210, 90, 0.24, 0.34);
     return false;
   }
 
   function trySkill(from: FighterState, to: FighterState, id: Side, tid: Side): boolean {
     const sk = from.cfg.active;
     const dist = Math.hypot(to.x - from.x, to.y - from.y);
-    if (from.skillCd > 0 || dist > from.cfg.attackRange * sk.rangeMul) return false;
+    if (from.skillCd > 0 || from.recoverT > 0 || dist > from.cfg.attackRange * sk.rangeMul) return false;
     from.skillCd = sk.cooldown;
     from.action = "skill"; from.actionTimer = 0.45;
+    // 突进近身
+    const lungeDist = Math.max(40, from.cfg.attackRange * 0.7);
+    from.x = Math.min(ARENA_W - 60, Math.max(60, to.x - ((to.x - from.x) / dist) * lungeDist));
+    from.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, to.y - ((to.y - from.y) / dist) * lungeDist));
     emit({ tick: 0, t: time, type: "skill", id, name: sk.name, x: to.x, y: to.y, fx: sk.fx });
     const dmg = Math.max(1, Math.round(sk.damage));
     to.hp -= dmg;
     to.action = "hit"; to.actionTimer = 0.3;
     emit({ tick: 0, t: time, type: "damage", id: tid, value: dmg, from: id, hp: Math.max(0, to.hp), x: to.x, y: to.y });
     if (from.cfg.passiveKind === "lifesteal") {
-      const heal = Math.round(dmg * 0.45);
+      const heal = Math.round(dmg * 0.3);
       from.hp = Math.min(from.cfg.maxHp, from.hp + heal);
       emit({ tick: 0, t: time, type: "heal", id, value: heal, hp: Math.round(from.hp), text: `吸血 +${heal}`, x: from.x, y: from.y });
+      if (heal >= 14) emit({ tick: 0, t: time, type: "proc", id, kind: "lifesteal", name: "鲜血汲取", x: from.x, y: from.y, tx: to.x, ty: to.y });
     }
     if (to.hp <= 0) {
       to.hp = 0; to.alive = false; to.action = "death";
@@ -151,10 +167,11 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
       emit({ tick: 0, t: time, type: "end", winner: id, duration: time });
       return true;
     }
+    knockback(from, to, 300, 90, 0.26, 0.4);
     return false;
   }
 
-  /** 狂战士被动：生命每降 10%，攻速 +8%（上限 9 层） */
+  /** 狂战士被动：生命每降 10%，攻速 +8%（上限 9 层）；层数变化走 proc 演出 */
   function effectiveInterval(st: FighterState): number {
     if (st.cfg.passiveKind !== "rage") return st.cfg.attackInterval;
     const missing = 1 - st.hp / st.cfg.maxHp;
@@ -162,13 +179,14 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
     if (stacks !== st.rageStacks) {
       st.rageStacks = stacks;
       emit({ tick: 0, t: time, type: "buff", id: st.cfg.id, name: "狂暴", stacks });
+      if (stacks > 0) emit({ tick: 0, t: time, type: "proc", id: st.cfg.id, kind: "rage", name: "狂暴", x: st.x, y: st.y, stacks });
     }
     return st.cfg.attackInterval * (1 - 0.08 * stacks);
   }
 
-  function stepFighter(st: FighterState, foe: FighterState, ctx: SimCtx): boolean {
+  function stepFighter(st: FighterState, foe: FighterState): boolean {
     if (!st.alive) return false;
-    effectiveInterval(st); // 每步刷新狂暴层数
+    effectiveInterval(st);
     st.attackTimer -= DT;
     st.skillCd -= DT;
     st.actionTimer -= DT;
@@ -178,29 +196,24 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
     const dist = Math.max(0.001, Math.hypot(dx, dy));
     st.facing = dx >= 0 ? 1 : -1;
 
-    // 决策：技能 > 普攻 > 走位
+    // 交手恢复期：击退滑行，不追击不攻击
+    if (st.recoverT > 0) {
+      st.recoverT -= DT;
+      st.x = Math.min(ARENA_W - 60, Math.max(60, st.x + st.kbVx * DT));
+      st.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, st.y + st.kbVy * DT));
+      const decay = Math.exp(-5.5 * DT);
+      st.kbVx *= decay; st.kbVy *= decay;
+      return false;
+    }
+
+    // 决策：技能 > 普攻 > 突进接近
     if (trySkill(st, foe, st.cfg.id, foe.cfg.id)) return true;
     if (tryAttack(st, foe, st.cfg.id, foe.cfg.id)) return true;
 
-    // 走位
-    const desired = st.cfg.attackRange * 0.85;
-    let vx = 0, vy = 0;
-    const keepAway = st.cfg.style === "evasive" && st.skillCd > 1.2;
-    if (keepAway && dist < st.cfg.attackRange * 1.6) {
-      // 拉开 + 环绕
-      vx = (-dx / dist) * st.cfg.speed * 0.7 + (-dy / dist) * st.cfg.speed * 0.5 * st.facing;
-      vy = (-dy / dist) * st.cfg.speed * 0.7 + (dx / dist) * st.cfg.speed * 0.5 * st.facing;
-    } else if (dist > desired) {
-      const sp = st.cfg.speed;
-      vx = (dx / dist) * sp; vy = (dy / dist) * sp;
-    } else if (dist < desired * 0.6) {
-      vx = (-dx / dist) * st.cfg.speed * 0.5; vy = (-dy / dist) * st.cfg.speed * 0.5;
-    } else if (st.action === "idle") {
-      st.action = "walk";
-    }
-    if (vx !== 0 || vy !== 0) {
-      st.x = Math.min(ARENA_W - 60, Math.max(60, st.x + vx * DT));
-      st.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, st.y + vy * DT));
+    if (dist > st.cfg.attackRange * 0.9) {
+      const sp = st.cfg.speed * (dist > st.cfg.attackRange * 2 ? 1.35 : 1.0);
+      st.x = Math.min(ARENA_W - 60, Math.max(60, st.x + (dx / dist) * sp * DT));
+      st.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, st.y + (dy / dist) * sp * DT));
       if (st.action === "idle") st.action = "walk";
     }
     return false;
@@ -214,11 +227,8 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
       fuseAnnounced = true;
       emit({ tick, t: time, type: "fuse", text: "激战加时！伤害提升！" });
     }
-    const ctx: SimCtx = { time, rng };
-    if (stepFighter(A, B, ctx)) break;
-    if (stepFighter(B, A, ctx)) break;
-    // 加时保险丝：战斗临近上限时双方伤害递增（避免拖场）
-    if (!fuseAnnounced) { /* 已在上文处理 */ }
+    if (stepFighter(A, B)) break;
+    if (stepFighter(B, A)) break;
     if (tick % MOVE_EVERY === 0) {
       emit({ tick, t: time, type: "move", id: "A", x: Math.round(A.x), y: Math.round(A.y), facing: A.facing });
       emit({ tick, t: time, type: "move", id: "B", x: Math.round(B.x), y: Math.round(B.y), facing: B.facing });

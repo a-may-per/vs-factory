@@ -84,25 +84,56 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   writeWav(sfxPcm, sfxWav);
 
   // ---------- 伤害/治疗/技能特效列表（坐标来自事件本身）----------
-  interface Fx { t0: number; kind: "dmg" | "heal" | "skillring" | "dodge"; x: number; y: number; text: string; color: [number, number, number, number] }
+  interface Fx { t0: number; kind: "dmg" | "heal" | "skillring" | "banner" | "slash"; x: number; y: number; tx?: number; ty?: number; text: string; color: [number, number, number, number]; big?: boolean }
   const fxList: Fx[] = [];
   for (const ev of events) {
     if (ev.type === "damage") {
-      fxList.push({ t0: ev.t, kind: "dmg", x: ev.x, y: ev.y - 70, text: (ev.crit ? "暴击 " : "") + `-${ev.value}`, color: ev.crit ? [255, 220, 80, 255] : [255, 96, 84, 255] });
+      fxList.push({ t0: ev.t, kind: "dmg", x: ev.x, y: ev.y - 80, text: `-${ev.value}`, color: ev.crit ? [255, 220, 80, 255] : [255, 96, 84, 255], big: ev.crit });
     } else if (ev.type === "heal") {
-      fxList.push({ t0: ev.t, kind: "heal", x: ev.x, y: ev.y - 90, text: ev.text, color: [96, 230, 140, 255] });
+      fxList.push({ t0: ev.t, kind: "heal", x: ev.x, y: ev.y - 100, text: ev.text, color: [96, 230, 140, 255] });
     } else if (ev.type === "skill") {
       fxList.push({ t0: ev.t, kind: "skillring", x: ev.x, y: ev.y, text: ev.name, color: [255, 210, 90, 255] });
-    } else if (ev.type === "fuse" && ev.text.includes("闪避")) {
-      const who = ev.text.replace(" 闪避了攻击！", "");
-      const v = who === byId.A.name ? byId.A : byId.B;
-      // 闪避文本触发时不知道位置，用此时 mover 的最后位置 —— 简化：搜索其后第一个 move 事件
-      fxList.push({ t0: ev.t, kind: "dodge", x: v.x, y: v.y, text: "闪避!", color: [160, 220, 255, 255] });
+      fxList.push({ t0: ev.t, kind: "slash", x: ev.x, y: ev.y, text: "", color: [255, 240, 180, 255] });
+    } else if (ev.type === "proc") {
+      // 技能式横幅演出：招式名大字 + 光效
+      if (ev.kind === "crit") {
+        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: "会心一击！", color: [255, 226, 88, 255], big: true });
+      } else if (ev.kind === "lifesteal") {
+        // 吸血：从目标到自身的红色光珠
+        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: "鲜血汲取", color: [255, 80, 120, 255] });
+      } else if (ev.kind === "rage") {
+        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: `狂暴 ×${ev.stacks}`, color: [255, 130, 30, 255] });
+      } else if (ev.kind === "dodge") {
+        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: "闪避！", color: [150, 220, 255, 255] });
+      }
     }
+  }
+
+  // hit-stop（顿帧）与震屏时间轴：大事件时刻索引
+  const stops: { t: number; dur: number; shake: number }[] = [];
+  for (const ev of events) {
+    if (ev.type === "proc" && ev.kind === "crit") stops.push({ t: ev.t, dur: 0.14, shake: 14 });
+    else if (ev.type === "skill") stops.push({ t: ev.t, dur: 0.1, shake: 10 });
+    else if (ev.type === "proc" && ev.kind === "rage") stops.push({ t: ev.t, dur: 0.08, shake: 6 });
+    else if (ev.type === "death") stops.push({ t: ev.t, dur: 0.3, shake: 18 });
+  }
+  function hitStopAt(tb: number): { freeze: boolean; shake: number } {
+    for (const s of stops) {
+      if (tb >= s.t && tb < s.t + s.dur) return { freeze: true, shake: s.shake };
+      // 震屏在 hit-stop 后延续 0.25s
+      if (tb >= s.t + s.dur && tb < s.t + s.dur + 0.25) {
+        const k = 1 - (tb - s.t - s.dur) / 0.25;
+        return { freeze: false, shake: s.shake * k };
+      }
+    }
+    return { freeze: false, shake: 0 };
   }
 
   // ---------- 逐帧事件应用游标 ----------
   let evIdx = 0;
+  // 视觉位置（平滑追踪模拟位置，产生突进/弹开动画感）
+  const visX: Record<Side, number> = { A: byId.A?.x ?? 0, B: byId.B?.x ?? 0 };
+  const visY: Record<Side, number> = { A: byId.A?.y ?? 0, B: byId.B?.y ?? 0 };
   const applyEvent = (ev: SimEvent) => {
     if (ev.type === "move") { const v = byId[ev.id]; v.x = ev.x; v.y = ev.y; v.facing = ev.facing; }
     else if (ev.type === "damage") { const v = byId[ev.id]; v.hp = ev.hp; v.hitFlash = 0.16; }
@@ -141,8 +172,12 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
     }
   };
 
-  const drawFighter = (fb: FrameBuf, v: FighterView, tNow: number) => {
-    const px = AX + v.x * SCALE, py = AY + v.y * SCALE;
+  const drawFighter = (fb: FrameBuf, v: FighterView, tNow: number, shx = 0, shy = 0) => {
+    // 视觉位置向模拟位置平滑追踪（每帧收敛 40%），突进/击退自动变成动画
+    const id = v === byId.A ? "A" : "B";
+    visX[id] += (v.x - visX[id]) * 0.4;
+    visY[id] += (v.y - visY[id]) * 0.4;
+    const px = AX + visX[id] * SCALE + shx, py = AY + visY[id] * SCALE + shy;
     const [r, g, b] = hex(v.color);
     const [r2, g2, b2] = hex(v.color2);
     // 影子
@@ -203,6 +238,40 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
     atlas.draw(fb, "你想看谁打谁？评论区点播下期对阵", W / 2, H - 82, [196, 188, 235, 255], 0.6, "center");
   };
 
+  const drawFightersShaken = (fb: FrameBuf, tNow: number, shx: number, shy: number) => {
+    // 借助 fb 平移：简单做法是给 drawFighter 传偏移
+    drawFighter(fb, byId.A, tNow, shx, shy);
+    drawFighter(fb, byId.B, tNow, shx, shy);
+  };
+
+  const drawFxShaken = (fb: FrameBuf, tb: number, shx: number, shy: number) => {
+    for (const fx of fxList) {
+      const age = tb - fx.t0;
+      if (fx.kind === "banner") continue;
+      if (age < 0 || age > 0.9) continue;
+      const rise = age * 50;
+      const alpha = Math.max(0, 255 - age * 320);
+      const sx = AX + fx.x * SCALE + shx, sy = AY + fx.y * SCALE + shy;
+      if (fx.kind === "skillring") {
+        const rr = 18 + age * 150;
+        for (let seg = 0; seg < 22; seg++) {
+          const ang = (seg / 22) * Math.PI * 2;
+          fb.blendCircle(sx + Math.cos(ang) * rr, sy + Math.sin(ang) * rr, 6, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * 0.6)]);
+        }
+        atlas.draw(fb, fx.text, sx, sy - 90 - rise, fx.color, 0.66, "center");
+      } else if (fx.kind === "slash") {
+        // 斜向斩击线
+        const len = 30 + age * 260;
+        for (let i = 0; i < 26; i++) {
+          const k = i / 26;
+          fb.blendCircle(sx - len / 2 + len * k, sy - len / 3 + (len / 3) * k, 5 - k * 3, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * (1 - k) * 0.9)]);
+        }
+      } else {
+        atlas.draw(fb, fx.text, sx, sy - rise, fx.color, fx.big ? 1.05 : 0.72, "center");
+      }
+    }
+  };
+
   const [ar, ag, ab] = hex(byId.A.color);
   const [br, bg, bb] = hex(byId.B.color);
 
@@ -239,33 +308,42 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
         atlas.draw(fb, "AI 斗蛐蛐擂台", W / 2, 330, [204, 194, 244, 255], 0.85, "center");
       } else if (tb >= 0) {
         // ====== 战斗 + 结算 ======
-        while (evIdx < events.length && events[evIdx].t <= tb) applyEvent(events[evIdx++]);
-
-        // 擂台
-        drawArena(fb);
-        drawFighter(fb, byId.A, tNow);
-        drawFighter(fb, byId.B, tNow);
-
-        // 特效
-        for (const fx of fxList) {
-          const age = tb - fx.t0;
-          if (age < 0 || age > 0.9) continue;
-          const rise = age * 50;
-          const alpha = Math.max(0, 255 - age * 320);
-          const sx = AX + fx.x * SCALE, sy = AY + fx.y * SCALE;
-          if (fx.kind === "skillring") {
-            const rr = 18 + age * 140;
-            for (let seg = 0; seg < 22; seg++) {
-              const ang = (seg / 22) * Math.PI * 2;
-              fb.blendCircle(sx + Math.cos(ang) * rr, sy + Math.sin(ang) * rr, 6, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * 0.6)]);
-            }
-            atlas.draw(fb, fx.text, sx, sy - 84 - rise, fx.color, 0.62, "center");
-          } else {
-            const big = fx.kind === "dmg" && fx.text.startsWith("暴击");
-            atlas.draw(fb, fx.text, sx, sy - rise, fx.color, big ? 0.95 : 0.7, "center");
-          }
+        const hs = hitStopAt(tb);
+        // hit-stop：冻结事件推进（画面顿帧），但震屏照常
+        if (!hs.freeze) {
+          while (evIdx < events.length && events[evIdx].t <= tb) applyEvent(events[evIdx++]);
         }
+
+        // 震屏偏移
+        const shx = hs.shake > 0 ? Math.round((Math.sin(tNow * 91) * hs.shake)) : 0;
+        const shy = hs.shake > 0 ? Math.round((Math.cos(tNow * 77) * hs.shake * 0.6)) : 0;
+
+        // 擂台（带震屏）
+        fb.blendRect(0, 0, W, H, [0, 0, 0, 0]); // no-op 保持结构
+        drawArena(fb);
+        // 角色整体震屏：绘制进偏移层（简化：直接偏移坐标重画）
+        drawFightersShaken(fb, tNow, shx, shy);
+
+        // 特效（跟随震屏）
+        drawFxShaken(fb, tb, shx, shy);
         drawHud(fb, tb);
+
+        // 技能式横幅（不随震屏，屏幕中央大字）
+        for (const fx of fxList) {
+          if (fx.kind !== "banner") continue;
+          const age = tb - fx.t0;
+          if (age < 0 || age > 0.8) continue;
+          // 弹性放大入场 + 淡出
+          const inK = Math.min(1, age / 0.12);
+          const scale = (fx.big ? 1.5 : 1.1) * (2.2 - inK * 1.2);
+          const alpha = age > 0.55 ? Math.max(0, 1 - (age - 0.55) / 0.25) : 1;
+          // 背景斜切色带
+          const bandH = 110;
+          fb.blendRect(0, fx.y - bandH / 2, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
+          fb.fillRect(0, fx.y - bandH / 2, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
+          fb.fillRect(0, fx.y + bandH / 2 - 4, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
+          atlasBig.draw(fb, fx.text, W / 2, fx.y - 40 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], scale, "center");
+        }
 
         // 死亡时胜者字幕
         const deathEv = events.find(e => e.type === "death") as Extract<SimEvent, { type: "death" }> | undefined;
