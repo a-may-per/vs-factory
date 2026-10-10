@@ -38,6 +38,16 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   const atlas = new FontAtlas(fontDir + "atlas64.rgba", fontDir + "atlas64.json");
   const atlasBig = new FontAtlas(fontDir + "atlas96.rgba", fontDir + "atlas96.json");
 
+  // 所有动态文字先按容器宽度缩放，避免 HUD、卡片和结算文字越界。
+  const drawFit = (
+    fb: FrameBuf, font: FontAtlas, text: string, x: number, y: number,
+    color: [number, number, number, number], maxWidth: number, baseScale: number,
+    align: "left" | "center" | "right",
+  ) => {
+    const natural = Math.max(1, font.measure(text) * baseScale);
+    font.draw(fb, text, x, y, color, baseScale * Math.min(1, maxWidth / natural), align);
+  };
+
   // ---------- 回放视图 ----------
   const spawnEv = events.filter(e => e.type === "spawn") as Extract<SimEvent, { type: "spawn" }>[];
   const byId: Record<Side, FighterView> = {} as any;
@@ -129,7 +139,7 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
     else if (ev.type === "damage") { const v = byId[ev.id]; v.hp = ev.hp; v.hitFlash = 0.16; }
     else if (ev.type === "skill") { const v = byId[ev.id]; v.action = "skill"; }
     else if (ev.type === "death") { const v = byId[ev.id]; v.alive = false; v.action = "death"; v.deathT = ev.t; }
-    else if (ev.type === "buff" && ev.name === "狂暴") { byId[ev.id].rageStacks = ev.stacks; }
+    else if (ev.type === "buff" && (ev.name === "狂暴" || ev.name === "狂暴蓄力")) { byId[ev.id].rageStacks = ev.stacks; }
   };
   // 初始满血
   for (const id of ["A", "B"] as Side[]) byId[id].hp = byId[id].maxHp;
@@ -210,21 +220,21 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
       const isA = id === "A";
       const barW = 400;
       const bx = isA ? 44 : W - 44 - barW;
-      const by = 108;
-      atlas.draw(fb, v.name, isA ? bx : bx + barW, by - 26, [255, 255, 255, 255], 0.72, isA ? "left" : "right");
+      const by = 116;
+      drawFit(fb, atlas, v.name, isA ? bx : bx + barW, 34, [255, 255, 255, 255], barW - 34, 0.72, isA ? "left" : "right");
       fb.fillRect(bx, by, barW, 30, [38, 34, 54, 255]);
       const frac = Math.max(0, v.hp / v.maxHp);
       const [r, g, b] = hex(v.color);
       const fw = Math.round((barW - 6) * frac);
       fb.fillRect(isA ? bx + 3 : bx + 3 + (barW - 6 - fw), by + 3, fw, 24, [r, g, b, 255]);
-      atlas.draw(fb, `${Math.ceil(v.hp)}`, isA ? bx + barW - 6 : bx + 6, by + 4, [255, 255, 255, 255], 0.5, isA ? "right" : "left");
-      atlas.draw(fb, `被动 ${v.passive}`, isA ? bx : bx + barW, by + 44, [168, 158, 222, 255], 0.5, isA ? "left" : "right");
+      drawFit(fb, atlas, `${Math.ceil(v.hp)} HP`, isA ? bx + barW - 8 : bx + 8, 78, [224, 224, 240, 255], 100, 0.42, isA ? "right" : "left");
+      drawFit(fb, atlas, `被动 ${v.passive}`, isA ? bx : bx + barW, 168, [168, 158, 222, 255], barW - 20, 0.5, isA ? "left" : "right");
     }
     // 计时（贴顶，避免和血量数字打架）
-    atlas.draw(fb, tb.toFixed(0) + "s", W / 2, 52, [255, 216, 110, 255], 0.7, "center");
+    drawFit(fb, atlas, tb.toFixed(0) + "s", W / 2, 52, [255, 216, 110, 255], 100, 0.7, "center");
     // 底部信息条
     fb.fillRect(0, H - 120, W, 120, [9, 8, 16, 225]);
-    atlas.draw(fb, "你想看谁打谁？评论区点播下期对阵", W / 2, H - 82, [196, 188, 235, 255], 0.6, "center");
+    drawFit(fb, atlas, "你想看谁打谁？评论区点播下期对阵", W / 2, H - 82, [196, 188, 235, 255], W - 64, 0.6, "center");
   };
 
   const drawFightersShaken = (fb: FrameBuf, tNow: number, shx: number, shy: number) => {
@@ -247,7 +257,7 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           const ang = (seg / 22) * Math.PI * 2;
           fb.blendCircle(sx + Math.cos(ang) * rr, sy + Math.sin(ang) * rr, 6, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * 0.6)]);
         }
-        atlas.draw(fb, fx.text, sx, sy - 90 - rise, fx.color, 0.66, "center");
+        drawFit(fb, atlas, fx.text, sx, sy - 90 - rise, fx.color, 300, 0.66, "center");
       } else if (fx.kind === "slash") {
         // 斜向斩击线
         const len = 30 + age * 260;
@@ -256,7 +266,7 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           fb.blendCircle(sx - len / 2 + len * k, sy - len / 3 + (len / 3) * k, 5 - k * 3, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * (1 - k) * 0.9)]);
         }
       } else {
-        atlas.draw(fb, fx.text, sx, sy - rise, fx.color, fx.big ? 1.05 : 0.72, "center");
+        drawFit(fb, atlas, fx.text, sx, sy - rise, fx.color, 300, fx.big ? 1.05 : 0.72, "center");
       }
     }
   };
@@ -279,22 +289,22 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
         const ax = 56 - slide * 0.7, ay = 600;
         fb.fillRect(ax, ay, cardW, cardH, [ar, ag, ab, 255]);
         fb.fillRect(ax + 14, ay + 14, cardW - 28, cardH - 28, [Math.round(ar * 0.38), Math.round(ag * 0.38), Math.round(ab * 0.38), 255]);
-        atlasBig.draw(fb, byId.A.name, ax + cardW / 2, ay + 110, [255, 255, 255, 255], 1.05, "center");
-        atlas.draw(fb, byId.A.title, ax + cardW / 2, ay + 240, [255, 228, 228, 255], 0.66, "center");
-        atlas.draw(fb, `被动 ${byId.A.passive}`, ax + cardW / 2, ay + 300, [255, 204, 204, 255], 0.55, "center");
-        atlas.draw(fb, byId.A.passiveDesc, ax + cardW / 2, ay + 360, [232, 206, 206, 255], 0.4, "center");
+        drawFit(fb, atlasBig, byId.A.name, ax + cardW / 2, ay + 110, [255, 255, 255, 255], cardW - 28, 1.05, "center");
+        drawFit(fb, atlas, byId.A.title, ax + cardW / 2, ay + 240, [255, 228, 228, 255], cardW - 44, 0.66, "center");
+        drawFit(fb, atlas, `被动 ${byId.A.passive}`, ax + cardW / 2, ay + 300, [255, 204, 204, 255], cardW - 44, 0.55, "center");
+        drawFit(fb, atlas, byId.A.passiveDesc, ax + cardW / 2, ay + 360, [232, 206, 206, 255], cardW - 44, 0.4, "center");
         const bx2 = W - 56 - cardW + slide * 0.7;
         fb.fillRect(bx2, ay, cardW, cardH, [br, bg, bb, 255]);
         fb.fillRect(bx2 + 14, ay + 14, cardW - 28, cardH - 28, [Math.round(br * 0.38), Math.round(bg * 0.38), Math.round(bb * 0.38), 255]);
-        atlasBig.draw(fb, byId.B.name, bx2 + cardW / 2, ay + 110, [255, 255, 255, 255], 1.05, "center");
-        atlas.draw(fb, byId.B.title, bx2 + cardW / 2, ay + 240, [255, 240, 220, 255], 0.66, "center");
-        atlas.draw(fb, `被动 ${byId.B.passive}`, bx2 + cardW / 2, ay + 300, [255, 222, 184, 255], 0.55, "center");
-        atlas.draw(fb, byId.B.passiveDesc, bx2 + cardW / 2, ay + 360, [240, 220, 200, 255], 0.4, "center");
+        drawFit(fb, atlasBig, byId.B.name, bx2 + cardW / 2, ay + 110, [255, 255, 255, 255], cardW - 28, 1.05, "center");
+        drawFit(fb, atlas, byId.B.title, bx2 + cardW / 2, ay + 240, [255, 240, 220, 255], cardW - 44, 0.66, "center");
+        drawFit(fb, atlas, `被动 ${byId.B.passive}`, bx2 + cardW / 2, ay + 300, [255, 222, 184, 255], cardW - 44, 0.55, "center");
+        drawFit(fb, atlas, byId.B.passiveDesc, bx2 + cardW / 2, ay + 360, [240, 220, 200, 255], cardW - 44, 0.4, "center");
         if (tNow > 0.9) {
           const vsK = Math.min(1, (tNow - 0.9) / 0.16);
-          atlasBig.draw(fb, "VS", W / 2, 740, [255, 238, 88, 255], 3 - vsK * 1.7, "center");
+          drawFit(fb, atlasBig, "VS", W / 2, 740, [255, 238, 88, 255], 260, 3 - vsK * 1.7, "center");
         }
-        atlas.draw(fb, "AI 斗蛐蛐擂台", W / 2, 330, [204, 194, 244, 255], 0.85, "center");
+        drawFit(fb, atlas, "AI 斗蛐蛐擂台", W / 2, 330, [204, 194, 244, 255], W - 80, 0.85, "center");
       } else if (tb >= 0) {
         // ====== 战斗 + 结算 ======
         const hs = hitStopAt(tb);
@@ -331,14 +341,14 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           fb.blendRect(0, fx.y - bandH / 2, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
           fb.fillRect(0, fx.y - bandH / 2, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
           fb.fillRect(0, fx.y + bandH / 2 - 4, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
-          atlasBig.draw(fb, fx.text, W / 2, fx.y - 26 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], scale, "center");
+          drawFit(fb, atlasBig, fx.text, W / 2, fx.y - 26 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], W - 80, scale, "center");
         }
 
         // 死亡时胜者字幕
         const deathEv = events.find(e => e.type === "death") as Extract<SimEvent, { type: "death" }> | undefined;
         if (deathEv && tb >= deathEv.t + 0.3 && tb <= battleSec) {
           const winner = byId[endEv!.winner];
-          atlasBig.draw(fb, `${winner.name} 胜`, W / 2, H * 0.30, [255, 238, 120, 255], 1.9, "center");
+          drawFit(fb, atlasBig, `${winner.name} 胜`, W / 2, H * 0.30, [255, 238, 120, 255], W - 80, 1.9, "center");
         }
         // 结算卡
         if (tb > battleSec) {
@@ -350,10 +360,10 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
             const cx = W / 2, cy = 700;
             fb.fillRect(cx - 250, cy - 20, 500, 640, [wr, wg, wb, 255]);
             fb.fillRect(cx - 236, cy - 6, 472, 612, [Math.round(wr * 0.32), Math.round(wg * 0.32), Math.round(wb * 0.32), 255]);
-            atlasBig.draw(fb, "WINNER", cx, cy + 100, [255, 255, 255, 255], 1.0, "center");
-            atlasBig.draw(fb, winner.name, cx, cy + 260, [255, 255, 255, 255], 1.15, "center");
-            atlas.draw(fb, `剩余 HP ${Math.ceil(winner.hp)}`, cx, cy + 400, [225, 225, 245, 255], 0.55, "center");
-            atlas.draw(fb, "想看谁打谁？评论区点播", cx, cy + 480, [255, 228, 150, 255], 0.58, "center");
+            drawFit(fb, atlasBig, "WINNER", cx, cy + 100, [255, 255, 255, 255], 420, 1.0, "center");
+            drawFit(fb, atlasBig, winner.name, cx, cy + 260, [255, 255, 255, 255], 440, 1.15, "center");
+            drawFit(fb, atlas, `剩余 HP ${Math.ceil(winner.hp)}`, cx, cy + 400, [225, 225, 245, 255], 420, 0.55, "center");
+            drawFit(fb, atlas, "想看谁打谁？评论区点播", cx, cy + 480, [255, 228, 150, 255], 440, 0.58, "center");
           }
         }
       } else {

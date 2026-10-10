@@ -36,8 +36,9 @@ ball:  歌曲 → librosa 分析(onset/beat/HPSS) → JSON 事件轴 → 同一�
 - [x] 两线 MVP 链路 + 样片（out/duel/、out/music-ball/）
 - [ ] 视觉打磨：重击推拉镜头、血条缓动、死亡演出
 - [x] duel 交手机制修订：无普通攻击，接触即技能，技能后弹开并重新寻路
-- [x] music-ball 横版平台跑酷：主角球表情/拖尾、横向前进、平台切换、重力下坠、安全层落地
-- [ ] music-ball：换装参数、用 2~3 首不同节奏歌曲校准自动跳跃与平台布局
+- [x] music-ball 节拍碰撞版：强拍/beat/weak 分层，目标墙/跳板 + 必达抛物线 + 斜向下坠反弹（out/music-ball/impact_collision_mp3.mp4）
+- [x] music-ball 自动卡点：beat_track 主节拍骨架 + onset_strength 强弱 + HPSS 音色分层；强拍必达、弱音装饰
+- [ ] music-ball：用 2~3 首真实不同节奏歌曲校准卡点密度、强拍阈值和目标布局
 - [x] music-ball mp3：入口自动用 ffmpeg 转成 44.1kHz 单声道 PCM WAV 后分析/渲染
 - [ ] 热门歌版权策略
 - [ ] 参考视频（仍缺，风格定案的唯一阻塞项）
