@@ -1,14 +1,14 @@
-// duel 战斗模拟器 v2：斗蛐蛐式交手节奏（突进贴近 → 交手 → 弹开 → 再接近）。
-// 暴击/吸血/狂暴/闪避全部走 proc 事件，渲染层做技能式演出。
-// 确定性：固定 tick + mulberry32 种子 → JSONL 事件日志，渲染器只回放。
+// duel 战斗模拟器：擂台漫游弹射模式。
+// 英雄持续在空间里移动；碰墙反弹；碰到对方触发技能；技能后双方像弹球一样反弹继续漫游。
+// 没有普通攻击、没有主动寻路追人。
 
 export type Side = "A" | "B";
 
 export interface SkillDef {
   name: string;
-  cooldown: number;   // 秒
+  cooldown: number;
   damage: number;
-  rangeMul: number;   // 施法距离 = attackRange * rangeMul
+  rangeMul: number;
   fx: "bolt" | "whirl";
   description: string;
 }
@@ -20,52 +20,47 @@ export interface FighterConfig {
   name: string;
   title: string;
   maxHp: number;
-  attack: number;
-  speed: number;          // 模拟坐标 px/s
-  attackRange: number;
-  attackInterval: number; // 秒
+  speed: number;
+  contactRange: number;
   color: string;
   color2: string;
   active: SkillDef;
   passive: PassiveDef;
   passiveKind: "lifesteal" | "rage";
-  style: "aggressive" | "evasive" | "balanced";
+  style: "aggressive" | "balanced";
 }
 
 export interface FighterState {
   cfg: FighterConfig;
   x: number; y: number;
+  vx: number; vy: number;
   hp: number;
   facing: 1 | -1;
-  attackTimer: number;
   skillCd: number;
-  action: "idle" | "walk" | "attack" | "skill" | "hit" | "death";
+  action: "idle" | "walk" | "skill" | "hit" | "death";
   actionTimer: number;
   rageStacks: number;
   alive: boolean;
-  kbVx: number; kbVy: number;   // 击退速度（指数衰减滑行）
-  recoverT: number;             // 交手后的恢复期（期间不追击不攻击）
 }
 
-export interface SimCtx { time: number; rng: () => number }
-
 export type SimEvent =
-  | { tick: number; t: number; type: "spawn"; id: Side; name: string; title: string; x: number; y: number; color: string; color2: string; passive: string; passiveDesc: string; activeName: string }
+  | { tick: number; t: number; type: "spawn"; id: Side; name: string; title: string; x: number; y: number; color: string; color2: string; passive: string; passiveDesc: string; activeName: string; maxHp: number }
   | { tick: number; t: number; type: "move"; id: Side; x: number; y: number; facing: 1 | -1 }
-  | { tick: number; t: number; type: "attack"; id: Side; target: Side; x: number; y: number }
-  | { tick: number; t: number; type: "damage"; id: Side; value: number; from: Side; hp: number; crit?: boolean; x: number; y: number }
-  | { tick: number; t: number; type: "skill"; id: Side; name: string; x: number; y: number; fx: SkillDef["fx"] }
+  | { tick: number; t: number; type: "wallBounce"; id: Side; x: number; y: number }
+  | { tick: number; t: number; type: "skill"; id: Side; target: Side; name: string; x: number; y: number; fx: SkillDef["fx"] }
+  | { tick: number; t: number; type: "damage"; id: Side; value: number; from: Side; hp: number; x: number; y: number }
   | { tick: number; t: number; type: "heal"; id: Side; value: number; hp: number; text: string; x: number; y: number }
   | { tick: number; t: number; type: "buff"; id: Side; name: string; stacks: number }
-  | { tick: number; t: number; type: "proc"; id: Side; kind: "crit" | "lifesteal" | "rage" | "dodge"; name: string; x: number; y: number; tx?: number; ty?: number; stacks?: number }
-  | { tick: number; t: number; type: "fuse"; text: string }
+  | { tick: number; t: number; type: "skillEffect"; id: Side; kind: "lifesteal" | "rage" | "bounce"; name: string; x: number; y: number; tx?: number; ty?: number; stacks?: number }
   | { tick: number; t: number; type: "death"; id: Side; x: number; y: number }
   | { tick: number; t: number; type: "end"; winner: Side; duration: number };
 
-export const ARENA_W = 960, ARENA_H = 540;
+export const ARENA_W = 960;
+export const ARENA_H = 540;
 export const TICK_RATE = 60;
 const DT = 1 / TICK_RATE;
-const MOVE_EVERY = 2; // 30Hz 采样位置（击退滑行更平滑）
+const MOVE_EVERY = 2;
+const RADIUS = 42;
 
 function mulberry32(seed: number) {
   let s = seed >>> 0;
@@ -77,162 +72,164 @@ function mulberry32(seed: number) {
   };
 }
 
+function normalize(vx: number, vy: number, speed: number): [number, number] {
+  const len = Math.max(0.001, Math.hypot(vx, vy));
+  return [vx / len * speed, vy / len * speed];
+}
+
 export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number, maxDuration = 45): SimEvent[] {
   const events: SimEvent[] = [];
-  const emit = (ev: SimEvent) => events.push(ev);
+  const emit = (event: SimEvent) => events.push(event);
   const rng = mulberry32(seed);
   let time = 0;
 
-  const mkState = (cfg: FighterConfig, x: number, y: number): FighterState => ({
-    cfg, x, y, hp: cfg.maxHp, facing: x < ARENA_W / 2 ? 1 : -1,
-    attackTimer: 0.8, skillCd: 2.5, action: "idle", actionTimer: 0,
-    rageStacks: 0, alive: true, kbVx: 0, kbVy: 0, recoverT: 0,
-  });
+  const makeState = (cfg: FighterConfig, x: number, y: number, angle: number): FighterState => {
+    const [vx, vy] = normalize(Math.cos(angle), Math.sin(angle), cfg.speed);
+    return {
+      cfg, x, y, vx, vy, hp: cfg.maxHp,
+      facing: vx >= 0 ? 1 : -1,
+      skillCd: 0, action: "walk", actionTimer: 0,
+      rageStacks: 0, alive: true,
+    };
+  };
 
-  const A = mkState(cfgA, ARENA_W * 0.24, ARENA_H * 0.58);
-  const B = mkState(cfgB, ARENA_W * 0.76, ARENA_H * 0.58);
+  const A = makeState(cfgA, ARENA_W * 0.25, ARENA_H * 0.44, -0.35 + rng() * 0.7);
+  const B = makeState(cfgB, ARENA_W * 0.75, ARENA_H * 0.66, Math.PI + 0.25 + rng() * 0.7);
 
-  emit({ tick: 0, t: 0, type: "spawn", id: "A", name: cfgA.name, title: cfgA.title, x: A.x, y: A.y, color: cfgA.color, color2: cfgA.color2, passive: cfgA.passive.name, passiveDesc: cfgA.passive.description, activeName: cfgA.active.name });
-  emit({ tick: 0, t: 0, type: "spawn", id: "B", name: cfgB.name, title: cfgB.title, x: B.x, y: B.y, color: cfgB.color, color2: cfgB.color2, passive: cfgB.passive.name, passiveDesc: cfgB.passive.description, activeName: cfgB.active.name });
+  for (const f of [A, B]) {
+    emit({
+      tick: 0, t: 0, type: "spawn", id: f.cfg.id, name: f.cfg.name,
+      title: f.cfg.title, x: f.x, y: f.y,
+      color: f.cfg.color, color2: f.cfg.color2,
+      passive: f.cfg.passive.name, passiveDesc: f.cfg.passive.description,
+      activeName: f.cfg.active.name, maxHp: f.cfg.maxHp,
+    });
+  }
 
-  /** 交手后弹开：受击方被击退，攻击方小幅后撤 */
-  function knockback(from: FighterState, to: FighterState, kbTo: number, kbFrom: number, recTo: number, recFrom: number) {
-    const dx = to.x - from.x, dy = to.y - from.y;
+  function bounceWall(f: FighterState, tick: number) {
+    let bounced = false;
+    if (f.x < RADIUS) { f.x = RADIUS; f.vx = Math.abs(f.vx); bounced = true; }
+    if (f.x > ARENA_W - RADIUS) { f.x = ARENA_W - RADIUS; f.vx = -Math.abs(f.vx); bounced = true; }
+    if (f.y < ARENA_H * 0.45 + RADIUS) { f.y = ARENA_H * 0.45 + RADIUS; f.vy = Math.abs(f.vy); bounced = true; }
+    if (f.y > ARENA_H - RADIUS) { f.y = ARENA_H - RADIUS; f.vy = -Math.abs(f.vy); bounced = true; }
+    if (bounced) {
+      // 加一点角度扰动，避免永远同一条轨道来回弹。
+      const speed = f.cfg.speed;
+      const jitter = (rng() - 0.5) * 0.35;
+      const ang = Math.atan2(f.vy, f.vx) + jitter;
+      [f.vx, f.vy] = normalize(Math.cos(ang), Math.sin(ang), speed);
+      emit({ tick, t: time, type: "wallBounce", id: f.cfg.id, x: f.x, y: f.y });
+    }
+  }
+
+  function bounceApart(a: FighterState, b: FighterState, strong = false) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
     const d = Math.max(0.001, Math.hypot(dx, dy));
-    const ux = dx / d, uy = dy / d;
-    to.kbVx = ux * kbTo; to.kbVy = uy * kbTo; to.recoverT = recTo;
-    from.kbVx = -ux * kbFrom; from.kbVy = -uy * kbFrom; from.recoverT = recFrom;
+    const nx = dx / d;
+    const ny = dy / d;
+    const impulse = strong ? 1.35 : 1.12;
+    [a.vx, a.vy] = normalize(-nx + (rng() - 0.5) * 0.35, -ny + (rng() - 0.5) * 0.35, a.cfg.speed * impulse);
+    [b.vx, b.vy] = normalize(nx + (rng() - 0.5) * 0.35, ny + (rng() - 0.5) * 0.35, b.cfg.speed * impulse);
+    // 直接把圆分开，避免同帧连续触发。
+    const overlap = RADIUS * 2 - d + 4;
+    if (overlap > 0) {
+      a.x -= nx * overlap * 0.5;
+      a.y -= ny * overlap * 0.5;
+      b.x += nx * overlap * 0.5;
+      b.y += ny * overlap * 0.5;
+    }
   }
 
-  function tryAttack(from: FighterState, to: FighterState, id: Side, tid: Side): boolean {
-    const dist = Math.hypot(to.x - from.x, to.y - from.y);
-    if (dist > from.cfg.attackRange || from.attackTimer > 0 || from.recoverT > 0) return false;
-    // evasive 风格 10% 闪避
-    if (to.cfg.style === "evasive" && rng() < 0.10) {
-      emit({ tick: 0, t: time, type: "proc", id: tid, kind: "dodge", name: "闪避", x: to.x, y: to.y });
-      from.attackTimer = from.cfg.attackInterval * 0.5;
-      from.recoverT = 0.18;
-      return false;
+  function castSkill(caster: FighterState, target: FighterState): boolean {
+    if (caster.skillCd > 0) return false;
+    const skill = caster.cfg.active;
+    caster.skillCd = skill.cooldown;
+    caster.action = "skill";
+    caster.actionTimer = 0.45;
+
+    emit({ tick: 0, t: time, type: "skill", id: caster.cfg.id, target: target.cfg.id, name: skill.name, x: target.x, y: target.y, fx: skill.fx });
+
+    const rageMultiplier = caster.cfg.passiveKind === "rage" ? 1 + caster.rageStacks * 0.1 : 1;
+    const damage = Math.max(1, Math.round(skill.damage * rageMultiplier));
+    target.hp -= damage;
+    target.action = "hit";
+    target.actionTimer = 0.25;
+    emit({ tick: 0, t: time, type: "damage", id: target.cfg.id, value: damage, from: caster.cfg.id, hp: Math.max(0, target.hp), x: target.x, y: target.y });
+
+    if (caster.cfg.passiveKind === "lifesteal") {
+      const heal = Math.round(damage * 0.3);
+      caster.hp = Math.min(caster.cfg.maxHp, caster.hp + heal);
+      emit({ tick: 0, t: time, type: "heal", id: caster.cfg.id, value: heal, hp: caster.hp, text: `技能吸血 +${heal}`, x: caster.x, y: caster.y });
+      emit({ tick: 0, t: time, type: "skillEffect", id: caster.cfg.id, kind: "lifesteal", name: "血影回响", x: caster.x, y: caster.y, tx: target.x, ty: target.y });
     }
-    const roll = 0.9 + rng() * 0.2;                 // ±10% 确定性浮动
-    const crit = rng() < 0.15;
-    const dmg = Math.max(1, Math.round(from.cfg.attack * roll * (crit ? 1.8 : 1)));
-    to.hp -= dmg;
-    to.action = "hit"; to.actionTimer = 0.22;
-    from.action = "attack"; from.actionTimer = 0.28;
-    from.attackTimer = effectiveInterval(from);
-    emit({ tick: 0, t: time, type: "attack", id, target: tid, x: from.x, y: from.y });
-    emit({ tick: 0, t: time, type: "damage", id: tid, value: dmg, from: id, hp: Math.max(0, to.hp), crit, x: to.x, y: to.y });
-    if (crit) emit({ tick: 0, t: time, type: "proc", id, kind: "crit", name: "会心一击", x: to.x, y: to.y });
-    if (from.cfg.passiveKind === "lifesteal") {
-      const heal = Math.round(dmg * 0.3);
-      from.hp = Math.min(from.cfg.maxHp, from.hp + heal);
-      emit({ tick: 0, t: time, type: "heal", id, value: heal, hp: Math.round(from.hp), text: `吸血 +${heal}`, x: from.x, y: from.y });
-      if (heal >= 14) emit({ tick: 0, t: time, type: "proc", id, kind: "lifesteal", name: "鲜血汲取", x: from.x, y: from.y, tx: to.x, ty: to.y });
+
+    if (caster.cfg.passiveKind === "rage") {
+      caster.rageStacks = Math.min(6, caster.rageStacks + 1);
+      emit({ tick: 0, t: time, type: "buff", id: caster.cfg.id, name: "狂暴蓄力", stacks: caster.rageStacks });
+      emit({ tick: 0, t: time, type: "skillEffect", id: caster.cfg.id, kind: "rage", name: `狂暴蓄力 ×${caster.rageStacks}`, x: caster.x, y: caster.y, stacks: caster.rageStacks });
     }
-    if (to.hp <= 0) {
-      to.hp = 0; to.alive = false; to.action = "death";
-      emit({ tick: 0, t: time, type: "death", id: tid, x: to.x, y: to.y });
-      emit({ tick: 0, t: time, type: "end", winner: id, duration: time });
+
+    emit({ tick: 0, t: time, type: "skillEffect", id: caster.cfg.id, kind: "bounce", name: "弹开", x: caster.x, y: caster.y, tx: target.x, ty: target.y });
+
+    if (target.hp <= 0) {
+      target.hp = 0;
+      target.alive = false;
+      target.action = "death";
+      emit({ tick: 0, t: time, type: "death", id: target.cfg.id, x: target.x, y: target.y });
+      emit({ tick: 0, t: time, type: "end", winner: caster.cfg.id, duration: time });
       return true;
     }
-    knockback(from, to, crit ? 340 : 210, 90, 0.24, 0.34);
+
+    bounceApart(caster, target, skill.fx === "whirl");
     return false;
   }
 
-  function trySkill(from: FighterState, to: FighterState, id: Side, tid: Side): boolean {
-    const sk = from.cfg.active;
-    const dist = Math.hypot(to.x - from.x, to.y - from.y);
-    if (from.skillCd > 0 || from.recoverT > 0 || dist > from.cfg.attackRange * sk.rangeMul) return false;
-    from.skillCd = sk.cooldown;
-    from.action = "skill"; from.actionTimer = 0.45;
-    // 突进近身
-    const lungeDist = Math.max(40, from.cfg.attackRange * 0.7);
-    from.x = Math.min(ARENA_W - 60, Math.max(60, to.x - ((to.x - from.x) / dist) * lungeDist));
-    from.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, to.y - ((to.y - from.y) / dist) * lungeDist));
-    emit({ tick: 0, t: time, type: "skill", id, name: sk.name, x: to.x, y: to.y, fx: sk.fx });
-    const dmg = Math.max(1, Math.round(sk.damage));
-    to.hp -= dmg;
-    to.action = "hit"; to.actionTimer = 0.3;
-    emit({ tick: 0, t: time, type: "damage", id: tid, value: dmg, from: id, hp: Math.max(0, to.hp), x: to.x, y: to.y });
-    if (from.cfg.passiveKind === "lifesteal") {
-      const heal = Math.round(dmg * 0.3);
-      from.hp = Math.min(from.cfg.maxHp, from.hp + heal);
-      emit({ tick: 0, t: time, type: "heal", id, value: heal, hp: Math.round(from.hp), text: `吸血 +${heal}`, x: from.x, y: from.y });
-      if (heal >= 14) emit({ tick: 0, t: time, type: "proc", id, kind: "lifesteal", name: "鲜血汲取", x: from.x, y: from.y, tx: to.x, ty: to.y });
-    }
-    if (to.hp <= 0) {
-      to.hp = 0; to.alive = false; to.action = "death";
-      emit({ tick: 0, t: time, type: "death", id: tid, x: to.x, y: to.y });
-      emit({ tick: 0, t: time, type: "end", winner: id, duration: time });
-      return true;
-    }
-    knockback(from, to, 300, 90, 0.26, 0.4);
-    return false;
-  }
-
-  /** 狂战士被动：生命每降 10%，攻速 +8%（上限 9 层）；层数变化走 proc 演出 */
-  function effectiveInterval(st: FighterState): number {
-    if (st.cfg.passiveKind !== "rage") return st.cfg.attackInterval;
-    const missing = 1 - st.hp / st.cfg.maxHp;
-    const stacks = Math.min(9, Math.floor(missing * 10));
-    if (stacks !== st.rageStacks) {
-      st.rageStacks = stacks;
-      emit({ tick: 0, t: time, type: "buff", id: st.cfg.id, name: "狂暴", stacks });
-      if (stacks > 0) emit({ tick: 0, t: time, type: "proc", id: st.cfg.id, kind: "rage", name: "狂暴", x: st.x, y: st.y, stacks });
-    }
-    return st.cfg.attackInterval * (1 - 0.08 * stacks);
-  }
-
-  function stepFighter(st: FighterState, foe: FighterState): boolean {
-    if (!st.alive) return false;
-    effectiveInterval(st);
-    st.attackTimer -= DT;
-    st.skillCd -= DT;
-    st.actionTimer -= DT;
-    if (st.actionTimer <= 0 && st.action !== "death") st.action = "idle";
-
-    const dx = foe.x - st.x, dy = foe.y - st.y;
-    const dist = Math.max(0.001, Math.hypot(dx, dy));
-    st.facing = dx >= 0 ? 1 : -1;
-
-    // 交手恢复期：击退滑行，不追击不攻击
-    if (st.recoverT > 0) {
-      st.recoverT -= DT;
-      st.x = Math.min(ARENA_W - 60, Math.max(60, st.x + st.kbVx * DT));
-      st.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, st.y + st.kbVy * DT));
-      const decay = Math.exp(-5.5 * DT);
-      st.kbVx *= decay; st.kbVy *= decay;
-      return false;
-    }
-
-    // 决策：技能 > 普攻 > 突进接近
-    if (trySkill(st, foe, st.cfg.id, foe.cfg.id)) return true;
-    if (tryAttack(st, foe, st.cfg.id, foe.cfg.id)) return true;
-
-    if (dist > st.cfg.attackRange * 0.9) {
-      const sp = st.cfg.speed * (dist > st.cfg.attackRange * 2 ? 1.35 : 1.0);
-      st.x = Math.min(ARENA_W - 60, Math.max(60, st.x + (dx / dist) * sp * DT));
-      st.y = Math.min(ARENA_H - 60, Math.max(ARENA_H * 0.45, st.y + (dy / dist) * sp * DT));
-      if (st.action === "idle") st.action = "walk";
-    }
-    return false;
-  }
-
-  const TICKS = Math.floor(TICK_RATE * maxDuration);
-  let fuseAnnounced = false;
-  for (let tick = 1; tick <= TICKS; tick++) {
+  const maxTicks = Math.floor(TICK_RATE * maxDuration);
+  for (let tick = 1; tick <= maxTicks; tick++) {
     time = tick * DT;
-    if (!fuseAnnounced && time > maxDuration - 8) {
-      fuseAnnounced = true;
-      emit({ tick, t: time, type: "fuse", text: "激战加时！伤害提升！" });
+    for (const f of [A, B]) {
+      if (!f.alive) continue;
+      f.skillCd = Math.max(0, f.skillCd - DT);
+      f.actionTimer = Math.max(0, f.actionTimer - DT);
+      if (f.actionTimer === 0 && f.action !== "death") f.action = "walk";
+      f.x += f.vx * DT;
+      f.y += f.vy * DT;
+      f.facing = f.vx >= 0 ? 1 : -1;
+      bounceWall(f, tick);
     }
-    if (stepFighter(A, B)) break;
-    if (stepFighter(B, A)) break;
+
+    if (A.alive && B.alive) {
+      const d = Math.hypot(B.x - A.x, B.y - A.y);
+      if (d <= A.cfg.contactRange || d <= B.cfg.contactRange) {
+        // 接触时，冷却好了的一方先触发；都冷却好时按种子随机先手。
+        const aReady = A.skillCd <= 0;
+        const bReady = B.skillCd <= 0;
+        if (aReady && bReady) {
+          const first = rng() < 0.5 ? A : B;
+          const second = first === A ? B : A;
+          if (castSkill(first, second)) break;
+        } else if (aReady) {
+          if (castSkill(A, B)) break;
+        } else if (bReady) {
+          if (castSkill(B, A)) break;
+        } else {
+          bounceApart(A, B, false);
+        }
+      }
+    }
+
     if (tick % MOVE_EVERY === 0) {
       emit({ tick, t: time, type: "move", id: "A", x: Math.round(A.x), y: Math.round(A.y), facing: A.facing });
       emit({ tick, t: time, type: "move", id: "B", x: Math.round(B.x), y: Math.round(B.y), facing: B.facing });
     }
+  }
+  // 超时保险：如果 45s 内没击杀，按剩余血量百分比判定。
+  if (!events.some(e => e.type === "end")) {
+    const aPct = A.hp / A.cfg.maxHp;
+    const bPct = B.hp / B.cfg.maxHp;
+    const winner = aPct >= bPct ? "A" : "B";
+    emit({ tick: maxTicks, t: maxDuration, type: "end", winner, duration: maxDuration });
   }
   return events;
 }

@@ -16,8 +16,10 @@
 node duel/run.ts 77            # → out/duel/duel_77.mp4 (1080x1920, ~30s)
 node duel/run.ts 42 --cold-open  # 先打后卡版本
 
-# music-ball：任意音频 → 踩点跑酷成片
+# music-ball：任意音频 → 横版平台跑酷成片
 node music-ball/run.ts your-song.mp3 out.mp4
+# 可选 seed：同一首歌换 seed 生成不同平台布局
+node music-ball/run.ts your-song.mp3 out.mp4 17
 ```
 依赖：ffmpeg（brew）、Node 22+（原生跑 TS）、music-ball/.venv（librosa，已建）
 
@@ -32,8 +34,12 @@ ball:  歌曲 → librosa 分析(onset/beat/HPSS) → JSON 事件轴 → 同一�
 
 ## 状态
 - [x] 两线 MVP 链路 + 样片（out/duel/、out/music-ball/）
-- [ ] 视觉打磨：重击推拉镜头、血条缓动、死亡演出、上半屏波形可视化
-- [ ] music-ball 主角球+换装、mp3 实测、热门歌版权策略
+- [ ] 视觉打磨：重击推拉镜头、血条缓动、死亡演出
+- [x] duel 交手机制修订：无普通攻击，接触即技能，技能后弹开并重新寻路
+- [x] music-ball 横版平台跑酷：主角球表情/拖尾、横向前进、平台切换、重力下坠、安全层落地
+- [ ] music-ball：换装参数、用 2~3 首不同节奏歌曲校准自动跳跃与平台布局
+- [x] music-ball mp3：入口自动用 ffmpeg 转成 44.1kHz 单声道 PCM WAV 后分析/渲染
+- [ ] 热门歌版权策略
 - [ ] 参考视频（仍缺，风格定案的唯一阻塞项）
 - [ ] 系列名候选（早先后台生成流程未跑完，重启即可）
 - [ ] 平台实测：直接发平台，前 5 条只跟自己比（完播>30%、点赞>3%）

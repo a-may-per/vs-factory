@@ -65,9 +65,8 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   if (!coldOpen) sfxTracks.push({ pcm: synthSfx("vs-slam"), offsetSec: 0.15, gain: 1.0 });
   for (const ev of events) {
     const at = INTRO_SEC + ev.t;
-    if (ev.type === "attack") sfxTracks.push({ pcm: synthSfx("punch", 100 + Math.floor(ev.t * 7)), offsetSec: at, gain: ev.type === "attack" ? 0.5 : 1 });
-    else if (ev.type === "skill") sfxTracks.push({ pcm: synthSfx("skill", 200 + Math.floor(ev.t * 11)), offsetSec: at, gain: 0.8 });
-    else if (ev.type === "damage" && ev.crit) sfxTracks.push({ pcm: synthSfx("crit", 400 + Math.floor(ev.t * 13)), offsetSec: at, gain: 0.9 });
+    if (ev.type === "skill") sfxTracks.push({ pcm: synthSfx("skill", 200 + Math.floor(ev.t * 11)), offsetSec: at, gain: 0.95 });
+    else if (ev.type === "skillEffect") sfxTracks.push({ pcm: synthSfx(ev.kind === "rage" ? "whoosh" : "coin", 400 + Math.floor(ev.t * 13)), offsetSec: at, gain: 0.75 });
     else if (ev.type === "death") sfxTracks.push({ pcm: synthSfx("death", 300 + Math.floor(ev.t * 5)), offsetSec: at, gain: 1.0 });
   }
   const mixed = mixTracks(sfxTracks, totalSec);
@@ -88,33 +87,24 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   const fxList: Fx[] = [];
   for (const ev of events) {
     if (ev.type === "damage") {
-      fxList.push({ t0: ev.t, kind: "dmg", x: ev.x, y: ev.y - 80, text: `-${ev.value}`, color: ev.crit ? [255, 220, 80, 255] : [255, 96, 84, 255], big: ev.crit });
+      fxList.push({ t0: ev.t, kind: "dmg", x: ev.x, y: ev.y - 120, text: `-${ev.value}`, color: [255, 96, 84, 255] });
     } else if (ev.type === "heal") {
-      fxList.push({ t0: ev.t, kind: "heal", x: ev.x, y: ev.y - 100, text: ev.text, color: [96, 230, 140, 255] });
+      fxList.push({ t0: ev.t, kind: "heal", x: ev.x, y: ev.y - 140, text: ev.text, color: [96, 230, 140, 255] });
     } else if (ev.type === "skill") {
-      fxList.push({ t0: ev.t, kind: "skillring", x: ev.x, y: ev.y, text: ev.name, color: [255, 210, 90, 255] });
+      fxList.push({ t0: ev.t, kind: "skillring", x: ev.x, y: ev.y, text: ev.name, color: ev.id === "A" ? [255, 90, 130, 255] : [255, 190, 70, 255], big: true });
       fxList.push({ t0: ev.t, kind: "slash", x: ev.x, y: ev.y, text: "", color: [255, 240, 180, 255] });
-    } else if (ev.type === "proc") {
-      // 技能式横幅演出：招式名大字 + 光效
-      if (ev.kind === "crit") {
-        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: "会心一击！", color: [255, 226, 88, 255], big: true });
-      } else if (ev.kind === "lifesteal") {
-        // 吸血：从目标到自身的红色光珠
-        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: "鲜血汲取", color: [255, 80, 120, 255] });
-      } else if (ev.kind === "rage") {
-        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: `狂暴 ×${ev.stacks}`, color: [255, 130, 30, 255] });
-      } else if (ev.kind === "dodge") {
-        fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text: "闪避！", color: [150, 220, 255, 255] });
-      }
+    } else if (ev.type === "skillEffect") {
+      const text = ev.kind === "lifesteal" ? "技能吸血" : `狂暴蓄力 ×${ev.stacks ?? 1}`;
+      const color: [number, number, number, number] = ev.kind === "lifesteal" ? [255, 80, 120, 255] : [255, 130, 30, 255];
+      fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text, color, big: true });
     }
   }
 
   // hit-stop（顿帧）与震屏时间轴：大事件时刻索引
   const stops: { t: number; dur: number; shake: number }[] = [];
   for (const ev of events) {
-    if (ev.type === "proc" && ev.kind === "crit") stops.push({ t: ev.t, dur: 0.14, shake: 14 });
-    else if (ev.type === "skill") stops.push({ t: ev.t, dur: 0.1, shake: 10 });
-    else if (ev.type === "proc" && ev.kind === "rage") stops.push({ t: ev.t, dur: 0.08, shake: 6 });
+    if (ev.type === "skill") stops.push({ t: ev.t, dur: 0.16, shake: 13 });
+    else if (ev.type === "skillEffect") stops.push({ t: ev.t, dur: 0.1, shake: 7 });
     else if (ev.type === "death") stops.push({ t: ev.t, dur: 0.3, shake: 18 });
   }
   function hitStopAt(tb: number): { freeze: boolean; shake: number } {
@@ -137,7 +127,6 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   const applyEvent = (ev: SimEvent) => {
     if (ev.type === "move") { const v = byId[ev.id]; v.x = ev.x; v.y = ev.y; v.facing = ev.facing; }
     else if (ev.type === "damage") { const v = byId[ev.id]; v.hp = ev.hp; v.hitFlash = 0.16; }
-    else if (ev.type === "attack") { const v = byId[ev.id]; v.action = "attack"; }
     else if (ev.type === "skill") { const v = byId[ev.id]; v.action = "skill"; }
     else if (ev.type === "death") { const v = byId[ev.id]; v.alive = false; v.action = "death"; v.deathT = ev.t; }
     else if (ev.type === "buff" && ev.name === "狂暴") { byId[ev.id].rageStacks = ev.stacks; }
@@ -189,7 +178,7 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
       fb.fillRect(px - 20, py + 2, 40, 12, [r, g, b, 220]);
       return;
     }
-    const atk = v.action === "attack" || v.action === "skill";
+    const atk = v.action === "skill";
     const walk = v.action === "walk";
     const bob = walk ? Math.sin(tNow * 16) * 5 : 0;
     const lunge = atk ? v.facing * 14 : 0;
@@ -335,14 +324,14 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           if (age < 0 || age > 0.8) continue;
           // 弹性放大入场 + 淡出
           const inK = Math.min(1, age / 0.12);
-          const scale = (fx.big ? 1.5 : 1.1) * (2.2 - inK * 1.2);
+          const scale = (fx.big ? 0.62 : 0.56) * (1.12 - inK * 0.12);
           const alpha = age > 0.55 ? Math.max(0, 1 - (age - 0.55) / 0.25) : 1;
           // 背景斜切色带
-          const bandH = 110;
+          const bandH = 64;
           fb.blendRect(0, fx.y - bandH / 2, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
           fb.fillRect(0, fx.y - bandH / 2, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
           fb.fillRect(0, fx.y + bandH / 2 - 4, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
-          atlasBig.draw(fb, fx.text, W / 2, fx.y - 40 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], scale, "center");
+          atlasBig.draw(fb, fx.text, W / 2, fx.y - 26 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], scale, "center");
         }
 
         // 死亡时胜者字幕
