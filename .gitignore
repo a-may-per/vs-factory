@@ -1,0 +1,7 @@
+node_modules/
+.venv/
+music-ball/.venv/
+out/
+shared/out/
+__pycache__/
+*.pyc

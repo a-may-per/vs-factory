@@ -1,0 +1,7 @@
+{
+  "name": "vs-factory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "AI 斗蛐蛐短视频工厂：duel(小人对战) + music-ball(音乐小球)"
+}
