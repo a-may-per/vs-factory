@@ -1,0 +1,21 @@
+; Engine configuration file.
+; Pumpkin Knight vs Fire Slime replay viewer.
+config_version=5
+
+[application]
+config/name="Duel Replay"
+run/main_scene="res://scenes/replay.tscn"
+
+[display]
+window/size/viewport_width=1080
+window/size/viewport_height=1920
+window/size/window_width_override=540
+window/size/window_height_override=960
+window/stretch/mode="canvas_items"
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/default_filters/use_nearest_mipmap_filter=false
+textures/canvas_textures/default_texture_filter=0
+

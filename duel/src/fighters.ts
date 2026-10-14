@@ -4,36 +4,36 @@ import type { FighterConfig } from "./sim.ts";
 
 export const VAMPIRE: FighterConfig = {
   id: "A",
-  name: "夜伯爵",
-  title: "不眠血裔",
+  name: "南瓜骑士",
+  title: "万圣游侠",
   maxHp: 780,
   speed: 240,
   contactRange: 145,
   color: "#b3223a",
   color2: "#5a1440",
   passiveKind: "lifesteal",
-  passive: { name: "鲜血汲取", description: "血影突袭命中后恢复造成伤害的 30%" },
+  passive: { name: "南瓜护盾", description: "技能命中后获得短暂护盾" },
   active: {
-    name: "血影突袭", cooldown: 2.8, damage: 150, rangeMul: 1,
-    fx: "bolt", description: "接触后突进斩击，命中后触发技能吸血",
+    name: "南瓜冲锋", cooldown: 2.8, damage: 150, rangeMul: 1,
+    fx: "bolt", description: "接触后冲锋斩击，命中后弹开",
   },
   style: "balanced",
 };
 
 export const BERSERKER: FighterConfig = {
   id: "B",
-  name: "断岳",
-  title: "血性狂徒",
+  name: "火焰史莱姆",
+  title: "熔岩弹弹",
   maxHp: 820,
   speed: 220,
   contactRange: 145,
   color: "#e07820",
   color2: "#7a4014",
   passiveKind: "rage",
-  passive: { name: "狂暴蓄力", description: "每次裂地重斩后蓄力，下一次技能伤害提升" },
+  passive: { name: "火焰蓄力", description: "每次火焰技能命中后，下一次技能更强" },
   active: {
-    name: "裂地重斩", cooldown: 3.2, damage: 165, rangeMul: 1,
-    fx: "whirl", description: "接触后重斩并击退，狂暴蓄力后更强",
+    name: "熔岩爆弹", cooldown: 3.2, damage: 165, rangeMul: 1,
+    fx: "whirl", description: "接触后爆发火焰并击退，蓄力后更强",
   },
   style: "aggressive",
 };
