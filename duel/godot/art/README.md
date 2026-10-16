@@ -1,10 +1,11 @@
-# Godot art drop zone
+# Godot art assets
 
-Put the reviewed ChatGPT-generated sprite sheets here:
+The current files are real transparent RGBA Sprite Sheets generated for the first playable replay:
 
-- `pumpkin_knight_sheet.png` — 288x288, six rows by six columns, 48px cells
-- `fire_slime_sheet.png` — 288x288, six rows by six columns, 48px cells
+- `pumpkin_knight_sheet.png` — 288x288, 6×6 cells, 48px per cell
+- `fire_slime_sheet.png` — 288x288, 6×6 cells, 48px per cell
 
-Until those files exist, the Godot replay viewer uses procedural placeholder art so the event
-replay and camera can be tested. Replace the placeholder textures without changing the JSONL
-protocol.
+Rows are `idle`, `walk`, `cast`, `hit`, `death`, `skill`; base actions use four frames and the
+skill row uses six. They are deliberately simple first-pass Q-style pixel art. Replace these
+files with ChatGPT-generated sheets using the prompt in `../prompts/character-sheet.md`; the
+Godot scene and frame protocol remain unchanged.

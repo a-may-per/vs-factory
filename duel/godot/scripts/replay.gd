@@ -15,6 +15,12 @@ var fighters := {}
 var effects: Array = []
 var paused := false
 
+@export var pumpkin_sheet: Texture2D
+@export var slime_sheet: Texture2D
+const CELL := 48
+const SPRITE_SCALE := 2.15
+const FRAME_RATE := 10.0
+
 func _ready() -> void:
     _load_events()
     queue_redraw()
@@ -39,6 +45,10 @@ func _process(delta: float) -> void:
     while cursor < events.size() and float(events[cursor].get("t", 0)) <= replay_t:
         _apply_event(events[cursor])
         cursor += 1
+    for id in fighters:
+        fighters[id].action_t += delta
+        if fighters[id].action != "walk" and fighters[id].action_t > 0.45 and fighters[id].alive:
+            fighters[id].action = "idle"
     for fx in effects:
         fx.age += delta
     effects = effects.filter(func(fx): return fx.age < fx.life)
@@ -48,24 +58,28 @@ func _apply_event(event: Dictionary) -> void:
     var kind := str(event.get("type", ""))
     var id := str(event.get("id", ""))
     if kind == "spawn":
-        fighters[id] = {"x": float(event.get("x", 0)), "y": float(event.get("y", 0)), "hp": float(event.get("maxHp", 1)), "max_hp": float(event.get("maxHp", 1)), "alive": true, "action": "idle", "flip": false}
+        fighters[id] = {"x": float(event.get("x", 0)), "y": float(event.get("y", 0)), "hp": float(event.get("maxHp", 1)), "max_hp": float(event.get("maxHp", 1)), "alive": true, "action": "idle", "action_t": 0.0, "flip": false}
     elif kind == "move" and fighters.has(id):
         fighters[id].x = float(event.get("x", fighters[id].x))
         fighters[id].y = float(event.get("y", fighters[id].y))
         fighters[id].flip = int(event.get("facing", 1)) < 0
         fighters[id].action = "walk"
+        fighters[id].action_t = 0.0
     elif kind == "damage" and fighters.has(id):
         fighters[id].hp = float(event.get("hp", fighters[id].hp))
         fighters[id].action = "hit"
+        fighters[id].action_t = 0.0
         effects.append({"kind": "hit", "x": float(event.get("x", 0)), "y": float(event.get("y", 0)), "age": 0.0, "life": 0.22})
     elif kind == "skill" and fighters.has(id):
         fighters[id].action = "skill"
+        fighters[id].action_t = 0.0
         effects.append({"kind": "skill", "id": id, "x": float(event.get("x", 0)), "y": float(event.get("y", 0)), "age": 0.0, "life": 0.35})
     elif kind == "skillEffect":
         effects.append({"kind": str(event.get("kind", "bounce")), "id": id, "x": float(event.get("x", 0)), "y": float(event.get("y", 0)), "age": 0.0, "life": 0.42})
     elif kind == "death" and fighters.has(id):
         fighters[id].alive = false
         fighters[id].action = "death"
+        fighters[id].action_t = 0.0
 
 func _arena_pos(f: Dictionary) -> Vector2:
     return Vector2(ARENA.position.x + float(f.x) * ARENA.size.x / 960.0, ARENA.position.y + float(f.y) * ARENA.size.y / 540.0)
@@ -89,29 +103,20 @@ func _draw_grid() -> void:
 
 func _draw_fighter(id: String, f: Dictionary) -> void:
     var p := _arena_pos(f)
-    var color: Color = COLORS[id]
-    # 临时占位：48px 粗描边 Q版几何形。替换 SpriteSheet 后删除此函数中的角色绘制。
-    draw_ellipse(p + Vector2(0, 38), Vector2(28, 12), Color(0, 0, 0, 0.42))
-    if not f.alive:
-        draw_rect(Rect2(p + Vector2(-28, 7), Vector2(56, 14)), color.darkened(0.35), true)
+    var sheet: Texture2D = pumpkin_sheet if id == "A" else slime_sheet
+    if sheet == null:
         return
-    if id == "A":
-        draw_circle(p + Vector2(0, -20), 19, color)
-        draw_circle(p + Vector2(0, -47), 15, Color("#ff9b28"))
-        draw_circle(p + Vector2(-6, -51), 3, Color("#73a94b"))
-        draw_rect(Rect2(p + Vector2(-20, -8), Vector2(40, 43)), Color("#263b66"), true)
-        draw_line(p + Vector2(20, 2), p + Vector2(39, -18), Color("#5dd1c8"), 6)
-    else:
-        draw_circle(p + Vector2(0, -25), 26, color)
-        draw_circle(p + Vector2(-7, -34), 5, Color("#ffd447"))
-        draw_circle(p + Vector2(8, -37), 5, Color("#ff8f24"))
-        draw_circle(p + Vector2(-7, -26), 3, Color("#25152b"))
-        draw_circle(p + Vector2(8, -26), 3, Color("#25152b"))
-
-func draw_ellipse(center: Vector2, radius: Vector2, color: Color) -> void:
-    draw_set_transform(center, 0.0, radius)
-    draw_circle(Vector2.ZERO, 1.0, color)
-    draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+    var row := {"idle": 0, "walk": 1, "skill": 2, "hit": 3, "death": 4}.get(f.action, 0)
+    var frame_count := 6 if row == 5 else 4
+    if f.action == "skill": frame_count = 6
+    if f.action == "death": frame_count = 4
+    var frame := int(f.action_t * FRAME_RATE) % frame_count
+    var source := Rect2(frame * CELL, row * CELL, CELL, CELL)
+    var dest := Rect2(p - Vector2(CELL * SPRITE_SCALE / 2.0, CELL * SPRITE_SCALE), Vector2(CELL * SPRITE_SCALE, CELL * SPRITE_SCALE))
+    if bool(f.flip):
+        dest.position.x += dest.size.x
+        dest.size.x = -dest.size.x
+    draw_texture_rect_region(sheet, dest, source)
 
 func _draw_effect(fx: Dictionary) -> void:
     var p := ARENA.position + Vector2(float(fx.x) * ARENA.size.x / 960.0, float(fx.y) * ARENA.size.y / 540.0)

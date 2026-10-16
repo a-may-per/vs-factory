@@ -35,7 +35,8 @@ ball:  歌曲 → librosa 分析(onset/beat/HPSS) → JSON 事件轴 → 同一�
 ## 状态
 - [x] 两线 MVP 链路 + 样片（out/duel/、out/music-ball/）
 - [ ] 视觉打磨：重击推拉镜头、血条缓动、死亡演出
-- [x] 角色视觉升级方案：Godot 2D + Q版像素 Sprite，南瓜骑士 vs 火焰史莱姆；素材提示词已准备
+- [x] 角色视觉升级方案：Godot 2D + Q版像素 Sprite，南瓜骑士 vs 火焰史莱姆
+- [x] 真实 Sprite Sheet 已生成并接入 Godot 回放（duel/godot/art/ + replay.gd）
 - [x] duel 交手机制修订：无普通攻击，接触即技能，技能后弹开并重新寻路
 - [x] music-ball 节拍碰撞成品：完整二维世界、动态视野、必达抛物线、局部碰撞环/碎片/踏板回弹/球体形变（out/music-ball/impact_world_fx_final.mp4）
 - [x] music-ball 自动卡点：beat_track 主节拍骨架 + onset_strength 强弱 + HPSS 音色分层；强拍必达、弱音装饰
