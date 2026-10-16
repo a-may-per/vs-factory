@@ -48,6 +48,12 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
     font.draw(fb, text, x, y, color, baseScale * Math.min(1, maxWidth / natural), align);
   };
 
+  // 动态演出安全区：任何飘字/横幅都必须落在画布和擂台内，不能压 HUD 或越过擂台边线。
+  const ARENA_TOP = AY + 22;
+  const ARENA_BOTTOM = AY + Math.round(ARENA_H * SCALE) - 26;
+  const clampTextY = (y: number, halfHeight = 24) =>
+    Math.max(ARENA_TOP + halfHeight, Math.min(ARENA_BOTTOM - halfHeight, y));
+
   // ---------- 回放视图 ----------
   const spawnEv = events.filter(e => e.type === "spawn") as Extract<SimEvent, { type: "spawn" }>[];
   const byId: Record<Side, FighterView> = {} as any;
@@ -76,7 +82,10 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   for (const ev of events) {
     const at = INTRO_SEC + ev.t;
     if (ev.type === "skill") sfxTracks.push({ pcm: synthSfx("skill", 200 + Math.floor(ev.t * 11)), offsetSec: at, gain: 0.95 });
-    else if (ev.type === "skillEffect") sfxTracks.push({ pcm: synthSfx(ev.kind === "rage" ? "whoosh" : "coin", 400 + Math.floor(ev.t * 13)), offsetSec: at, gain: 0.75 });
+    else if (ev.type === "skillEffect") {
+      const sound = ev.kind === "rage" ? "whoosh" : ev.kind === "lifesteal" ? "coin" : "punch";
+      sfxTracks.push({ pcm: synthSfx(sound, 400 + Math.floor(ev.t * 13)), offsetSec: at, gain: ev.kind === "bounce" ? 0.45 : 0.75 });
+    }
     else if (ev.type === "death") sfxTracks.push({ pcm: synthSfx("death", 300 + Math.floor(ev.t * 5)), offsetSec: at, gain: 1.0 });
   }
   const mixed = mixTracks(sfxTracks, totalSec);
@@ -97,13 +106,15 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   const fxList: Fx[] = [];
   for (const ev of events) {
     if (ev.type === "damage") {
-      fxList.push({ t0: ev.t, kind: "dmg", x: ev.x, y: ev.y - 120, text: `-${ev.value}`, color: [255, 96, 84, 255] });
+      const x = ev.x + (ev.id === "A" ? -72 : 72);
+      fxList.push({ t0: ev.t, kind: "dmg", x, y: ev.y - 165, text: `-${ev.value}`, color: [255, 96, 84, 255] });
     } else if (ev.type === "heal") {
-      fxList.push({ t0: ev.t, kind: "heal", x: ev.x, y: ev.y - 140, text: ev.text, color: [96, 230, 140, 255] });
+      const x = ev.x + (ev.id === "A" ? -92 : 92);
+      fxList.push({ t0: ev.t, kind: "heal", x, y: ev.y - 82, text: ev.text, color: [96, 230, 140, 255] });
     } else if (ev.type === "skill") {
       fxList.push({ t0: ev.t, kind: "skillring", x: ev.x, y: ev.y, text: ev.name, color: ev.id === "A" ? [255, 90, 130, 255] : [255, 190, 70, 255], big: true });
       fxList.push({ t0: ev.t, kind: "slash", x: ev.x, y: ev.y, text: "", color: [255, 240, 180, 255] });
-    } else if (ev.type === "skillEffect") {
+    } else if (ev.type === "skillEffect" && ev.kind !== "bounce") {
       const text = ev.kind === "lifesteal" ? "技能吸血" : `狂暴蓄力 ×${ev.stacks ?? 1}`;
       const color: [number, number, number, number] = ev.kind === "lifesteal" ? [255, 80, 120, 255] : [255, 130, 30, 255];
       fxList.push({ t0: ev.t, kind: "banner", x: W / 2, y: 300, text, color, big: true });
@@ -114,7 +125,7 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
   const stops: { t: number; dur: number; shake: number }[] = [];
   for (const ev of events) {
     if (ev.type === "skill") stops.push({ t: ev.t, dur: 0.16, shake: 13 });
-    else if (ev.type === "skillEffect") stops.push({ t: ev.t, dur: 0.1, shake: 7 });
+    else if (ev.type === "skillEffect" && ev.kind !== "bounce") stops.push({ t: ev.t, dur: 0.1, shake: 7 });
     else if (ev.type === "death") stops.push({ t: ev.t, dur: 0.3, shake: 18 });
   }
   function hitStopAt(tb: number): { freeze: boolean; shake: number } {
@@ -250,14 +261,16 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
       if (age < 0 || age > 0.9) continue;
       const rise = age * 50;
       const alpha = Math.max(0, 255 - age * 320);
-      const sx = AX + fx.x * SCALE + shx, sy = AY + fx.y * SCALE + shy;
+      const sx = Math.max(28, Math.min(W - 28, AX + fx.x * SCALE + shx));
+      const rawSy = AY + fx.y * SCALE + shy;
+      const sy = clampTextY(rawSy);
       if (fx.kind === "skillring") {
         const rr = 18 + age * 150;
         for (let seg = 0; seg < 22; seg++) {
           const ang = (seg / 22) * Math.PI * 2;
           fb.blendCircle(sx + Math.cos(ang) * rr, sy + Math.sin(ang) * rr, 6, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * 0.6)]);
         }
-        drawFit(fb, atlas, fx.text, sx, sy - 90 - rise, fx.color, 300, 0.66, "center");
+        drawFit(fb, atlas, fx.text, sx, clampTextY(sy + 70 + rise * 0.2), fx.color, 260, 0.58, "center");
       } else if (fx.kind === "slash") {
         // 斜向斩击线
         const len = 30 + age * 260;
@@ -266,7 +279,7 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           fb.blendCircle(sx - len / 2 + len * k, sy - len / 3 + (len / 3) * k, 5 - k * 3, [fx.color[0], fx.color[1], fx.color[2], Math.round(alpha * (1 - k) * 0.9)]);
         }
       } else {
-        drawFit(fb, atlas, fx.text, sx, sy - rise, fx.color, 300, fx.big ? 1.05 : 0.72, "center");
+        drawFit(fb, atlas, fx.text, sx, clampTextY(sy - rise), fx.color, 300, fx.big ? 1.05 : 0.72, "center");
       }
     }
   };
@@ -338,10 +351,11 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           const alpha = age > 0.55 ? Math.max(0, 1 - (age - 0.55) / 0.25) : 1;
           // 背景斜切色带
           const bandH = 64;
-          fb.blendRect(0, fx.y - bandH / 2, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
-          fb.fillRect(0, fx.y - bandH / 2, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
-          fb.fillRect(0, fx.y + bandH / 2 - 4, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
-          drawFit(fb, atlasBig, fx.text, W / 2, fx.y - 26 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], W - 80, scale, "center");
+          const bandY = 300; // 固定在 HUD 下方、擂台上方的技能信息槽
+          fb.blendRect(0, bandY - bandH / 2, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
+          fb.fillRect(0, bandY - bandH / 2, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
+          fb.fillRect(0, bandY + bandH / 2 - 4, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
+          drawFit(fb, atlasBig, fx.text, W / 2, bandY - 18 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], W - 80, scale, "center");
         }
 
         // 死亡时胜者字幕
