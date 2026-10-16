@@ -106,13 +106,13 @@ func _draw_fighter(id: String, f: Dictionary) -> void:
     var sheet: Texture2D = pumpkin_sheet if id == "A" else slime_sheet
     if sheet == null:
         return
-    var row := {"idle": 0, "walk": 1, "skill": 2, "hit": 3, "death": 4}.get(f.action, 0)
-    var frame_count := 6 if row == 5 else 4
+    var row: int = int({"idle": 0, "walk": 1, "skill": 2, "hit": 3, "death": 4}.get(f.action, 0))
+    var frame_count: int = 6 if row == 5 else 4
     if f.action == "skill": frame_count = 6
     if f.action == "death": frame_count = 4
-    var frame := int(f.action_t * FRAME_RATE) % frame_count
-    var source := Rect2(frame * CELL, row * CELL, CELL, CELL)
-    var dest := Rect2(p - Vector2(CELL * SPRITE_SCALE / 2.0, CELL * SPRITE_SCALE), Vector2(CELL * SPRITE_SCALE, CELL * SPRITE_SCALE))
+    var frame: int = int(f.action_t * FRAME_RATE) % frame_count
+    var source: Rect2 = Rect2(frame * CELL, row * CELL, CELL, CELL)
+    var dest: Rect2 = Rect2(p - Vector2(CELL * SPRITE_SCALE / 2.0, CELL * SPRITE_SCALE), Vector2(CELL * SPRITE_SCALE, CELL * SPRITE_SCALE))
     if bool(f.flip):
         dest.position.x += dest.size.x
         dest.size.x = -dest.size.x
