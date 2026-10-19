@@ -18,7 +18,7 @@ var paused := false
 @export var pumpkin_sheet: Texture2D
 @export var slime_sheet: Texture2D
 const CELL := 48
-const SPRITE_SCALE := 2.15
+const SPRITE_SCALE := 1.75
 const FRAME_RATE := 10.0
 
 func _ready() -> void:
@@ -112,7 +112,10 @@ func _draw_fighter(id: String, f: Dictionary) -> void:
     if f.action == "death": frame_count = 4
     var frame: int = int(f.action_t * FRAME_RATE) % frame_count
     var source: Rect2 = Rect2(frame * CELL, row * CELL, CELL, CELL)
-    var dest: Rect2 = Rect2(p - Vector2(CELL * SPRITE_SCALE / 2.0, CELL * SPRITE_SCALE), Vector2(CELL * SPRITE_SCALE, CELL * SPRITE_SCALE))
+    var visual_half := CELL * SPRITE_SCALE / 2.0
+    p.x = clamp(p.x, ARENA.position.x + visual_half, ARENA.end.x - visual_half)
+    p.y = clamp(p.y, ARENA.position.y + visual_half, ARENA.end.y - visual_half)
+    var dest: Rect2 = Rect2(p - Vector2(visual_half, visual_half * 2.0), Vector2(CELL * SPRITE_SCALE, CELL * SPRITE_SCALE))
     if bool(f.flip):
         dest.position.x += dest.size.x
         dest.size.x = -dest.size.x

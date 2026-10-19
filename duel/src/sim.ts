@@ -60,7 +60,7 @@ export const ARENA_H = 540;
 export const TICK_RATE = 60;
 const DT = 1 / TICK_RATE;
 const MOVE_EVERY = 2;
-const RADIUS = 42;
+const RADIUS = 56;
 
 function mulberry32(seed: number) {
   let s = seed >>> 0;
@@ -139,6 +139,12 @@ export function simulate(cfgA: FighterConfig, cfgB: FighterConfig, seed: number,
       b.x += nx * overlap * 0.5;
       b.y += ny * overlap * 0.5;
     }
+    // 分离后也必须立即限制在擂台内，避免下一帧才回弹造成穿墙视觉。
+    const clamp = (f: FighterState) => {
+      f.x = Math.min(ARENA_W - RADIUS, Math.max(RADIUS, f.x));
+      f.y = Math.min(ARENA_H - RADIUS, Math.max(ARENA_H * 0.45 + RADIUS, f.y));
+    };
+    clamp(a); clamp(b);
   }
 
   function castSkill(caster: FighterState, target: FighterState): boolean {
