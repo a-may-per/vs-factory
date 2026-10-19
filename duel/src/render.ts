@@ -347,15 +347,17 @@ export async function renderDuel(eventsPath: string, outMp4: string, opts: { col
           if (age < 0 || age > 0.8) continue;
           // 弹性放大入场 + 淡出
           const inK = Math.min(1, age / 0.12);
-          const scale = (fx.big ? 0.62 : 0.56) * (1.12 - inK * 0.12);
           const alpha = age > 0.55 ? Math.max(0, 1 - (age - 0.55) / 0.25) : 1;
-          // 背景斜切色带
-          const bandH = 64;
-          const bandY = 300; // 固定在 HUD 下方、擂台上方的技能信息槽
-          fb.blendRect(0, bandY - bandH / 2, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
-          fb.fillRect(0, bandY - bandH / 2, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
-          fb.fillRect(0, bandY + bandH / 2 - 4, W, 4, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
-          drawFit(fb, atlasBig, fx.text, W / 2, bandY - 18 * scale, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], W - 80, scale, "center");
+          // 固定技能槽：用 64px 图集并把实际字高锁在横条内，禁止越过上下边线。
+          const bandH = 58;
+          const bandY = 300;
+          const bandTop = bandY - bandH / 2;
+          const bandBottom = bandY + bandH / 2;
+          const textScale = 0.43 * (0.92 + inK * 0.08);
+          fb.blendRect(0, bandTop, W, bandH, [fx.color[0], fx.color[1], fx.color[2], Math.round(50 * alpha)]);
+          fb.fillRect(0, bandTop, W, 3, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
+          fb.fillRect(0, bandBottom - 3, W, 3, [fx.color[0], fx.color[1], fx.color[2], Math.round(220 * alpha)]);
+          drawFit(fb, atlas, fx.text, W / 2, bandTop + 10, [fx.color[0], fx.color[1], fx.color[2], Math.round(255 * alpha)], W - 96, textScale, "center");
         }
 
         // 死亡时胜者字幕
