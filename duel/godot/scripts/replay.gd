@@ -106,20 +106,22 @@ func _draw_fighter(id: String, f: Dictionary) -> void:
     var sheet: Texture2D = pumpkin_sheet if id == "A" else slime_sheet
     if sheet == null:
         return
-    var row: int = int({"idle": 0, "walk": 1, "skill": 2, "hit": 3, "death": 4}.get(f.action, 0))
+    # 第 6 行才是角色专属技能；第 3 行保留为通用 cast。
+    var row: int = int({"idle": 0, "walk": 1, "skill": 5, "hit": 3, "death": 4}.get(f.action, 0))
     var frame_count: int = 6 if row == 5 else 4
-    if f.action == "skill": frame_count = 6
-    if f.action == "death": frame_count = 4
     var frame: int = int(f.action_t * FRAME_RATE) % frame_count
     var source: Rect2 = Rect2(frame * CELL, row * CELL, CELL, CELL)
     var visual_half := CELL * SPRITE_SCALE / 2.0
     p.x = clamp(p.x, ARENA.position.x + visual_half, ARENA.end.x - visual_half)
     p.y = clamp(p.y, ARENA.position.y + visual_half, ARENA.end.y - visual_half)
-    var dest: Rect2 = Rect2(p - Vector2(visual_half, visual_half * 2.0), Vector2(CELL * SPRITE_SCALE, CELL * SPRITE_SCALE))
-    if bool(f.flip):
-        dest.position.x += dest.size.x
-        dest.size.x = -dest.size.x
-    draw_texture_rect_region(sheet, dest, source)
+
+    # 以角色脚底中心为原点镜像。不能用负宽 Rect2：负宽会让 Godot 从错误锚点
+    # 向外展开贴图，角色贴右墙并朝左时就会视觉穿墙。
+    var flip_scale := -SPRITE_SCALE if bool(f.flip) else SPRITE_SCALE
+    draw_set_transform(p, 0.0, Vector2(flip_scale, SPRITE_SCALE))
+    var local_dest := Rect2(-CELL / 2.0, -CELL, CELL, CELL)
+    draw_texture_rect_region(sheet, local_dest, source)
+    draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 func _draw_effect(fx: Dictionary) -> void:
     var p := ARENA.position + Vector2(float(fx.x) * ARENA.size.x / 960.0, float(fx.y) * ARENA.size.y / 540.0)
