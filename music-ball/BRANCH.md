@@ -24,7 +24,7 @@
       假敲击多 → [Demucs 4.1](https://pypi.org/project/demucs/)（用 adefossez 活跃 fork，MIT；htdemucs 模型仅限非商用）
 - [x] 排除项：aubio（7 年未发版+GPL 编译门槛）、madmom（模型 CC BY-NC 禁商用+PyPI 已死）、
       spleeter（Python<3.12 锁死）、essentia（AGPL 传染）
-- [x] 渲染栈：**复用 duel 的 PixiJS+ffmpeg 管线**——两线同一套渲染/导出/发布代码，只是数据源不同
+- [x] 渲染栈：**复用 duel 的 TS 软件光栅器 + ffmpeg 管线**——两线同一套渲染/导出/发布代码；不依赖 PixiJS 原生模块，平台/跑酷只换数据源
 - [ ] 画面风格（霓虹几何/像素/卡通）：待参考视频到位后定
 - [x] 小球角色化：**主角球+换装**（2026-10-09 拍板）——全系列同一只主角球，
       通过换装/换色/换表情适配不同歌，观众认脸，制作最省
@@ -37,12 +37,23 @@
 - **BGM 版权张力**：踩点按成片内音轨生成，抖音站内换曲会破坏音画同步 → 曲库有同名曲才站内换轨，否则改用 CC0/已购授权曲烧录
 - 本机 Python 3.9.6 < librosa 要求的 3.12 → 首周用 brew/uv 装新版
 
-## 实现记录（2026-10-10 初版代码完成）
-- [x] 音频分析：music-ball/tools/analyze.py（librosa onset+beat+HPSS → JSON 事件轴 {t_ms,strength,band,beat,downbeat}），
-      120ms 去重；实测 35.9s 曲子提取 128 敲击点，BPM 误差 2%
-- [x] 渲染：复用共享 TS 光栅器+ffmpeg 管线；蛇形赛道 + 命中波纹 + 光柱 + 拖尾小球；
-      音频 = 原曲 + 程序化敲击音效混合
-- [x] 一键：`node music-ball/run.ts <song.wav|mp3> [out.mp4]`
-- 样片：out/music-ball/chill_demo.mp4（38.4s，程序化生成的 CC0 测试曲）
-- 已知短板（下轮迭代）：画面上半 40% 空置（可加音量波形可视化）；小球未角色化（主角球+换装待做）；
-  mp3 输入未实测（librosa 需 ffmpeg/audioread 支持）；热门歌版权策略未接
+## 实现记录（2026-10-10 节拍碰撞成品）
+- [x] 音频分析：`tools/analyze.py`（librosa onset + beat + HPSS），输出
+      `{t_ms,strength,band,beat,downbeat,tier}`；用节拍网格做主轴，strong/beat/weak 三层卡点
+- [x] 碰撞关卡：`src/impact-level.ts` 将强拍生成大跳板、普通拍生成墙面/板、弱拍生成装饰块；
+      seed 保证同一歌曲重复生成同一布局，强拍目标不会漏掉
+- [x] 必达轨迹：`src/impact-motion.ts` 用重力抛物线连接相邻主目标，端点严格落在下一个目标；
+      视觉有斜向下坠/反弹，数值上保证关键节点命中
+- [x] 渲染：`src/render.ts` 共享 TS 光栅器 + ffmpeg，强拍爆闪/震动/碰撞波纹/拖尾/连击；输出 1920×1080
+- [x] 一键：`node music-ball/run.ts <song.wav|mp3> [out.mp4] [seed]`；输入先由 ffmpeg 统一为 44.1kHz 单声道 WAV
+- 样片：`out/music-ball/impact_world_fx_final.mp4`（MP3 输入，完整世界+动态镜头+局部碰撞特效，约 38s）
+- [x] 完整世界：所有 strong/beat/weak 对象在生成关卡时即存在；渲染只按镜头视锥裁剪，不再按时间窗口临时出现
+- [x] 动态视野：根据小球与未来 3~4 个目标的包围盒自动缩放，目标稀疏时拉远看到更多，密集时拉近
+- [x] 新碰撞特效：移除全屏白闪，改踏板压缩回弹、局部双冲击环、法线方向碎片、短时拖尾增强、球体椭圆 squash/stretch
+- [x] 流行音乐自动卡点：MP3/热门歌 → ffmpeg 标准化 → beat 网格 + onset 强度分层 → 必达碰撞目标 → 混音成片
+  - `strong`：downbeat 或强度前 32%，大跳板/强爆闪/重音
+  - `beat`：beat_track 的普通节拍，墙面/普通板
+  - `weak`：节拍外强 onset，小碰撞块/装饰，不干扰主轨迹
+  - 主轨迹按相邻目标时间差反推抛物线，因此关键强拍不会漏撞
+- 已知限制：节拍极弱、rubato 或现场演奏的歌曲会降低 beat_track 准确率；正式发布热门歌仍应使用平台曲库/合法授权
+- 下一步可选：真实流行歌曲 A/B 校准阈值与目标密度，增加可配置的视觉主题和小球换装

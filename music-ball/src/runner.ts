@@ -41,13 +41,15 @@ function platformAt(level: Level, x: number, y: number, vy: number): Platform | 
 
 export function createRunner(level: Level, options: RunnerOptions = {}): RunnerState {
   const startY = options.startY ?? 500;
+  const startX = options.startX ?? 90;
+  const startPlatform = level.platforms.find(p => p.kind === "start" || (startX >= p.x && startX <= p.endX));
   return {
-    x: options.startX ?? 90,
+    x: startX,
     y: startY - BALL_R,
     vx: options.speed ?? level.speed,
     vy: 0,
     grounded: true,
-    platformId: 0,
+    platformId: startPlatform?.id ?? 0,
     status: "run",
     jumpT: 0,
     nextTarget: 0,
@@ -58,10 +60,15 @@ export function createRunner(level: Level, options: RunnerOptions = {}): RunnerS
 
 function shouldJump(state: RunnerState, level: Level, t: number): BeatTarget | undefined {
   const target = level.targets[state.nextTarget];
-  if (!target || target.tSec < t - 0.12) return target;
+  if (!target || target.tSec < t - 0.12) return undefined;
+  // 同一平台上的节拍点只负责连击，不应让小球反复起跳。
+  // 只有目标位于另一平台，或当前平台即将结束时，才触发跳跃。
+  const current = level.platforms.find(p => p.id === state.platformId);
+  const needsTransition = target.platformId !== state.platformId || Boolean(current && state.x > current.endX - 140);
+  if (!needsTransition) return undefined;
   const dx = target.x - state.x;
-  // 事件点来到球前方 160px 内时跳，强拍提前一点。
-  const trigger = target.downbeat ? 230 : target.beat ? 190 : 155;
+  // 事件点来到球前方时起跳；重拍提前更远，给高台/缺口留足飞行时间。
+  const trigger = target.downbeat ? 300 : target.beat ? 250 : 200;
   return dx > 0 && dx < trigger ? target : undefined;
 }
 
@@ -76,6 +83,15 @@ export function stepRunner(
   const jumpVelocity = options.jumpVelocity ?? -610;
   const beforeY = state.y;
   const target = shouldJump(state, level, t);
+  if (state.grounded) {
+    const support = level.platforms.find(p => p.id === state.platformId);
+    const stillSupported = support && state.x >= support.x - BALL_R && state.x <= support.endX + BALL_R;
+    if (!stillSupported) {
+      state.grounded = false;
+      state.status = "fall";
+      state.vy = Math.max(0, state.vy);
+    }
+  }
   if (state.grounded && target) {
     state.vy = jumpVelocity - (target.downbeat ? 70 : target.strength * 50);
     state.grounded = false;

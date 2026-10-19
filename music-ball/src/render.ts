@@ -1,161 +1,237 @@
-// music-ball 渲染器：吃 JSON 事件轴 → 小球横版跑酷踩点动画 → 1080x1920 竖屏成片。
-// 布局：竖屏里赛道横向滚动，小球固定在画面左 1/3，敲击点从右侧迎面而来。
+// 节拍碰撞渲染器：完整二维世界 + 动态镜头 + 局部碰撞特效。
+// 所有墙面/踏板在关卡生成时已存在；镜头视野只做裁剪，不按时间临时生成目标。
 import { FrameBuf } from "../../shared/render/framebuf.ts";
 import { FontAtlas } from "../../shared/render/atlas.ts";
 import { encodeFrames } from "../../shared/render/encoder.ts";
 import { synthSfx, writeWav } from "../../shared/audio/sfx.ts";
 import { mixTracks, normalize } from "../../shared/audio/mixer.ts";
-import type { SimEvent as _Unused } from "../../duel/src/sim.ts";
+import { buildImpactLevel, type AxisEvent, type ImpactTarget, type ShaftWall } from "./impact-level.ts";
+import { planSegments, sampleImpactMotion, type ImpactMotionFrame } from "./impact-motion.ts";
 import { readFileSync } from "node:fs";
 
-const W = 1080, H = 1920, FPS = 30;
-const SR = 44100;
-
-interface AxisEvent { t_ms: number; strength: number; band: string; beat: boolean; downbeat: boolean }
+const W = 1920, H = 1080, FPS = 30, SR = 44100;
+const INTRO = 1.1, OUTRO = 1.6;
 interface Axis { meta: { duration_s: number; tempo: number; events: number }; events: AxisEvent[] }
+interface Camera { x: number; y: number; zoom: number }
 
-const BALL_X = 340;            // 小球屏幕 x
-const TRACK_Y = 1240;          // 赛道基准线 y
-const APPROACH_SEC = 1.6;      // 敲击点从右边进入的提前量
+function readMonoWav(path: string): Float32Array {
+  const bytes = readFileSync(path);
+  if (bytes.toString("ascii", 0, 4) !== "RIFF" || bytes.toString("ascii", 8, 12) !== "WAVE") throw new Error("music-ball needs WAV/PCM input");
+  let p = 12, channels = 0, bits = 0, data = -1, size = 0;
+  while (p + 8 <= bytes.length) {
+    const id = bytes.toString("ascii", p, p + 4), n = bytes.readUInt32LE(p + 4), start = p + 8;
+    if (id === "fmt ") { if (bytes.readUInt16LE(start) !== 1) throw new Error("only PCM WAV is supported"); channels = bytes.readUInt16LE(start + 2); bits = bytes.readUInt16LE(start + 14); }
+    if (id === "data") { data = start; size = Math.min(n, bytes.length - start); break; }
+    p = start + n + (n % 2);
+  }
+  if (data < 0 || channels < 1 || bits !== 16) throw new Error("invalid 16-bit PCM WAV");
+  const count = Math.floor(size / 2 / channels), mono = new Float32Array(count);
+  for (let i = 0; i < count; i++) { let s = 0; for (let c = 0; c < channels; c++) s += bytes.readInt16LE(data + (i * channels + c) * 2) / 32768; mono[i] = s / channels; }
+  return mono;
+}
 
-export async function renderMusicBall(axisPath: string, audioPath: string, outMp4: string): Promise<void> {
-  const axis: Axis = JSON.parse(readFileSync(axisPath, "utf-8"));
-  const evs = axis.events;
-  const duration = axis.meta.duration_s;
+const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+function screen(worldX: number, worldY: number, cam: Camera): [number, number] {
+  return [(worldX - cam.x) * cam.zoom + W * 0.43, (worldY - cam.y) * cam.zoom + H * 0.43];
+}
+function visible(x: number, y: number, margin = 180): boolean { return x > -margin && x < W + margin && y > -margin && y < H + margin; }
 
+/** 根据当前球和未来两个目标的包围盒确定视野：稀疏时拉远、密集时拉近。 */
+function desiredCamera(motion: ImpactMotionFrame, targets: ImpactTarget[], currentId: number, impactPulse: number): Camera {
+  const ahead = targets.filter(t => t.id >= Math.max(0, currentId - 1)).slice(0, 4);
+  const xs = [motion.x, ...ahead.map(t => t.x)], ys = [motion.y, ...ahead.map(t => t.y)];
+  const spanX = Math.max(...xs) - Math.min(...xs), spanY = Math.max(...ys) - Math.min(...ys);
+  const fitX = 1050 / Math.max(520, spanX + 300), fitY = 610 / Math.max(360, spanY + 240);
+  let zoom = clamp(Math.min(fitX, fitY), 0.70, 1.10);
+  zoom *= 1 + impactPulse * 0.025; // 强拍只做很轻的局部推近
+  const lead = ahead[1] ?? ahead[0];
+  const lookX = lead ? motion.x * 0.66 + lead.x * 0.34 : motion.x;
+  const lookY = lead ? motion.y * 0.72 + lead.y * 0.28 : motion.y;
+  return { x: lookX, y: lookY, zoom };
+}
+
+/** 接触后的局部反馈：踏板压缩/回弹、环和方向性碎片，无全屏闪白。 */
+function impactAge(target: ImpactTarget, gameT: number): number { return gameT - target.tSec; }
+function impactPulse(target: ImpactTarget | undefined, gameT: number): number {
+  if (!target) return 0;
+  const age = Math.abs(gameT - target.tSec);
+  return age < 0.24 ? 1 - age / 0.24 : 0;
+}
+
+function drawCorridorWall(fb: FrameBuf, wall: ShaftWall, cam: Camera, gameT: number): void {
+  const x = Math.round((wall.x - cam.x) * cam.zoom + W * 0.43);
+  const y = Math.round((wall.yStart + wall.yEnd) / 2 - cam.y);
+  const length = (wall.yEnd - wall.yStart) * cam.zoom;
+  if (!visible(x, H / 2, length / 2)) return;
+  const c = wall.hue;
+  // 纵向连续墙：厚基座、内沿灯带、按下坠方向排列的结构刻度。
+  fb.fillRotatedRect(x, H * 0.43, wall.thickness * cam.zoom, length, 0, [c[0], c[1], c[2], 245]);
+  const inner = wall.side === "left" ? x + wall.thickness * cam.zoom * 0.38 : x - wall.thickness * cam.zoom * 0.38;
+  fb.fillRotatedRect(inner, H * 0.43, 10 * cam.zoom, length - 10, 0, [108, 142, 208, 235]);
+  for (let mark = wall.yStart + 80; mark < wall.yEnd; mark += 150) {
+    const sy = (mark - cam.y) * cam.zoom + H * 0.43;
+    fb.fillRect(wall.side === "left" ? x + 8 : x - 48 * cam.zoom, sy, 40 * cam.zoom, 5 * cam.zoom, [185, 207, 255, 135]);
+  }
+}
+
+function drawTarget(fb: FrameBuf, target: ImpactTarget, cam: Camera, gameT: number): void {
+  const [x, y] = screen(target.x, target.y, cam);
+  if (!visible(x, y, target.length * cam.zoom)) return;
+  const age = impactAge(target, gameT);
+  const active = age >= 0 && age < 0.30;
+  const pulse = active ? 1 - age / 0.30 : 0;
+  const [r, g, b] = target.hue;
+  const compress = 1 - pulse * 0.24;
+  const rebound = active ? Math.sin(clamp(age / 0.30, 0, 1) * Math.PI) * 8 : 0;
+  const length = (target.tier === "strong" ? 168 : target.tier === "beat" ? 42 : 26) * cam.zoom;
+  const thick = Math.max(7, (target.tier === "strong" ? 30 : target.tier === "beat" ? 12 : 9) * cam.zoom * compress);
+  const angle = target.normalAngle;
+
+  // 普通 beat/weak 只保留墙边短标记；大型独立结构只给 strong。
+  fb.fillRotatedRect(x, y + rebound, length + (target.tier === "strong" ? 20 : 8) * cam.zoom, thick + 10 * cam.zoom, angle, [r, g, b, target.tier === "strong" ? 34 : 22]);
+  fb.fillRotatedRect(x, y + rebound, length, thick, angle, [r, g, b, 255]);
+  fb.fillRotatedRect(x, y + rebound - 3 * cam.zoom, length * 0.82, Math.max(3, thick * 0.20), angle, [245, 252, 255, 210]);
+
+  if (active) {
+    // 收缩的双冲击环。
+    for (let ring = 0; ring < 2; ring++) {
+      const rr = (28 + ring * 22 + age * 120) * cam.zoom;
+      const alpha = Math.round((1 - age / 0.30) * (130 - ring * 34));
+      for (let i = 0; i < 24; i++) {
+        const a = i / 24 * Math.PI * 2;
+        fb.blendCircle(x + Math.cos(a) * rr, y + Math.sin(a) * rr, 3.2 * cam.zoom, [r, g, b, alpha]);
+      }
+    }
+    // 碎片沿踏板法线喷射，位置完全确定，不使用随机数。
+    const nx = Math.cos(angle - Math.PI / 2), ny = Math.sin(angle - Math.PI / 2);
+    const tx = Math.cos(angle), ty = Math.sin(angle);
+    const count = target.tier === "strong" ? 12 : 7;
+    for (let i = 0; i < count; i++) {
+      const side = i % 2 ? 1 : -1;
+      const speed = (36 + (i % 4) * 14) * age * 3.3 * cam.zoom;
+      const spread = side * (10 + i * 3) * age * cam.zoom;
+      const px = x + nx * speed + tx * spread;
+      const py = y + ny * speed + ty * spread + 90 * age * age;
+      const alpha = Math.round(220 * (1 - age / 0.30));
+      fb.fillRotatedRect(px, py, 9 * cam.zoom, 4 * cam.zoom, angle + i * 0.37, [r, g, b, alpha]);
+    }
+  }
+}
+
+function drawAccent(fb: FrameBuf, target: ImpactTarget, cam: Camera): void {
+  const [x, y] = screen(target.x, target.y, cam);
+  if (!visible(x, y, 70)) return;
+  const r = target.radius * cam.zoom;
+  fb.blendCircle(x, y, r + 9 * cam.zoom, [target.hue[0], target.hue[1], target.hue[2], 30]);
+  fb.fillCircle(x, y, r, [target.hue[0], target.hue[1], target.hue[2], 215]);
+  fb.fillCircle(x - r * 0.25, y - r * 0.25, r * 0.25, [245, 238, 255, 210]);
+}
+
+function drawBall(fb: FrameBuf, motion: ImpactMotionFrame, cam: Camera, collision: ImpactTarget | undefined, gameT: number): void {
+  const [x, y] = screen(motion.x, motion.y, cam);
+  const age = collision ? Math.abs(gameT - collision.tSec) : 9;
+  const hit = age < 0.16;
+  const tierColor: [number, number, number] = collision?.tier === "strong" ? [255, 198, 70] : [96, 214, 255];
+  const baseR = 28 * cam.zoom;
+  // 撞击 squash，离开时 stretch：用旋转矩形+圆心模拟椭圆轮廓。
+  const squeeze = hit ? Math.sin((1 - age / 0.16) * Math.PI / 2) : 0;
+  const sx = 1 + squeeze * 0.35, sy = 1 - squeeze * 0.24;
+  const trailBoost = hit ? 1.8 : 1;
+  const mag = Math.max(1, Math.hypot(motion.vx, motion.vy));
+  const ux = motion.vx / mag, uy = motion.vy / mag;
+  for (let i = 6; i >= 1; i--) {
+    const d = i * 18 * cam.zoom * trailBoost;
+    fb.blendCircle(x - ux * d, y - uy * d, Math.max(3, baseR - i * 3.2 * cam.zoom), [tierColor[0], tierColor[1], tierColor[2], Math.round(52 / (i * 0.7))]);
+  }
+  const angle = Math.atan2(motion.vy, motion.vx);
+  fb.fillRotatedEllipse(x, y, baseR * sx, baseR * sy, angle, [tierColor[0], tierColor[1], tierColor[2], 255]);
+  // 高光和表情跟随球心，撞击时不会出现方形轮廓。
+  fb.fillCircle(x - baseR * 0.30, y - baseR * 0.34, baseR * 0.30, [238, 255, 255, 235]);
+  fb.fillCircle(x - baseR * 0.28, y - baseR * 0.02, Math.max(2, baseR * 0.12), [28, 45, 76, 255]);
+  fb.fillCircle(x + baseR * 0.28, y - baseR * 0.02, Math.max(2, baseR * 0.12), [28, 45, 76, 255]);
+  fb.fillRect(x - baseR * 0.28, y + baseR * 0.32, baseR * 0.56, Math.max(2, baseR * 0.10), [28, 45, 76, 255]);
+}
+
+export async function renderImpactMusicBall(axisPath: string, audioPath: string, outMp4: string, seed = 23): Promise<void> {
+  const axis = JSON.parse(readFileSync(axisPath, "utf8")) as Axis;
+  const level = buildImpactLevel(axis.events, axis.meta.duration_s, seed);
+  const segments = planSegments(level, 760);
+  const audio = readMonoWav(audioPath);
+  const total = INTRO + axis.meta.duration_s + OUTRO;
+  const frameCount = Math.ceil(total * FPS);
   const fontDir = new URL("../../shared/fonts/", import.meta.url).pathname;
   const atlas = new FontAtlas(fontDir + "atlas64.rgba", fontDir + "atlas64.json");
-  const atlasBig = new FontAtlas(fontDir + "atlas96.rgba", fontDir + "atlas96.json");
+  const big = new FontAtlas(fontDir + "atlas96.rgba", fontDir + "atlas96.json");
 
-  const introSec = 1.0;
-  const totalSec = introSec + duration + 1.5;
-  const totalFrames = Math.ceil(totalSec * FPS);
+  const tracks: { pcm: Float32Array; offsetSec: number; gain?: number }[] = [];
+  for (const target of level.mainTargets) tracks.push({ pcm: synthSfx(target.tier === "strong" ? "crit" : "punch", 1200 + target.id), offsetSec: INTRO + target.tSec, gain: target.tier === "strong" ? 0.48 : 0.24 });
+  const mixed = mixTracks(tracks, total);
+  const audioOffset = Math.floor(INTRO * SR);
+  for (let i = 0; i < audio.length && audioOffset + i < mixed.length; i++) mixed[audioOffset + i] += audio[i] * 0.90;
+  const wav = "/tmp/music-ball-impact-mix.wav";
+  writeWav(normalize(mixed, 0.9), wav);
 
-  // ---------- 敲击点：把事件映射为赛道上的目标点 ----------
-  // 视觉时间轴 = introSec + t_ms/1000。敲击点在击中时刻应位于 BALL_X。
-  interface Hit { tSec: number; strength: number; band: string; beat: boolean; downbeat: boolean; y: number; hue: [number, number, number]; hitT: number }
-  const hits: Hit[] = [];
-  let lastY = TRACK_Y;
-  for (const ev of evs) {
-    const tSec = introSec + ev.t_ms / 1000;
-    // y 在赛道带内随 strength 变化（强拍高一点）
-    const band = ev.band === "perc" ? 1 : 0;
-    // 蛇形路径：随时间正弦起伏 + 强度调幅
-    const wave = Math.sin(ev.t_ms / 1000 * 1.4) * 190;
-    let y = TRACK_Y - 120 + wave * 0.9 - (ev.downbeat ? 60 : ev.beat ? 30 : 0) - ev.strength * 90 - band * 40;
-    y = Math.max(TRACK_Y - 380, Math.min(TRACK_Y + 40, y));
-    y = lastY * 0.55 + y * 0.45;
-    lastY = y;
-    const hue: [number, number, number] = ev.band === "perc"
-      ? [255, 150 + Math.round(ev.strength * 60), 60]   // 鼓点橙
-      : [120 + Math.round(ev.strength * 80), 200, 255]; // 和声青
-    hits.push({ tSec, strength: ev.strength, band: ev.band, beat: ev.beat, downbeat: ev.downbeat, y, hue, hitT: -1 });
-  }
-  // 小球命中动画时间
-  const hitAnim = new Map<number, number>(); // hit index -> 击中帧时间
-  hits.forEach((h, i) => hitAnim.set(i, h.tSec));
-
-  // ---------- 音频 ----------
-  const sfxTracks: { pcm: Float32Array; offsetSec: number; gain?: number }[] = [];
-  hits.forEach((h, i) => {
-    const kind = h.downbeat ? "crit" : h.beat ? "punch" : "coin";
-    sfxTracks.push({ pcm: synthSfx(kind as any, 500 + i), offsetSec: h.tSec, gain: 0.25 + h.strength * 0.35 });
-  });
-  const sfxPcm = mixTracks(sfxTracks, totalSec);
-  // 与原曲混合：读原曲 wav（16bit mono 44100），对齐 introSec 偏移
-  const origBytes = readFileSync(audioPath);
-  const dataIdx = origBytes.indexOf("data", 12);
-  const origPcm = new Float32Array((origBytes.length - dataIdx - 8) / 2);
-  for (let i = 0; i < origPcm.length; i++) {
-    origPcm[i] = origBytes.readInt16LE(dataIdx + 8 + i * 2) / 32768;
-  }
-  const full = new Float32Array(Math.floor(totalSec * SR));
-  for (let i = 0; i < origPcm.length; i++) {
-    const j = Math.floor(introSec * SR) + i;
-    if (j < full.length) full[j] += origPcm[i] * 0.9;
-  }
-  for (let i = 0; i < full.length && i < sfxPcm.length; i++) full[i] += sfxPcm[i];
-  const finalPcm = normalize(full, 0.9);
-  const mixedWav = "/tmp/mb_mixed.wav";
-  writeWav(finalPcm, mixedWav);
-
-  let ballY = TRACK_Y - 60;
-
-  // ---------- 逐帧 ----------
+  let lastImpact = -1, combo = 0, maxCombo = 0;
+  let camera: Camera = { x: level.mainTargets[0]?.x ?? 0, y: level.mainTargets[0]?.y ?? 0, zoom: 0.82 };
   async function* frameGen() {
-    for (let f = 0; f < totalFrames; f++) {
-      const tNow = f / FPS;
-      const fb = new FrameBuf(W, H);
-      // 背景渐变（上深下微亮）
-      fb.fillRect(0, 0, W, H, [16, 20, 38, 255]);
-      for (let i = 0; i < H; i += 4) {
-        const k = i / H;
-        fb.blendRect(0, i, W, 4, [30 + k * 20, 36 + k * 26, 60 + k * 30, 255 * 0.35]);
-      }
-      // 赛道带
-      fb.fillRect(0, TRACK_Y - 260, W, 480, [20, 24, 44, 140]);
-      // 赛道线
-      fb.fillRect(0, TRACK_Y + 60, W, 6, [70, 90, 160, 255]);
+    for (let frame = 0; frame < frameCount; frame++) {
+      const now = frame / FPS, gameT = now - INTRO;
+      const motion = sampleImpactMotion(level, Math.max(0, gameT), { gravity: 760 }, segments);
+      const nearest = level.mainTargets.reduce<ImpactTarget | undefined>((best, t) => !best || Math.abs(t.tSec - gameT) < Math.abs(best.tSec - gameT) ? t : best, undefined);
+      const collision = nearest && Math.abs(nearest.tSec - gameT) < 0.18 ? nearest : undefined;
+      if (collision && Math.abs(collision.tSec - gameT) <= 1 / FPS && collision.id !== lastImpact) { combo++; maxCombo = Math.max(maxCombo, combo); lastImpact = collision.id; }
+      const pulse = impactPulse(collision, gameT);
+      const wanted = desiredCamera(motion, level.mainTargets, motion.targetId, collision?.tier === "strong" ? pulse : pulse * 0.25);
+      // 平滑镜头，不因目标切换突然跳变。
+      camera.x += (wanted.x - camera.x) * 0.10;
+      camera.y += (wanted.y - camera.y) * 0.10;
+      camera.zoom += (wanted.zoom - camera.zoom) * 0.09;
 
-      // 小球轨迹曲线（把临近 hit 连成平滑路径并绘制）
-      // 敲击点
-      for (const h of hits) {
-        const dt = h.tSec - tNow;
-        if (dt < -0.35 || dt > APPROACH_SEC) continue;
-        // 位置：从右侧推进到 BALL_X（线性），x 击中后随小球一起左移出屏
-        const prog = 1 - dt / APPROACH_SEC; // 0..1 到达
-        const x = W + 60 - (W + 120 - BALL_X) * prog;
-        const alpha = dt < 0 ? Math.max(0, 1 + dt / 0.35) : 1;
-        const r = 18 + h.strength * 26 + (h.downbeat ? 12 : 0);
-        const [cr, cg, cb] = h.hue;
-        fb.fillCircle(x, h.y, r, [cr, cg, cb, Math.round(255 * alpha)]);
-        // 光环
-        fb.blendCircle(x, h.y, r + 12, [cr, cg, cb, Math.round(90 * alpha)]);
-        // 赛道地面光柱
-        fb.blendRect(x - r * 0.4, TRACK_Y + 20, r * 0.8, 46, [cr, cg, cb, Math.round(60 * alpha)]);
-        // 击中波纹
-        if (dt >= -0.12 && dt < 0) {
-          const k = -dt / 0.12;
-          for (let seg = 0; seg < 14; seg++) {
-            const ang = (seg / 14) * Math.PI * 2;
-            fb.blendCircle(x + Math.cos(ang) * (30 + k * 50), h.y + Math.sin(ang) * (30 + k * 50), 4, [255, 255, 255, Math.round(160 * (1 - k))]);
-          }
+      const fb = new FrameBuf(W, H, [8, 12, 30, 255]);
+      if (now < INTRO) {
+        big.draw(fb, "节拍碰撞", W / 2, 350, [255, 216, 90, 255], 1.7, "center");
+        atlas.draw(fb, "完整世界 · 动态视野 · 局部碰撞特效", W / 2, 500, [150, 220, 255, 255], 0.72, "center");
+        atlas.draw(fb, `${axis.meta.tempo} BPM · ${level.mainTargets.length + level.accents.length} 个世界物体`, W / 2, 590, [174, 184, 230, 255], 0.56, "center");
+      } else {
+        // 无限网格背景跟随完整世界，动态 zoom 也影响视差密度。
+        const grid = 220 * camera.zoom;
+        const sx = ((camera.x * 0.16 * camera.zoom) % grid + grid) % grid;
+        const sy = ((camera.y * 0.14 * camera.zoom) % grid + grid) % grid;
+        for (let x = -sx - grid; x < W + grid; x += grid) for (let y = -sy - grid; y < H + grid; y += grid) {
+          fb.fillRect(x + 18, y + 18, grid * 0.64, grid * 0.56, [24, 35, 72, 150]);
         }
-      }
 
-      // 小球（沿路径：y = 临近下一个 hit 的 y 插值，接近时对齐）
-      let targetY = TRACK_Y - 120;
-      for (const h of hits) {
-        const dt = h.tSec - tNow;
-        if (dt >= -0.05) { targetY = h.y; break; }
-      }
-      // 球心 y 平滑追踪下一个 hit
-      ballY = ballY * 0.72 + targetY * 0.28;
-      const pulse = 1 + Math.sin(tNow * 8) * 0.04;
-      const ballR = 34 * pulse;
-      // 拖尾
-      for (let i = 1; i <= 5; i++) {
-        fb.blendCircle(BALL_X - i * 18, ballY + i * 3, ballR - i * 5, [90, 210, 255, Math.round(60 - i * 10)]);
-      }
-      fb.fillCircle(BALL_X, ballY, ballR, [110, 220, 255, 255]);
-      fb.fillCircle(BALL_X - ballR * 0.3, ballY - ballR * 0.35, ballR * 0.35, [220, 250, 255, 255]); // 高光
+        // 所有物体始终存在，仅按视锥裁剪；不再按时间窗口隐藏。
+        for (const accent of level.accents) drawAccent(fb, accent, camera);
+        for (const wall of level.walls) drawCorridorWall(fb, wall, camera, gameT);
+        for (const target of level.mainTargets) drawTarget(fb, target, camera, gameT);
+        drawBall(fb, motion, camera, collision, gameT);
 
-      // 进度字幕
-      atlas.draw(fb, "AI 斗蛐蛐 · 音乐小球", W / 2, 120, [180, 210, 255, 255], 0.7, "center");
-      atlas.draw(fb, `${axis.meta.tempo} BPM · ${hits.length} 连击目标`, W / 2, 200, [120, 150, 210, 255], 0.5, "center");
-      // 进度条
-      const pw = Math.round((tNow - introSec) / duration * W);
-      fb.fillRect(0, H - 14, Math.max(0, Math.min(W, pw)), 14, [90, 210, 255, 255]);
-
-      // 结尾淡出
-      if (tNow > introSec + duration + 0.5) {
-        const k = Math.min(1, (tNow - introSec - duration - 0.5) / 1.0);
-        fb.blendRect(0, 0, W, H, [0, 0, 0, Math.round(255 * k)]);
+        fb.fillRect(0, 0, W, 118, [6, 10, 26, 225]);
+        atlas.draw(fb, "AI 斗蛐蛐 · 节拍碰撞", 58, 28, [180, 220, 255, 255], 0.66);
+        atlas.draw(fb, `${axis.meta.tempo} BPM`, 58, 74, [130, 168, 224, 255], 0.48);
+        const status = collision?.tier === "strong" ? "重拍反弹" : collision ? "碰撞" : "寻找下一目标";
+        atlas.draw(fb, status, W / 2, 36, collision?.tier === "strong" ? [255, 210, 76, 255] : [150, 220, 255, 255], 0.66, "center");
+        atlas.draw(fb, `COMBO ${combo}`, W - 58, 28, [255, 208, 90, 255], 0.62, "right");
+        atlas.draw(fb, `视野 ${(camera.zoom * 100).toFixed(0)}%`, W - 58, 74, [170, 194, 230, 255], 0.43, "right");
+        fb.fillRect(0, H - 24, W, 24, [6, 10, 26, 255]);
+        fb.fillRect(0, H - 24, Math.round(W * clamp(gameT / axis.meta.duration_s, 0, 1)), 24, [255, 190, 68, 255]);
+      }
+      if (gameT > axis.meta.duration_s) {
+        const fade = clamp((gameT - axis.meta.duration_s) / OUTRO, 0, 1);
+        fb.blendRect(0, 0, W, H, [5, 8, 20, Math.round(205 * fade)]);
+        big.draw(fb, "节拍完成", W / 2, 390, [255, 220, 100, 255], 1.6, "center");
+        atlas.draw(fb, `最大连击 ${maxCombo} · ${level.mainTargets.length + level.accents.length} 个世界物体`, W / 2, 540, [170, 220, 255, 255], 0.65, "center");
       }
       yield fb;
     }
   }
+  await encodeFrames(frameGen(), { width: W, height: H, fps: FPS, outPath: outMp4, audioPath: wav, crf: 19 });
+  console.log(`music-ball world rendered -> ${outMp4}`);
+}
 
-  await encodeFrames(frameGen(), { width: W, height: H, fps: FPS, outPath: outMp4, audioPath: mixedWav, crf: 19 });
-  console.log(`music-ball rendered -> ${outMp4}`);
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const [, , axis, audio, out, seed] = process.argv;
+  if (!axis || !audio || !out) throw new Error("usage: node music-ball/src/render.ts <axis.json> <song.wav> <out.mp4> [seed]");
+  await renderImpactMusicBall(axis, audio, out, seed ? Number(seed) : 23);
 }

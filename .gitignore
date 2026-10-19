@@ -5,3 +5,4 @@ out/
 shared/out/
 __pycache__/
 *.pyc
+.godot/

@@ -87,15 +87,16 @@ export function buildLevel(
 
   const platforms: Platform[] = [];
   const startY = 500;
-  platforms.push({ id: 0, x: -500, endX: 0, topY: startY, kind: "start", hue: [90, 210, 255] });
+  const startPlatformEnd = 260;
+  platforms.push({ id: 0, x: -500, endX: startPlatformEnd, topY: startY, kind: "start", hue: [90, 210, 255] });
 
-  let previousX = 0;
+  let previousX = startPlatformEnd;
   let previousY = startY;
   let platformId = 1;
   for (let i = 0; i < transitionEvents.length; i++) {
     const event = transitionEvents[i];
-    const transitionX = Math.max(previousX + 320, event.t_ms / 1000 * speed);
-    const gap = 54 + Math.round(rand() * 34);
+    const transitionX = Math.max(previousX + 250, event.t_ms / 1000 * speed + 240);
+    const gap = 42 + Math.round(rand() * 26);
     const endX = transitionX - gap;
     if (endX > previousX + 100) {
       const lane = laneYs[(i + Math.floor(rand() * 2)) % laneYs.length];
