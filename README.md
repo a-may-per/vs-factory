@@ -1,53 +1,62 @@
-# vs-factory — AI 斗蛐蛐短视频工厂
+# vs-factory — AI 斗蛐蛐 & 赛博音游短视频批量工厂
 
-> 2026-10-09 梳理定稿，2026-10-10 初版代码 + 两线样片完成 ✅
+> 2026-10-30 全面升级：9:16 竖屏爆款视觉 + 真实物理零穿模 + 一键矩阵批量生产 ✅
 
 ## 一句话
-全自动流水线把「AI 对战」变成竖屏短视频：配置/音频进 → 成片出，中间不进剪辑软件。
+全自动流水线把「AI 技能对战」与「赛博音乐小球」直接变成 `1080×1920` (9:16) 竖屏短视频：配置/音频进 → 成片与爆款发布文案出，零人工剪辑。
 
-## 目录（分支即目录）
-- [duel/](duel/BRANCH.md) — 技能小人对战线（先做）：**已出样片**
-- [music-ball/](music-ball/BRANCH.md) — 音乐小球线：**已出样片**
-- shared/ — 公共设施：软件光栅器 / ffmpeg 编码器 / 字形图集 / 音效合成 / BGM 生成 / 混音器
+## 目录结构
+- [`batch.ts`](batch.ts) — **矩阵化批量短视频生产 CLI**（多模式 × 多主题 × 多球体皮肤 × 多流派合成电音/外部音乐目录 → 一键批量成片 + `batch_publish_sheet.md` 文案表）
+- [`music-ball/`](music-ball/BRANCH.md) — **音乐小球竖屏线 (`1080×1920`)**：三大短视频爆款物理模式（赛博琴键回廊 / 重力音阶跳台 / 破壁同心圆环）
+- [`duel/`](duel/BRANCH.md) — **技能小人对战竖屏线 (`1080×1920`)**：多英雄组合对战、街机 HUD、像素立绘动画与必杀震屏演出
+- [`shared/`](shared/) — 公共引擎：纯 TS 软件光栅器 (`FrameBuf`) / 2000+ 汉字抗锯齿字形图集 (`font.ts` + `supplement.ts`) / 程序化音效 (`sfx.ts`) / 电子音乐合成 / FFmpeg H.264 编码器
+
+---
 
 ## 快速开始
+
+### 1. 一键批量生产短视频矩阵 (`batch.ts`)
 ```bash
-# duel：一键对战成片（换 seed 换战局）
-node duel/run.ts 77            # → out/duel/duel_77.mp4 (1080x1920, ~30s)
-node duel/run.ts 42 --cold-open  # 先打后卡版本
+# 批量生成 3 条不同模式、不同霓虹主题、不同球体皮肤与配乐的 9:16 音乐小球视频
+node batch.ts --workflow music-ball --count 3
 
-# music-ball：任意音频 → 横版平台跑酷成片
-node music-ball/run.ts your-song.mp3 out.mp4
-# 可选 seed：同一首歌换 seed 生成不同平台布局
-node music-ball/run.ts your-song.mp3 out.mp4 17
+# 混合批量生成（音乐小球 + AI 技能对战）共 6 条竖屏短视频
+node batch.ts --workflow all --count 6 --seed 100
+
+# 使用你自己的热门音频目录（.mp3 / .wav）批量生成卡点短视频
+node batch.ts --workflow music-ball --audio-dir ./my-songs --count 10
 ```
-依赖：ffmpeg（brew）、Node 22+（原生跑 TS）、music-ball/.venv（librosa，已建）
+批量输出将保存在 `out/batch/` 下，并自动生成：
+- `batch_publish_sheet.md`：每条视频配套的抖音/TikTok/快手/Shorts **爆款标题、黄金前3秒钩子、置顶评论互动话术、热门话题标签**
+- `batch_manifest.json`：结构化元信息清单（供自动发布脚本直接消费）
 
-## 架构
+### 2. 单条音乐小球视频生成 (`music-ball/run.ts`)
+支持三大短视频平台爆款物理模式（默认 `1080×1920` 竖屏，加 `--aspect 16:9` 可切换横屏）：
+
+```bash
+# 模式 1：赛博琴键回廊 (corridor) —— 左右垂直霓虹琴键墙体 + 45°折线激光反弹 + 键位受击回缩
+node music-ball/run.ts song.mp3 out/corridor.mp4 17 --mode corridor --theme cyber-neon --skin visor-bot
+
+# 模式 2：重力音阶跳台 (hopper) —— 4车道交错3D发光跳板 + 因果向上高抛物线跳跃 + 弹簧踏板下压
+node music-ball/run.ts song.mp3 out/hopper.mp4 29 --mode hopper --theme synthwave-sunset --skin star-core
+
+# 模式 3：破壁同心圆环 (rings) —— 旋转多层霓虹同心圆环 + 弦向反弹 + 重拍整环碎裂解压爆破
+node music-ball/run.ts song.mp3 out/rings.mp4 42 --mode rings --theme emerald-matrix --skin vinyl-disc
 ```
-duel:  角色配置 + seed → TS 确定性模拟器(60Hz) → JSONL 事件日志 → 光栅回放渲染 → ffmpeg → mp4
-ball:  歌曲 → librosa 分析(onset/beat/HPSS) → JSON 事件轴 → 同一套渲染管线 → mp4
-共享:  FrameBuf 光栅器 / FontAtlas 中文字形 / sfx 程序化音效 / BGM 生成器 / 混音 / 编码器
+
+可选参数：
+- `--mode`: `corridor` | `hopper` | `rings`（兼容旧别名 `natural` / `impact`）
+- `--theme`: `cyber-neon` | `synthwave-sunset` | `emerald-matrix` | `crimson-void` | `aurora-ice`
+- `--skin`: `visor-bot` | `star-core` | `vinyl-disc` | `plasma-orb` | `cat-neon`
+- `--aspect`: `9:16`（默认竖屏 `1080×1920`）| `16:9`（横屏 `1920×1080`）
+
+### 3. 单条 AI 技能对战视频生成 (`duel/run.ts`)
+```bash
+node duel/run.ts 77              # → out/duel/duel_77.mp4 (1080x1920, ~30s)
+node duel/run.ts 42 --cold-open  # 先打后卡黄金前3秒版本
 ```
-- 渲染选型变更（2026-10-10）：PixiJS 需原生依赖安装受阻 → 改纯 TS 软件光栅器（零依赖零编译），细节见 duel/BRANCH.md
-- 音效零素材：jsfxr 式程序化合成；BGM 零版权：程序化生成（正式版音乐小球可换授权曲）
-
-## 状态
-- [x] 两线 MVP 链路 + 样片（out/duel/、out/music-ball/）
-- [ ] 视觉打磨：重击推拉镜头、血条缓动、死亡演出
-- [x] 角色视觉升级方案：Godot 2D + Q版像素 Sprite，南瓜骑士 vs 火焰史莱姆
-- [x] 真实 Sprite Sheet 已生成并接入 Godot 回放（duel/godot/art/ + replay.gd）
-- [x] duel 交手机制修订：无普通攻击，接触即技能，技能后弹开并重新寻路
-- [x] music-ball 节拍碰撞成品：完整二维世界、动态视野、必达抛物线、局部碰撞环/碎片/踏板回弹/球体形变（out/music-ball/impact_world_fx_final.mp4）
-- [x] music-ball 自动卡点：beat_track 主节拍骨架 + onset_strength 强弱 + HPSS 音色分层；强拍必达、弱音装饰
-- [ ] music-ball：用 2~3 首真实不同节奏歌曲校准卡点密度、强拍阈值和目标布局
-- [x] music-ball mp3：入口自动用 ffmpeg 转成 44.1kHz 单声道 PCM WAV 后分析/渲染
-- [ ] 热门歌版权策略
-- [ ] 参考视频（仍缺，风格定案的唯一阻塞项）
-- [ ] 系列名候选（早先后台生成流程未跑完，重启即可）
-- [ ] 平台实测：直接发平台，前 5 条只跟自己比（完播>30%、点赞>3%）
-
-## 已定决策（摘要）
-见各 BRANCH.md「已定/选型/包装」节：实时自动混战 / 纯数值技能+被动开场亮明 / 完整包装 / 棋盘格擂台 /
-固定机位+重击推拉 / 大字报 VS 卡（开场即卡，--cold-open 可切）/ 胜者+点播引导结算 /
-直接发平台四渠道分发 / 小球角色化（主角球+换装）/ 纯跑酷无剧情
+支持 4 组宿命对决阵容（根据 seed 自动轮换）：
+1. 南瓜骑士 vs 火焰史莱姆（反伤荆棘 vs 狂暴连击）
+2. 冰霜女巫 vs 雷霆狂战（极寒叠毒 vs 雷霆斩杀）
+3. 暗影刺客 vs 圣光机甲（暴击流血 vs 圣盾反震）
+4. 虚空术士 vs 荒野巨兽（深渊腐蚀 vs 蛮荒冲撞）

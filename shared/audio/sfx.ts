@@ -2,7 +2,7 @@
 // mulberry32 确定性伪随机：同 seed 同音效，符合流水线可复现目标。
 import { writeFileSync } from "node:fs";
 
-export type SfxKind = "punch" | "crit" | "skill" | "death" | "vs-slam" | "coin" | "whoosh";
+export type SfxKind = "punch" | "crit" | "skill" | "death" | "vs-slam" | "coin" | "whoosh" | "hit" | "parry";
 
 export interface SfxSpec {
   dur: number; freq: number; freqEnd: number; noise: number; decay: number;
@@ -10,13 +10,15 @@ export interface SfxSpec {
 }
 
 const SPECS: Record<SfxKind, SfxSpec> = {
-  punch:     { dur: 0.12, freq: 220, freqEnd: 60,  noise: 0.55, decay: 10, vol: 0.9,  slide: 4,  squareMix: 0.3 },
-  crit:      { dur: 0.20, freq: 320, freqEnd: 50,  noise: 0.7,  decay: 8,  vol: 1.0,  slide: 5,  squareMix: 0.4 },
-  skill:     { dur: 0.30, freq: 550, freqEnd: 120, noise: 0.15, decay: 6,  vol: 0.8,  slide: -3, squareMix: 0.7 },
-  death:     { dur: 0.55, freq: 180, freqEnd: 30,  noise: 0.4,  decay: 4,  vol: 1.0,  slide: -4, squareMix: 0.5 },
-  "vs-slam": { dur: 0.45, freq: 140, freqEnd: 35,  noise: 0.8,  decay: 5,  vol: 1.0,  slide: 2,  squareMix: 0.2 },
-  coin:      { dur: 0.09, freq: 900, freqEnd: 1400, noise: 0.0, decay: 9, vol: 0.5,  slide: -2, squareMix: 0.9 },
-  whoosh:    { dur: 0.25, freq: 400, freqEnd: 90,  noise: 0.9,  decay: 6,  vol: 0.5,  slide: 1,  squareMix: 0.0 },
+  punch:     { dur: 0.12, freq: 220,  freqEnd: 60,   noise: 0.55, decay: 10, vol: 0.9,  slide: 4,  squareMix: 0.3 },
+  crit:      { dur: 0.20, freq: 320,  freqEnd: 50,   noise: 0.7,  decay: 8,  vol: 1.0,  slide: 5,  squareMix: 0.4 },
+  skill:     { dur: 0.24, freq: 520,  freqEnd: 135,  noise: 0.18, decay: 7,  vol: 0.85, slide: -3, squareMix: 0.65 },
+  death:     { dur: 0.55, freq: 180,  freqEnd: 30,   noise: 0.4,  decay: 4,  vol: 1.0,  slide: -4, squareMix: 0.5 },
+  "vs-slam": { dur: 0.45, freq: 140,  freqEnd: 35,   noise: 0.8,  decay: 5,  vol: 1.0,  slide: 2,  squareMix: 0.2 },
+  coin:      { dur: 0.09, freq: 900,  freqEnd: 1400, noise: 0.0,  decay: 9,  vol: 0.55, slide: -2, squareMix: 0.85 },
+  whoosh:    { dur: 0.20, freq: 420,  freqEnd: 95,   noise: 0.85, decay: 7,  vol: 0.5,  slide: 1,  squareMix: 0.0 },
+  hit:       { dur: 0.07, freq: 340,  freqEnd: 115,  noise: 0.30, decay: 13, vol: 0.55, slide: -2, squareMix: 0.35 },
+  parry:     { dur: 0.15, freq: 1240, freqEnd: 1760, noise: 0.14, decay: 8,  vol: 0.95, slide: 2,  squareMix: 0.55 },
 };
 
 const SR = 44100;
@@ -31,22 +33,28 @@ function mulberry32(seed: number) {
   };
 }
 
-export function synthSfx(kind: SfxKind, seed = 42): Float32Array {
+export function synthSfx(kind: SfxKind, seed = 42, pitchMul = 1.0): Float32Array {
   const spec = SPECS[kind];
   const rng = mulberry32(seed);
   const n = Math.floor(spec.dur * SR);
   const out = new Float32Array(n);
   let phase = 0;
+  let phase2 = 0;
   for (let i = 0; i < n; i++) {
-    const t = i / SR;
     const k = i / n;
     // 频率滑动 + 指数衰减包络
-    const f = spec.freq * Math.pow(spec.freqEnd / spec.freq, k);
+    const f = spec.freq * Math.pow(spec.freqEnd / spec.freq, k) * pitchMul;
     phase += (2 * Math.PI * f) / SR;
+    phase2 += (2 * Math.PI * f * 2.41) / SR;
     const env = Math.exp(-spec.decay * k * 3);
     const square = Math.sign(Math.sin(phase)) * 0.5 + 0.5;
     const sine = (Math.sin(phase) + 1) / 2;
-    const tone = square * spec.squareMix + sine * (1 - spec.squareMix);
+    let tone = square * spec.squareMix + sine * (1 - spec.squareMix);
+    if (kind === "parry") {
+      // 金属刀剑交击泛音（Inharmonic metallic bell overtone）
+      const ring = Math.sin(phase) * 0.55 + Math.sin(phase2) * 0.45;
+      tone = ring;
+    }
     const noise = rng() * 2 - 1;
     const sample = tone * (1 - spec.noise) + noise * spec.noise;
     out[i] = sample * env * spec.vol;
