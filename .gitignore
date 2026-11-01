@@ -1,8 +1,8 @@
 node_modules/
 .venv/
 music-ball/.venv/
-out/
-shared/out/
+output/
 __pycache__/
 *.pyc
 .godot/
+out/
