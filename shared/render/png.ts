@@ -122,12 +122,63 @@ export class SpriteSheet {
   readonly cols: number;
   readonly rows: number;
 
-  constructor(path: string, cellW = 48, cellH = 48) {
-    this.png = decodePng(path);
+  constructor(pathOrPng: string | DecodedPng, cellW = 48, cellH = 48) {
+    this.png = typeof pathOrPng === "string" ? decodePng(pathOrPng) : pathOrPng;
     this.cellW = cellW;
     this.cellH = cellH;
     this.cols = Math.floor(this.png.width / cellW);
     this.rows = Math.floor(this.png.height / cellH);
+  }
+
+  /**
+   * 生成经过色相旋转/饱和度调节的衍生角色精灵图集（用于冰霜剑圣、雷电魔像、猩红死神、暗影魔王等独立视觉形象）
+   */
+  withHueShift(hueShiftDeg: number, satMul = 1, valMul = 1): SpriteSheet {
+    if (Math.abs(hueShiftDeg) < 0.5 && Math.abs(satMul - 1) < 0.02 && Math.abs(valMul - 1) < 0.02) {
+      return this;
+    }
+    const src = this.png.data;
+    const dst = new Uint8Array(src.length);
+    const shift = ((hueShiftDeg % 360) + 360) % 360;
+    for (let i = 0; i < src.length; i += 4) {
+      const a = src[i + 3];
+      if (a === 0) continue;
+      const r = src[i] / 255;
+      const g = src[i + 1] / 255;
+      const b = src[i + 2] / 255;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const d = max - min;
+      let h = 0;
+      const s = max === 0 ? 0 : d / max;
+      const v = max;
+      if (d > 1e-4) {
+        if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
+        else if (max === g) h = ((b - r) / d + 2) * 60;
+        else h = ((r - g) / d + 4) * 60;
+      }
+      // 保留接近纯黑的描边像素，只旋转彩色像素
+      if (v > 0.16 && s > 0.12) {
+        h = (h + shift) % 360;
+      }
+      const ns = Math.min(1, s * satMul);
+      const nv = Math.min(1, v * valMul);
+      const c = nv * ns;
+      const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+      const m = nv - c;
+      let nr = 0, ng = 0, nb = 0;
+      if (h < 60) { nr = c; ng = x; nb = 0; }
+      else if (h < 120) { nr = x; ng = c; nb = 0; }
+      else if (h < 180) { nr = 0; ng = c; nb = x; }
+      else if (h < 240) { nr = 0; ng = x; nb = c; }
+      else if (h < 300) { nr = x; ng = 0; nb = c; }
+      else { nr = c; ng = 0; nb = x; }
+      dst[i] = Math.round((nr + m) * 255);
+      dst[i + 1] = Math.round((ng + m) * 255);
+      dst[i + 2] = Math.round((nb + m) * 255);
+      dst[i + 3] = a;
+    }
+    return new SpriteSheet({ width: this.png.width, height: this.png.height, data: dst }, this.cellW, this.cellH);
   }
 
   /**

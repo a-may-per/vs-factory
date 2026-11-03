@@ -29,6 +29,8 @@ import {
 import { simulate } from "./duel/src/sim.ts";
 import { DUEL_MATCHUPS } from "./duel/src/fighters.ts";
 import { renderDuel } from "./duel/src/render.ts";
+import { SIEGE_MAPS, SIEGE_MAP_IDS } from "./siege/src/config.ts";
+import { renderSiegeVideo } from "./siege/src/render.ts";
 
 function getFlag(name: string): string | undefined {
   const idx = process.argv.indexOf(name);
@@ -39,7 +41,7 @@ function getFlag(name: string): string | undefined {
 export interface BatchItemMetadata {
   index: number;
   id: string;
-  workflow: "music-ball" | "duel";
+  workflow: "music-ball" | "duel" | "siege";
   mode: string;
   outMp4: string;
   resolution: "1080x1920";
@@ -53,10 +55,11 @@ export interface BatchItemMetadata {
   hashtags: string[];
 }
 
-const workflow = (getFlag("--workflow") ?? "music-ball") as "music-ball" | "duel" | "all";
+const PROJ_ROOT = dirname(fileURLToPath(import.meta.url));
+const workflow = (getFlag("--workflow") ?? "music-ball") as "music-ball" | "duel" | "siege" | "all";
 const count = Math.max(1, Number(getFlag("--count") ?? 3) || 3);
-const modeFilter = (getFlag("--mode") ?? "all") as MusicBallMode | "all";
-const outDir = getFlag("--out-dir") ?? "out/batch";
+const modeFilter = (getFlag("--mode") ?? "all") as MusicBallMode | "all" | "viral" | "legacy" | "all6";
+const outDir = getFlag("--out-dir") ?? join(PROJ_ROOT, "output/batch");
 const audioDir = getFlag("--audio-dir");
 const singleSong = getFlag("--song");
 const clipFlag = getFlag("--clip");
@@ -80,9 +83,13 @@ if (audioDir && existsSync(audioDir)) {
   }
 }
 
-const modesPool: MusicBallMode[] = modeFilter === "all"
-  ? ["corridor", "hopper", "rings"]
-  : [modeFilter];
+const modesPool: MusicBallMode[] = modeFilter === "all" || modeFilter === "viral"
+  ? ["maze", "staircase", "pendulum"]
+  : modeFilter === "legacy"
+    ? ["corridor", "hopper", "rings"]
+    : modeFilter === "all6"
+      ? ["maze", "staircase", "pendulum", "corridor", "hopper", "rings"]
+      : [modeFilter];
 
 const manifest: BatchItemMetadata[] = [];
 
@@ -96,9 +103,12 @@ console.log(`============================================================`);
 
 for (let i = 0; i < count; i++) {
   const seed = baseSeed + i * 37;
-  const isDuel = workflow === "duel" || (workflow === "all" && i % 4 === 3);
+  const activeWorkflow: "music-ball" | "duel" | "siege" =
+    workflow === "all"
+      ? (["music-ball", "siege", "duel"] as const)[i % 3]
+      : workflow;
 
-  if (!isDuel) {
+  if (activeWorkflow === "music-ball") {
     const mode = modesPool[i % modesPool.length];
     const themeId: ThemeId = THEME_IDS[i % THEME_IDS.length];
     const skinId: BallSkinId = BALL_SKIN_IDS[(i * 2) % BALL_SKIN_IDS.length];
@@ -154,11 +164,17 @@ for (let i = 0; i < count; i++) {
       aspect: "9:16",
     });
 
-    const modeCn = mode === "corridor"
-      ? "赛博琴键回廊"
-      : mode === "hopper"
-        ? "重力音阶跳台"
-        : "破壁同心圆环";
+    const modeCn = mode === "maze"
+      ? "弹跳方块音符迷宫"
+      : mode === "staircase"
+        ? "水晶阶梯八音盒"
+        : mode === "pendulum"
+          ? "同心星弧激光竖琴"
+          : mode === "corridor"
+            ? "赛博琴键回廊"
+            : mode === "hopper"
+              ? "重力音阶跳台"
+              : "破壁同心圆环";
 
     manifest.push({
       index: i + 1,
@@ -175,6 +191,37 @@ for (let i = 0; i < count; i++) {
       publishTitle: `【${modeCn}】${hookText.replace(/[★⚡♫]/g, "").trim()}！${bgmLabel} 全连击实机挑战`,
       pinnedComment: "你想听哪首歌或者哪个时间段的专属踩点挑战？评论区留言【歌名+秒数】，下期直接安排！🎧",
       hashtags: ["#音乐小球", "#卡点视频", "#强迫症极度舒适", "#解压视频", "#节奏大师", `#${modeCn}`],
+    });
+  } else if (activeWorkflow === "siege") {
+    const mapId = SIEGE_MAP_IDS[i % SIEGE_MAP_IDS.length];
+    const mapCfg = SIEGE_MAPS[mapId];
+    const id = `siege_${String(i + 1).padStart(2, "0")}_${mapId}_s${seed}`;
+    const outMp4 = join(outDir, `${id}.mp4`);
+
+    console.log(`\n[${i + 1}/${count}] 正在模拟并渲染 Siege 窄口死守 (${mapCfg.name}, seed=${seed}) ...`);
+    const stats = await renderSiegeVideo({
+      mapId,
+      seed,
+      durationSec: 19,
+      outMp4,
+      hookTitle: mapCfg.hookTitle,
+    });
+
+    manifest.push({
+      index: i + 1,
+      id,
+      workflow: "siege",
+      mode: mapId,
+      outMp4,
+      resolution: "1080x1920",
+      durationSec: stats.durationSec,
+      seed,
+      theme: mapCfg.name,
+      skinOrMatchup: `绿点特种小队 (${stats.aliveGreens}/${stats.totalGreens} 幸存) vs ${stats.kills} 感染红点`,
+      bgmInfo: "程序化战地电子脉冲 + 枪炮ASMR",
+      publishTitle: `【丧尸围城推演】${mapCfg.hookTitle} 最终歼灭 ${stats.kills} 感染体！`,
+      pinnedComment: mapCfg.pinnedComment,
+      hashtags: ["#丧尸模拟", "#沙盒推演", "#电子斗蛐蛐", "#解压视频", "#策略塔防", `#${mapCfg.name}`],
     });
   } else {
     const preset = DUEL_MATCHUPS[i % DUEL_MATCHUPS.length];

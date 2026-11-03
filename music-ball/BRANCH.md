@@ -45,8 +45,8 @@
 - [x] 必达轨迹：`src/impact-motion.ts` 用重力抛物线连接相邻主目标，端点严格落在下一个目标；
       视觉有斜向下坠/反弹，数值上保证关键节点命中
 - [x] 渲染：`src/render.ts` 共享 TS 光栅器 + ffmpeg，强拍爆闪/震动/碰撞波纹/拖尾/连击；输出 1920×1080
-- [x] 一键：`node music-ball/run.ts <song.wav|mp3> [out.mp4] [seed]`；输入先由 ffmpeg 统一为 44.1kHz 单声道 WAV
-- 样片：`out/music-ball/impact_world_fx_final.mp4`（MP3 输入，完整世界+动态镜头+局部碰撞特效，约 38s）
+- [x] 一键：`npx tsx music-ball/run.ts <song.wav|mp3> [output/music-ball/out.mp4] [seed]`；输入先由 ffmpeg 统一为 44.1kHz 单声道 WAV
+- 样片：`output/music-ball/maze_demo.mp4`、`output/music-ball/staircase_demo.mp4`、`output/music-ball/pendulum_demo.mp4`
 - [x] 完整世界：所有 strong/beat/weak 对象在生成关卡时即存在；渲染只按镜头视锥裁剪，不再按时间窗口临时出现
 - [x] 动态视野：根据小球与未来 3~4 个目标的包围盒自动缩放，目标稀疏时拉远看到更多，密集时拉近
 - [x] 新碰撞特效：移除全屏白闪，改踏板压缩回弹、局部双冲击环、法线方向碎片、短时拖尾增强、球体椭圆 squash/stretch

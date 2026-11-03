@@ -42,7 +42,7 @@ const positional = process.argv.slice(2).filter((arg, i, arr) => {
 const songArg = getFlag("--song") ?? positional[0];
 const outArg = getFlag("--out") ?? positional[1];
 const seed = Number(positional[2] ?? getFlag("--seed") ?? 77) || 77;
-const modeFlag = (getFlag("--mode") ?? "corridor") as MusicBallMode | "all";
+const modeFlag = (getFlag("--mode") ?? "maze") as MusicBallMode | "all" | "viral" | "legacy" | "all6";
 const themeFlag = getFlag("--theme") as ThemeId | undefined;
 const skinFlag = getFlag("--skin") as BallSkinId | undefined;
 const genreFlag = getFlag("--genre") as SynthGenre | undefined;
@@ -78,8 +78,8 @@ if (songArg && existsSync(songArg)) {
   console.log(`[2/3] analyzing beat & onset axis on sliced audio ...`);
   analyzeAudioAxis(wavPath, axisPath, MB_DIR);
 } else {
-  const synthDur = durationFlag ? Math.max(5, Number(durationFlag)) : 15.0;
-  console.log(`[1/2] synthesizing copyright-free electronic track & beat axis (seed=${seed}, duration=${synthDur}s) ...`);
+  const synthDur = durationFlag ? Math.max(5, Number(durationFlag)) : undefined;
+  console.log(`[1/2] synthesizing copyright-free electronic track & beat axis (seed=${seed}, duration=${synthDur ?? "genre-default"}) ...`);
   const info = generateSynthSongAndAxis(wavPath, axisPath, {
     genre: genreFlag,
     seed,
@@ -89,15 +89,19 @@ if (songArg && existsSync(songArg)) {
   console.log(`      genre=${info.genre} (${info.title}) tempo=${info.tempo}BPM events=${info.events.length}`);
 }
 
-const modes: MusicBallMode[] = modeFlag === "all"
-  ? ["corridor", "hopper", "rings"]
-  : [modeFlag];
+const modes: MusicBallMode[] = modeFlag === "all" || modeFlag === "viral"
+  ? ["maze", "staircase", "pendulum"]
+  : modeFlag === "legacy"
+    ? ["corridor", "hopper", "rings"]
+    : modeFlag === "all6"
+      ? ["maze", "staircase", "pendulum", "corridor", "hopper", "rings"]
+      : [modeFlag];
 
 for (let i = 0; i < modes.length; i++) {
   const m = modes[i];
   const targetOut = modes.length === 1 && outArg
     ? outArg
-    : join(PROJ_ROOT, "out/music-ball", `${m}_${seed}.mp4`);
+    : join(PROJ_ROOT, "output/music-ball", `${m}_${seed}.mp4`);
   mkdirSync(dirname(targetOut), { recursive: true });
   console.log(`[Render] mode=${m} -> ${targetOut} ...`);
   await renderMusicBallVideo(axisPath, wavPath, targetOut, {

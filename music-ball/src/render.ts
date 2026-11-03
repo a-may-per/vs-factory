@@ -1,7 +1,12 @@
-// Music-Ball 短视频爆款三合一渲染引擎（默认 1080×1920 竖屏 9:16）：
-// 1. corridor（赛博深井·琴键折返弹射）：左右壁面发光钢琴砖块 + 真实法线水平折返 + 零穿模
-// 2. hopper  （几何节拍·重力音阶跳台）：因果重力反推抛物线 + 100% 踏板上表面向上起跳 + 弹簧压陷 + 零穿模
-// 3. rings   （破壁圆环·同心牢笼爆破）：抖音/TikTok 顶流解压玩法，节拍内壁反弹 + 重拍碎环 + 外环推进
+// Music-Ball 短视频爆款全系渲染引擎（默认 1080×1920 竖屏 9:16）：
+// 【三大全新全网顶流爆款模式】：
+// 1. maze     （弹跳方块·音符迷宫）：全网播放量第一的发光圆角方块 2D 开放空间 45° 对角线折返 + 3D 立体斜切音砖回弹
+// 2. staircase（2.5D 水晶阶梯·八音盒）：抖音/小红书千万赞治愈水晶琉璃球抛物线拾级而下 + 3D 三面体水晶琴键下沉 + 极光光柱
+// 3. pendulum （催眠钟摆波·激光竖琴）：海外 2000W+ 播放 Polyrhythm 同心星弧轨道 + 多普勒蛇形相位波 + 中轴激光竖琴弦驻波共振
+// 【三大经典保留模式（完整保留可随时切换）】：
+// 4. corridor （赛博深井·琴键折返弹射）：左右壁面发光钢琴砖块 + 真实法线水平折返 + 零穿模
+// 5. hopper   （几何节拍·重力音阶跳台）：因果重力反推抛物线 + 100% 踏板上表面向上起跳 + 弹簧压陷 + 零穿模
+// 6. rings    （破壁圆环·同心牢笼爆破）：节拍内壁反弹 + 重拍碎环 + 外环推进
 import { FrameBuf, type RGBA } from "../../shared/render/framebuf.ts";
 import { FontAtlas } from "../../shared/render/atlas.ts";
 import { encodeFrames } from "../../shared/render/encoder.ts";
@@ -22,6 +27,12 @@ import {
   type MusicBallMode,
   type ThemeId,
 } from "./themes.ts";
+import {
+  buildViralNodes,
+  renderMazeMode,
+  renderPendulumMode,
+  renderStaircaseMode,
+} from "./viral-modes.ts";
 import { readFileSync } from "node:fs";
 
 const FPS = 30;
@@ -504,17 +515,22 @@ const NOTE_FREQ_MAP: Record<string, number> = {
   C4: 261.63,
   D4: 293.66,
   E4: 329.63,
+  F4: 349.23,
   G4: 392.00,
   A4: 440.00,
+  B4: 493.88,
   C5: 523.25,
   D5: 587.33,
   E5: 659.25,
+  F5: 698.46,
   G5: 783.99,
   A5: 880.00,
+  B5: 987.77,
+  C6: 1046.50,
 };
 
 /**
- * 合成温润的水晶泛音触键共鸣音（纯正弦波+柔和八度泛音，零方波/零白噪，完美融入舒缓钢琴或电音）
+ * 合成零延迟（1.5ms 瞬态起音）的水晶木槌触键共鸣音，确保每一次碰撞的画面帧与清脆敲击瞬态 100% 咬合
  */
 function synthGentleNoteChime(noteName: string, strong: boolean): Float32Array {
   const freq = NOTE_FREQ_MAP[noteName] ?? 523.25;
@@ -523,19 +539,27 @@ function synthGentleNoteChime(noteName: string, strong: boolean): Float32Array {
   const pcm = new Float32Array(len);
   let p1 = 0;
   let p2 = 0;
+  let p3 = 0;
   for (let i = 0; i < len; i++) {
     const dt = i / SR;
     p1 += (2 * Math.PI * freq) / SR;
     p2 += (2 * Math.PI * freq * 2.0) / SR;
-    const attack = Math.min(1, dt / 0.008);
+    p3 += (2 * Math.PI * freq * 4.0) / SR;
+    // 1.5ms 极速起音 + 清脆高频木槌瞬态，消除“画面撞上了声音才慢吞吞出来”的拖沓感
+    const attack = Math.min(1, dt / 0.0015);
     const env = attack * Math.exp(-dt * (strong ? 9.5 : 12.5));
-    pcm[i] = (Math.sin(p1) * 0.78 + Math.sin(p2) * 0.22 * Math.exp(-dt * 18)) * env;
+    const transient = Math.sin(p3) * 0.32 * Math.exp(-dt * 95);
+    pcm[i] =
+      (Math.sin(p1) * 0.76 +
+        Math.sin(p2) * 0.24 * Math.exp(-dt * 18) +
+        transient) *
+      env;
   }
   return pcm;
 }
 
 /**
- * 合成带温润音阶触键共鸣的音轨（剔除原本刺耳的 8-bit 激光/白噪碰撞声，保持原曲纯净度）
+ * 合成带清脆触键瞬态共鸣的音轨（剔除刺耳白噪，同时让每次视觉碰撞都有明确清脆的声学咬合点）
  */
 function buildMixedAudioTrack(
   wavPath: string,
@@ -548,17 +572,16 @@ function buildMixedAudioTrack(
   const baseTrack = new Float32Array(totalSamples);
   const offset = Math.floor(INTRO_SEC * SR);
   for (let i = 0; i < songSamples.length && i + offset < totalSamples; i++) {
-    baseTrack[i + offset] = songSamples[i] * 0.90;
+    baseTrack[i + offset] = songSamples[i] * 0.88;
   }
 
-  const isSoothing = tempo < 100;
   const sfxItems: { offsetSec: number; pcm: Float32Array; gain: number }[] = [];
   for (const n of nodes) {
     const hitTime = INTRO_SEC + n.t;
     sfxItems.push({
       offsetSec: hitTime,
       pcm: synthGentleNoteChime(n.noteName, n.strong),
-      gain: isSoothing ? (n.strong ? 0.08 : 0.05) : (n.strong ? 0.14 : 0.09),
+      gain: n.strong ? 0.20 : 0.14,
     });
   }
   const mixed = normalize(
@@ -592,15 +615,21 @@ export async function renderMusicBallVideo(
 
   const axis: AxisFile = JSON.parse(readFileSync(axisPath, "utf-8"));
   const songSamples = readMonoWav(wavPath);
+  const isNewViralMode = mode === "maze" || mode === "staircase" || mode === "pendulum";
+  const viralNodes = isNewViralMode
+    ? buildViralNodes(axis.events, axis.meta.duration_s, axis.meta.tempo, seed, mode)
+    : [];
   const nodes = buildBeatNodes(axis, seed, W, H);
-  const totalSec = INTRO_SEC + axis.meta.duration_s + OUTRO_SEC;
+  const activeNodesForAudio = isNewViralMode ? (viralNodes as unknown as BeatNode[]) : nodes;
+  const effectiveOutroSec = isNewViralMode ? 0.08 : OUTRO_SEC;
+  const totalSec = INTRO_SEC + axis.meta.duration_s + effectiveOutroSec;
   const totalFrames = Math.ceil(totalSec * FPS);
 
   const fontDir = new URL("../../shared/fonts/", import.meta.url).pathname;
   const atlas = new FontAtlas(`${fontDir}atlas64.rgba`, `${fontDir}atlas64.json`);
   const big = new FontAtlas(`${fontDir}atlas96.rgba`, `${fontDir}atlas96.json`);
 
-  const outWav = buildMixedAudioTrack(wavPath, nodes, totalSec, axis.meta.tempo);
+  const outWav = buildMixedAudioTrack(wavPath, activeNodesForAudio, totalSec, axis.meta.tempo);
 
   const isSoothing = axis.meta.tempo < 100;
   const hooks = isSoothing ? SOOTHING_HOOKS[mode] : VIRAL_HOOKS[mode];
@@ -618,12 +647,16 @@ export async function renderMusicBallVideo(
       ? "因果重力抛物线引擎 · 踏板弹簧压陷 · 真实向上弹跳"
       : "旋转霓虹同心牢笼 · 节拍内壁反射 · 重音碎环解压";
 
-  const beatMarkers = nodes.map(n => ({ t: n.t, strong: n.strong }));
+  const beatMarkers = activeNodesForAudio.map(n => ({ t: n.t, strong: n.strong }));
 
   // 维护历史轨迹与碎环碎片状态
   const trail: { x: number; y: number }[] = [];
   let camX = W / 2;
   let camY = nodes[0]?.y ?? 420;
+  const viralCam = {
+    x: viralNodes[0]?.x ?? 0,
+    y: viralNodes[0]?.y ?? 420,
+  };
 
   function* frameGen(): Iterable<FrameBuf> {
     for (let fIdx = 0; fIdx < totalFrames; fIdx++) {
@@ -641,8 +674,8 @@ export async function renderMusicBallVideo(
 
       // 计算最近一次碰撞的时间差，驱动高光、震屏与弹簧形变
       let sinceLastHit = 999;
-      let lastHitNode: BeatNode = nodes[0];
-      for (const n of nodes) {
+      let lastHitNode: BeatNode = activeNodesForAudio[0] ?? nodes[0];
+      for (const n of activeNodesForAudio) {
         if (gt >= n.t && gt - n.t < sinceLastHit) {
           sinceLastHit = gt - n.t;
           lastHitNode = n;
@@ -654,7 +687,7 @@ export async function renderMusicBallVideo(
 
       // 当前已达成的连击数
       let combo = 0;
-      for (const n of nodes) {
+      for (const n of activeNodesForAudio) {
         if (gt >= n.t) combo++;
       }
 
@@ -668,9 +701,40 @@ export async function renderMusicBallVideo(
       }
 
       // ======================================================================
-      // 分支一：CORRIDOR 赛博琴键折返走廊（100% 壁面垂直琴键法线反射，零穿模）
+      // 全新三大千万播放级爆款模式：MAZE / STAIRCASE / PENDULUM
       // ======================================================================
-      if (mode === "corridor") {
+      if (mode === "maze" || mode === "staircase" || mode === "pendulum") {
+        if (mode === "maze") {
+          renderMazeMode(fb, atlas, viralNodes, gt, hitPulse, theme, trail, viralCam);
+        } else if (mode === "staircase") {
+          renderStaircaseMode(fb, atlas, viralNodes, gt, hitPulse, theme, trail, viralCam);
+        } else {
+          renderPendulumMode(fb, atlas, viralNodes, gt, hitPulse, theme, axis.meta.tempo);
+        }
+
+        drawShortVideoHud(fb, atlas, big, {
+          mode,
+          modeTitle: mode === "maze" ? "弹跳方块" : mode === "staircase" ? "水晶八音盒" : "同心星弧",
+          songTitle: opts.songTitle ?? axis.meta.title,
+          hookText,
+          tempo: axis.meta.tempo,
+          skinName: BALL_SKIN_NAMES[skin],
+          theme,
+          statusText: lastHitNode.noteName,
+          isHitStrong,
+          isHitAny,
+          hitPulse,
+          combo,
+          maxCombo: combo,
+          progress: clamp(gt / axis.meta.duration_s, 0, 1),
+          currentTime: Math.max(0, gt),
+          duration: axis.meta.duration_s,
+          beatMarkers,
+          extraMetricLabel: mode === "maze" ? "点亮方块" : mode === "staircase" ? "水晶琴键" : "星弧音律",
+          extraMetricValue: `${combo}`,
+          spectrum,
+        });
+      } else if (mode === "corridor") {
         let bx = curNode.x;
         let by = curNode.y;
         let bvx = 0;
@@ -1359,9 +1423,9 @@ export async function renderMusicBallVideo(
       }
 
       // ======================================================================
-      // 终局 S+ 荣誉结算面板
+      // 终局 S+ 荣誉结算面板（仅在传统街机三模式开启；新三大爆款模式保持纯净开放首尾以实现无缝无限循环）
       // ======================================================================
-      if (gt > axis.meta.duration_s) {
+      if (!isNewViralMode && gt > axis.meta.duration_s) {
         const outroProgress = (gt - axis.meta.duration_s) / (OUTRO_SEC * 0.75);
         const totalShattered = nodes.filter(n => n.shatterRing).length;
         const metric3Label = mode === "corridor"
@@ -1446,5 +1510,56 @@ export async function renderRingMusicBall(
     ...opts,
     seed,
     mode: "rings",
+  });
+}
+
+/**
+ * 全新顶流爆款入口 4：弹跳方块音符迷宫（Viral Bouncing Square MIDI Labyrinth - maze）
+ */
+export async function renderMazeMusicBall(
+  axisPath: string,
+  wavPath: string,
+  outMp4: string,
+  seed = 108,
+  opts: Partial<RenderMusicBallOptions> = {},
+): Promise<void> {
+  await renderMusicBallVideo(axisPath, wavPath, outMp4, {
+    ...opts,
+    seed,
+    mode: "maze",
+  });
+}
+
+/**
+ * 全新顶流爆款入口 5：2.5D 水晶阶梯八音盒（Cascading Crystal Piano Staircase - staircase）
+ */
+export async function renderStaircaseMusicBall(
+  axisPath: string,
+  wavPath: string,
+  outMp4: string,
+  seed = 208,
+  opts: Partial<RenderMusicBallOptions> = {},
+): Promise<void> {
+  await renderMusicBallVideo(axisPath, wavPath, outMp4, {
+    ...opts,
+    seed,
+    mode: "staircase",
+  });
+}
+
+/**
+ * 全新顶流爆款入口 6：催眠钟摆波激光竖琴（Hypnotic Polyrhythm Pendulum Harp - pendulum）
+ */
+export async function renderPendulumMusicBall(
+  axisPath: string,
+  wavPath: string,
+  outMp4: string,
+  seed = 308,
+  opts: Partial<RenderMusicBallOptions> = {},
+): Promise<void> {
+  await renderMusicBallVideo(axisPath, wavPath, outMp4, {
+    ...opts,
+    seed,
+    mode: "pendulum",
   });
 }

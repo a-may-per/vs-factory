@@ -2,7 +2,7 @@
 import { FrameBuf, type RGBA } from "../../shared/render/framebuf.ts";
 import { FontAtlas } from "../../shared/render/atlas.ts";
 
-export type MusicBallMode = "corridor" | "hopper" | "rings";
+export type MusicBallMode = "maze" | "staircase" | "pendulum" | "corridor" | "hopper" | "rings";
 export type ThemeId = "cyber-neon" | "synthwave-sunset" | "emerald-matrix" | "crimson-void" | "aurora-ice";
 export type BallSkinId = "visor-bot" | "star-core" | "vinyl-disc" | "plasma-orb" | "cat-neon";
 
@@ -136,6 +136,21 @@ export const NOTE_NAMES = [
 ];
 
 export const VIRAL_HOOKS: Record<MusicBallMode, string[]> = {
+  maze: [
+    "弹跳方块 · 戴上耳机感受丝滑音阶折返",
+    "方块音符回廊 · 99%的人第3秒就沉陷了",
+    "强迫症极度舒适 · 方块音符零失误踩点",
+  ],
+  staircase: [
+    "水晶八音盒 · 每一跳都踩在音阶上极度舒适",
+    "戴上耳机 · 感受水晶琴键级阶律动",
+    "听完这15秒 · 强迫症极度舒适解压",
+  ],
+  pendulum: [
+    "同心星弧音律 · 强迫症极度舒适解压",
+    "戴上耳机 · 感受同心星弧温柔律动",
+    "闭上眼 · 感受星弧音符轻轻落下的治愈瞬间",
+  ],
   corridor: [
     "戴上耳机 · 99%的人第3秒就沉陷了",
     "强迫症极度舒适 · 丝滑音阶折返",
@@ -154,6 +169,21 @@ export const VIRAL_HOOKS: Record<MusicBallMode, string[]> = {
 };
 
 export const SOOTHING_HOOKS: Record<MusicBallMode, string[]> = {
+  maze: [
+    "闭上眼 · 感受方块音符轻轻落下的治愈瞬间",
+    "弹跳方块 · 戴上耳机感受丝滑音阶折返",
+    "强迫症极度舒适 · 方块音符零失误踩点",
+  ],
+  staircase: [
+    "闭上眼 · 听完这首水晶琴键心都静下来了",
+    "水晶八音盒 · 每一跳都踩在音阶上极度舒适",
+    "戴上耳机 · 感受水晶琴键级阶律动",
+  ],
+  pendulum: [
+    "闭上眼 · 感受星弧音符轻轻落下的治愈瞬间",
+    "同心星弧音律 · 强迫症极度舒适解压",
+    "戴上耳机 · 感受同心星弧温柔律动",
+  ],
   corridor: [
     "闭上眼 · 感受音符轻轻落下的治愈瞬间",
     "戴上耳机 · 丝滑钢琴音阶极度舒适",
@@ -379,9 +409,9 @@ export function drawShortVideoHud(
   const { theme } = opts;
   const pulse = opts.hitPulse ?? (opts.isHitStrong ? 0.85 : opts.isHitAny ? 0.45 : 0);
 
-  // 1. 顶部双段柔和暗场过渡（无需厚重背景框即可保证文字清晰可读，同时柔和压暗滚入顶部的踏板/砖块）
-  fb.blendGradientRect(0, 0, W, 160, [4, 7, 18, 240], [4, 7, 18, 185], true);
-  fb.blendGradientRect(0, 160, W, 110, [4, 7, 18, 185], [4, 7, 18, 0], true);
+  // 1. 顶部双段柔和暗场过渡（无需厚重背景框即可保证文字清晰可读，同时柔和消隐滚入顶部 HUD 区的历史音块）
+  fb.blendGradientRect(0, 0, W, 205, [4, 7, 18, 250], [4, 7, 18, 220], true);
+  fb.blendGradientRect(0, 205, W, 115, [4, 7, 18, 220], [4, 7, 18, 0], true);
 
   // 2. 顶部极简磨砂小胶囊：展示歌名/曲风 + BPM（轻巧不抢戏）
   const trackLabel = opts.songTitle
