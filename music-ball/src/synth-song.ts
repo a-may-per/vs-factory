@@ -28,7 +28,7 @@ export interface SynthTrackSpec {
 export const SYNTH_GENRES: Record<SynthGenre, SynthTrackSpec> = {
   "canon-piano": {
     genre: "canon-piano",
-    title: "帕赫贝尔《卡农》· 完整版治愈钢琴",
+    title: "名曲《卡农》· 完整版治愈钢琴",
     tempo: 96,
     durationSec: 42.0,
     soothing: true,

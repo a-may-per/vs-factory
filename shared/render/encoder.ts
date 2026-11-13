@@ -19,7 +19,8 @@ export async function encodeFrames(frames: AsyncIterable<FrameBuf> | Iterable<Fr
     args.push("-i", opts.audioPath, "-map", "0:v", "-map", "1:a", "-c:a", "aac", "-b:a", "192k", "-shortest");
   }
   args.push(
-    "-c:v", "libx264", "-preset", "medium", "-crf", String(opts.crf ?? 18),
+    "-c:v", "libx264", "-preset", "medium", "-crf", String(opts.crf ?? 24),
+    "-maxrate", "3400k", "-bufsize", "6800k",
     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     opts.outPath,
   );

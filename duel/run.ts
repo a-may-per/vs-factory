@@ -1,11 +1,11 @@
 // duel 一键流水线：模拟 → 事件日志 → 渲染 → 成片
-// 用法: node duel/run.ts [seed] [--matchup <index|id>] [--cold-open]
-// 特性:
-// 1. 自动递增版本号 (v01, v02, v03...)，绝不覆盖历史成片 (如 duel_42.mp4)。
-// 2. 随机轮换全英雄池对局阵容 (冰霜剑圣 / 雷电魔像 / 猩红死神 / 暗影魔王 / 南瓜骑士 / 火焰史莱姆)。
-// 3. 默认开启 1.75s 高燃开局对战卡（可通过 --cold-open 切换冷启动）。
+// 用法:
+//   npx tsx duel/run.ts [seed] [--a <heroA> --b <heroB>] [--matchup <id|index>] [--cold-open]
+// 示例:
+//   npx tsx duel/run.ts 808 --a alchemist --b bulldozer
+//   npx tsx duel/run.ts 701 --a 暴走拆迁队 --b 一拳光头
 import { simulate } from "./src/sim.ts";
-import { DUEL_MATCHUPS } from "./src/fighters.ts";
+import { DUEL_MATCHUPS, ALL_FIGHTERS, findFighter, buildCustomMatchup } from "./src/fighters.ts";
 import { renderDuel } from "./src/render.ts";
 import { writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -36,52 +36,61 @@ for (const file of existingFiles) {
 const nextVer = maxVer + 1;
 const verTag = `v${String(nextVer).padStart(2, "0")}`;
 
-// 2. 解析对局阵容：支持 --matchup 指定，默认从 6 大英雄对局池中随机选取（且避免与上一版重复）
-const matchupArgIdx = process.argv.indexOf("--matchup");
+function getArgValue(flag: string): string | undefined {
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === flag && process.argv[i + 1]) return process.argv[i + 1];
+    if (arg.startsWith(`${flag}=`)) return arg.slice(flag.length + 1);
+  }
+  return undefined;
+}
+
+// 2. 解析对局阵容：支持 --a <heroA> --b <heroB> 任选两个英雄自动开打，或 --matchup 指定，或从全英雄池随机挑两个英雄
+const argA = getArgValue("--a");
+const argB = getArgValue("--b");
+const argPair = getArgValue("--pair");
+const argMatchup = getArgValue("--matchup");
+
 let matchup = DUEL_MATCHUPS[0];
-if (matchupArgIdx >= 0 && process.argv[matchupArgIdx + 1]) {
-  const val = process.argv[matchupArgIdx + 1];
-  const byId = DUEL_MATCHUPS.find(m => m.id === val);
-  const byIdx = Number.isFinite(Number(val)) ? DUEL_MATCHUPS[Number(val) % DUEL_MATCHUPS.length] : undefined;
+if (argA || argB) {
+  const heroA = (argA ? findFighter(argA) : undefined) ?? ALL_FIGHTERS[0];
+  const heroB =
+    (argB ? findFighter(argB) : undefined) ??
+    ALL_FIGHTERS.find(f => f.name !== heroA.name) ??
+    ALL_FIGHTERS[1];
+  matchup = buildCustomMatchup(heroA, heroB);
+} else if (argPair && argPair.includes("_vs_")) {
+  const [leftKey, rightKey] = argPair.split("_vs_");
+  const preset = DUEL_MATCHUPS.find(m => m.id === argPair);
+  if (preset) {
+    matchup = preset;
+  } else {
+    const heroA = findFighter(leftKey) ?? ALL_FIGHTERS[0];
+    const heroB = findFighter(rightKey) ?? ALL_FIGHTERS[1];
+    matchup = buildCustomMatchup(heroA, heroB);
+  }
+} else if (argMatchup) {
+  const byId = DUEL_MATCHUPS.find(m => m.id === argMatchup);
+  const byIdx = Number.isFinite(Number(argMatchup))
+    ? DUEL_MATCHUPS[Number(argMatchup) % DUEL_MATCHUPS.length]
+    : undefined;
   matchup = byId ?? byIdx ?? DUEL_MATCHUPS[0];
 } else {
-  const candidates = DUEL_MATCHUPS.filter(m => m.id !== lastMatchupId);
-  const pool = candidates.length > 0 ? candidates : DUEL_MATCHUPS;
-  matchup = pool[Math.floor(Math.random() * pool.length)];
+  const skillPool = ALL_FIGHTERS.filter(f => f.combatMode === "skillball");
+  const idxA = Math.floor(Math.random() * skillPool.length);
+  let idxB = Math.floor(Math.random() * (skillPool.length - 1));
+  if (idxB >= idxA) idxB += 1;
+  matchup = buildCustomMatchup(skillPool[idxA], skillPool[idxB]);
 }
 
-// 3. 解析或随机生成高爽感种子（自动优选 13.5s~20.5s 内高频拼刀决胜局）
-const explicitSeedArg = process.argv.slice(2).find(a => !a.startsWith("--") && a !== process.argv[matchupArgIdx + 1]);
-const baseSeed = explicitSeedArg ? Number(explicitSeedArg) : 100 + Math.floor(Math.random() * 899);
+// 3. 100% 真实单次物理模拟（不做多局优选剧本，完全由初始种子与实时物理碰撞决定结局）
+const flagValues = new Set([argA, argB, argPair, argMatchup].filter(Boolean));
+const explicitSeedStr =
+  getArgValue("--seed") ??
+  process.argv.slice(2).find(a => !a.startsWith("--") && !flagValues.has(a) && /^\d+$/.test(a));
+const bestSeed = explicitSeedStr ? Number(explicitSeedStr) : 100 + Math.floor(Math.random() * 899);
 const coldOpen = process.argv.includes("--cold-open");
-
-let bestSeed = baseSeed;
-let bestEvents = simulate(matchup.fighterA, matchup.fighterB, baseSeed, 34);
-let bestScore = -1;
-
-for (let offset = 0; offset < (explicitSeedArg ? 1 : 12); offset++) {
-  const candSeed = baseSeed + offset * 7;
-  const evs = simulate(matchup.fighterA, matchup.fighterB, candSeed, 34);
-  const endEv = evs.find(e => e.type === "end") as { winner: string; duration: number } | undefined;
-  if (!endEv) continue;
-  const clashes = evs.filter(
-    e =>
-      e.type === "parry" ||
-      e.type === "skill" ||
-      e.type === "webHit" ||
-      e.type === "latchStart" ||
-      e.type === "seriousPunch" ||
-      e.type === "soundWave",
-  ).length;
-  // 黄金短视频时长窗口：战斗本体 21.0s~25.5s（加上 1.75s 对战卡 + 2.2s 结算台 = 总成片 25s~29.5s）
-  const inGoldenWindow = endEv.duration >= 21.0 && endEv.duration <= 25.5 ? 200 : 0;
-  const score = inGoldenWindow + clashes;
-  if (score > bestScore) {
-    bestScore = score;
-    bestSeed = candSeed;
-    bestEvents = evs;
-  }
-}
+const bestEvents = simulate(matchup.fighterA, matchup.fighterB, bestSeed, 55);
 
 const mp4FileName = `duel_${verTag}_seed${bestSeed}_${matchup.id}.mp4`;
 const eventsPath = `/tmp/events_${verTag}_seed${bestSeed}_${matchup.id}.jsonl`;

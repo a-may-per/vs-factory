@@ -23,6 +23,31 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * clamp(t, 0, 1);
 }
 
+/**
+ * 将科学音名（C4/D4/E4/F4/G4/A4/B4...）转换为唱名（do/re/mi/fa/so/la/si）
+ */
+export function noteToSolfege(noteName: string): string {
+  const letter = (noteName || "C").charAt(0).toUpperCase();
+  switch (letter) {
+    case "C":
+      return "do";
+    case "D":
+      return "re";
+    case "E":
+      return "mi";
+    case "F":
+      return "fa";
+    case "G":
+      return "so";
+    case "A":
+      return "la";
+    case "B":
+      return "si";
+    default:
+      return "do";
+  }
+}
+
 // 10 个音高对应的霓虹色板（从低音暖金/青色到高音空灵紫/冰蓝，保证视觉层次极其丰富）
 const PITCH_PALETTE: [number, number, number][] = [
   [56, 232, 255],   // C4 冰青
@@ -1202,54 +1227,40 @@ export function renderMazeMode(
     sy1: number,
     sx2: number,
     sy2: number,
-    bHitAxis: "x" | "y",
+    _bHitAxis: "x" | "y",
     halfW: number,
     col: RGBA,
   ) => {
-    const pad = 24;
-    if (bHitAxis === "y") {
-      const sx = sx1 >= sx0 ? 1 : -1;
-      const ax = sx0 + sx * pad;
-      const ay = sy0;
-      const cx = sx2 - sx * pad;
-      const cy = sy2;
-      if ((cx - ax) * sx <= 4) return;
-      fillSquareCorridorSeg(ax, ay, cx, cy, halfW, col);
-      fillConvexQuad(
-        fb,
-        [
-          [ax, ay],
-          [sx1, sy1],
-          [cx, cy],
-          [ax, ay],
-        ],
-        col,
-      );
-    } else {
-      const sy = sy1 >= sy0 ? 1 : -1;
-      const ax = sx0;
-      const ay = sy0 + sy * pad;
-      const cx = sx2;
-      const cy = sy2 - sy * pad;
-      if ((cy - ay) * sy <= 4) return;
-      fillSquareCorridorSeg(ax, ay, cx, cy, halfW, col);
-      fillConvexQuad(
-        fb,
-        [
-          [ax, ay],
-          [sx1, sy1],
-          [cx, cy],
-          [ax, ay],
-        ],
-        col,
-      );
-    }
+    const spanAB = Math.max(1, Math.abs(sx1 - sx0), Math.abs(sy1 - sy0));
+    const spanCB = Math.max(1, Math.abs(sx1 - sx2), Math.abs(sy1 - sy2));
+    // 取距离 A、C 各留出 26px 平直基座的精确走廊中心线分点 u1，以及中腹填充弦 u2，100% 消除内部孤岛三角形
+    const uA1 = clamp(26 / spanAB, 0.16, 0.42);
+    const uC1 = clamp(26 / spanCB, 0.16, 0.42);
+    const ax1 = lerp(sx0, sx1, uA1);
+    const ay1 = lerp(sy0, sy1, uA1);
+    const cx1 = lerp(sx2, sx1, uC1);
+    const cy1 = lerp(sy2, sy1, uC1);
+    if (Math.hypot(cx1 - ax1, cy1 - ay1) <= 6) return;
+    fillSquareCorridorSeg(ax1, ay1, cx1, cy1, halfW, col);
+
+    const ax2 = lerp(sx0, sx1, 0.56);
+    const ay2 = lerp(sy0, sy1, 0.56);
+    const cx2 = lerp(sx2, sx1, 0.56);
+    const cy2 = lerp(sy2, sy1, 0.56);
+    fillSquareCorridorSeg(ax2, ay2, cx2, cy2, halfW, col);
   };
 
-  // Pass 4A：绘制迷宫内壁外沿发光边墙（包含腔体楔形包络，已走过路段点亮为音符霓虹色，前方路段为冷峻冰蓝墙沿）
+  // 计算最近一次碰撞的精确经过时间 sinceHit，用于驱动「闪白、弹簧挤压、拐角刀光」四件套
+  const activeLastNode = gt <= first.t ? last : nodes[segIdx];
+  const sinceHit = gt <= first.t ? 999 : Math.max(0, gt - activeLastNode.t);
+  const nextNodeInRun = segIdx + 1 < N ? nodes[segIdx + 1] : null;
+  const untilNextHit = nextNodeInRun && gt > first.t ? Math.max(0, nextNodeInRun.t - gt) : 999;
+
+  // Pass 4A：绘制迷宫内壁外沿发光边墙（包含腔体楔形包络，已走过路段点亮为音符霓虹色，刚撞击瞬间局部墙沿触发纯白过曝闪白！）
   for (let i = 0; i < corridorPts.length - 1; i++) {
     const A = corridorPts[i];
     const B = corridorPts[i + 1];
+    const vIdxA = winStart + i;
     const sx0 = toScreenX(A.x);
     const sy0 = toScreenY(A.y);
     const sx1 = toScreenX(B.x);
@@ -1263,19 +1274,49 @@ export function renderMazeMode(
       continue;
     }
 
+    // 【闪白升级 1】：撞击后 75ms 内，碰撞点相邻走廊外沿边墙瞬间过曝闪白
+    const wallWhiteout =
+      (vIdxA === segIdx || vIdxA === segIdx - 1) && sinceHit < 0.075
+        ? Math.pow(1 - sinceHit / 0.075, 1.3)
+        : 0;
+
     const rimCol: RGBA = A.passed
-      ? [A.col[0], A.col[1], A.col[2], 225]
+      ? [
+          Math.round(lerp(A.col[0], 255, wallWhiteout)),
+          Math.round(lerp(A.col[1], 255, wallWhiteout)),
+          Math.round(lerp(A.col[2], 255, wallWhiteout)),
+          Math.round(lerp(225, 255, wallWhiteout)),
+        ]
       : [68, 118, 198, 185];
-    fillSquareCorridorSeg(sx0, sy0, sx1, sy1, wallRimHalfW, rimCol);
+    fillSquareCorridorSeg(sx0, sy0, sx1, sy1, wallRimHalfW + wallWhiteout * 2.5, rimCol);
 
     if (i + 2 < corridorPts.length) {
       const C = corridorPts[i + 2];
       const sx2 = toScreenX(C.x);
       const sy2 = toScreenY(C.y);
+      const wedgeWhiteout =
+        vIdxA + 1 === segIdx && sinceHit < 0.075
+          ? Math.pow(1 - sinceHit / 0.075, 1.3)
+          : 0;
       const wedgeRimCol: RGBA = B.passed
-        ? [B.col[0], B.col[1], B.col[2], 225]
+        ? [
+            Math.round(lerp(B.col[0], 255, wedgeWhiteout)),
+            Math.round(lerp(B.col[1], 255, wedgeWhiteout)),
+            Math.round(lerp(B.col[2], 255, wedgeWhiteout)),
+            Math.round(lerp(225, 255, wedgeWhiteout)),
+          ]
         : [68, 118, 198, 185];
-      fillChamberWedge(sx0, sy0, sx1, sy1, sx2, sy2, B.hitAxis, wallRimHalfW, wedgeRimCol);
+      fillChamberWedge(
+        sx0,
+        sy0,
+        sx1,
+        sy1,
+        sx2,
+        sy2,
+        B.hitAxis,
+        wallRimHalfW + wedgeWhiteout * 2.5,
+        wedgeRimCol,
+      );
     }
   }
 
@@ -1347,23 +1388,34 @@ export function renderMazeMode(
     }
   }
 
-  // Pass 4C：仅为「已经走过」的迷宫通道地面保留一条发光能量余晖线（支持跨周期鬼影余晖）
-  const activeHeadVIdx = gt <= first.t ? -1 : segIdx;
-  for (let vIdx = activeHeadVIdx - 12; vIdx < activeHeadVIdx; vIdx++) {
-    const A = getVirtualNode(vIdx);
-    const B = getVirtualNode(vIdx + 1);
-    const sx0 = toScreenX(A.x);
-    const sy0 = toScreenY(A.y);
-    const sx1 = toScreenX(B.x);
-    const sy1 = toScreenY(B.y);
-    const stepAge = (activeHeadVIdx - vIdx) / 12;
-    const age = clamp(1 - stepAge * 0.82, 0.18, 0.78);
-    fb.drawLine(sx0, sy0, sx1, sy1, 3, [
-      A.base.color[0],
-      A.base.color[1],
-      A.base.color[2],
-      Math.round(130 * age),
-    ]);
+  // Pass 4C：彻底移除地面永久折线残留（拖尾仅保留跟随方块本体的动态流光丝带，走过的地面保持纯净深色），仅在刚碰撞的拐角保留 0.16s 瞬态刀光
+  for (let vIdx = Math.max(0, segIdx - 1); vIdx <= segIdx; vIdx++) {
+    if (gt <= first.t) break;
+    const vn = getVirtualNode(vIdx);
+    const dtCorner = gt - vn.base.t;
+    if (dtCorner >= 0 && dtCorner < 0.20) {
+      const pCorner = 1 - dtCorner / 0.20;
+      const prevVn = getVirtualNode(vIdx - 1);
+      const nextVn = getVirtualNode(vIdx + 1);
+      const cx = toScreenX(vn.x);
+      const cy = toScreenY(vn.y);
+      const inDx = prevVn.x - vn.x;
+      const inDy = prevVn.y - vn.y;
+      const inLen = Math.max(1, Math.hypot(inDx, inDy));
+      const outDx = nextVn.x - vn.x;
+      const outDy = nextVn.y - vn.y;
+      const outLen = Math.max(1, Math.hypot(outDx, outDy));
+      const slashArm = 36 * pCorner + 14;
+      const ax = cx + (inDx / inLen) * slashArm;
+      const ay = cy + (inDy / inLen) * slashArm;
+      const bxSlash = cx + (outDx / outLen) * slashArm;
+      const bySlash = cy + (outDy / outLen) * slashArm;
+      const cCol = vn.base.color;
+      fb.drawLine(ax, ay, cx, cy, 6.5 * pCorner, [cCol[0], cCol[1], cCol[2], Math.round(210 * pCorner)]);
+      fb.drawLine(cx, cy, bxSlash, bySlash, 6.5 * pCorner, [cCol[0], cCol[1], cCol[2], Math.round(210 * pCorner)]);
+      fb.drawLine(ax, ay, cx, cy, 2.8 * pCorner, [255, 255, 255, Math.round(245 * pCorner)]);
+      fb.drawLine(cx, cy, bxSlash, bySlash, 2.8 * pCorner, [255, 255, 255, Math.round(245 * pCorner)]);
+    }
   }
 
   const curCol = (gt <= first.t ? last.color : nodes[segIdx]?.color) ?? theme.primary;
@@ -1374,7 +1426,7 @@ export function renderMazeMode(
     [curCol[0], curCol[1], curCol[2], Math.round(36 + hitPulse * 48)],
   );
 
-  // 5. 绘制齐平镶嵌在迷宫折返壁面上的锐利 MIDI 音符砖块（包含首尾周期延伸鬼影砖块，视觉完全无缝循环）
+  // 5. 绘制齐平镶嵌在迷宫折返壁面上的锐利 MIDI 音符砖块（包含 66ms 纯白过曝闪白 + 音砖弹簧压薄 + 物理几何碎晶迸射）
   for (let vIdx = segIdx - 14; vIdx <= segIdx + 18; vIdx++) {
     const vn = getVirtualNode(vIdx);
     const n = vn.base;
@@ -1382,8 +1434,15 @@ export function renderMazeMode(
     const isHit = dtHit >= 0;
     const activeFlash =
       vn.cycle === 0 && isHit && dtHit < 0.36 ? Math.pow(1 - dtHit / 0.36, 1.5) : 0;
+    // 【闪白升级 2】：撞击瞬间前 2 帧（dtHit < 0.066s）开启 100% 纯白过曝闪白（Overexposure Whiteout）
+    const isBrickWhiteout = vn.cycle === 0 && isHit && dtHit < 0.066;
 
-    const recoilMag = activeFlash > 0 ? Math.sin(activeFlash * Math.PI) * 7 : 0;
+    // 【挤压升级 1】：音砖受击时不仅向墙内后座回退 8.5px，同时沿法线方向瞬间压薄 24%、切向微扩 9%
+    const recoilMag = activeFlash > 0 ? Math.sin(Math.pow(activeFlash, 0.7) * Math.PI) * 8.5 : 0;
+    const brickSquash =
+      vn.cycle === 0 && isHit && dtHit < 0.16
+        ? Math.sin((1 - dtHit / 0.16) * Math.PI * 0.5) * 0.24
+        : 0;
     const normX = n.hitAxis === "x" ? (n.incomingVx > 0 ? 1 : -1) : 0;
     const normY = n.hitAxis === "y" ? (n.incomingVy > 0 ? 1 : -1) : 0;
 
@@ -1392,103 +1451,183 @@ export function renderMazeMode(
     if (sy < 195 || sy > H + 150 || sx < -150 || sx > W + 150) continue;
 
     const col = n.color;
-    const rx = sx - n.brickW * 0.5;
-    const ry = sy - n.brickH * 0.5;
+    const effBrickW = n.brickW * (n.hitAxis === "x" ? 1 - brickSquash : 1 + brickSquash * 0.38);
+    const effBrickH = n.brickH * (n.hitAxis === "y" ? 1 - brickSquash : 1 + brickSquash * 0.38);
+    const rx = sx - effBrickW * 0.5;
+    const ry = sy - effBrickH * 0.5;
 
     if (activeFlash > 0.02) {
-      fb.drawGlowCircle(sx, sy, 115 * activeFlash + 45, [col[0], col[1], col[2], Math.round(210 * activeFlash)]);
+      fb.drawGlowCircle(sx, sy, 128 * activeFlash + 48, [col[0], col[1], col[2], Math.round(225 * activeFlash)]);
+      if (isBrickWhiteout) {
+        fb.drawGlowCircle(sx, sy, 86, [255, 255, 255, 235]);
+      }
     } else if (isHit) {
       fb.drawGlowCircle(sx, sy, 44, [col[0], col[1], col[2], 55]);
     }
 
-    fb.blendRoundRect(rx + 3, ry + 5, n.brickW, n.brickH, 3, [0, 0, 0, 175]);
+    fb.blendRoundRect(rx + 3, ry + 5, effBrickW, effBrickH, 3, [0, 0, 0, 175]);
 
-    const fillTop: RGBA = activeFlash > 0.10
+    const fillTop: RGBA = isBrickWhiteout
       ? [255, 255, 255, 255]
-      : isHit
-        ? [col[0], col[1], col[2], 245]
-        : [22, 33, 62, 245];
-    const fillBot: RGBA = activeFlash > 0.10
-      ? [col[0], col[1], col[2], 255]
-      : isHit
-        ? [Math.round(col[0] * 0.55), Math.round(col[1] * 0.55), Math.round(col[2] * 0.65), 240]
-        : [13, 20, 40, 245];
+      : activeFlash > 0.10
+        ? [255, 255, 255, 255]
+        : isHit
+          ? [col[0], col[1], col[2], 245]
+          : [22, 33, 62, 245];
+    const fillBot: RGBA = isBrickWhiteout
+      ? [255, 255, 255, 255]
+      : activeFlash > 0.10
+        ? [col[0], col[1], col[2], 255]
+        : isHit
+          ? [Math.round(col[0] * 0.55), Math.round(col[1] * 0.55), Math.round(col[2] * 0.65), 240]
+          : [13, 20, 40, 245];
 
-    fb.blendGradientRoundRect(rx, ry, n.brickW, n.brickH, 3, fillTop, fillBot, true);
+    fb.blendGradientRoundRect(rx, ry, effBrickW, effBrickH, 3, fillTop, fillBot, true);
 
     if (n.hitAxis === "y") {
-      const edgeY = n.incomingVy > 0 ? ry + 1 : ry + n.brickH - 5;
-      fb.blendRect(rx + 3, edgeY, n.brickW - 6, 4, [255, 255, 255, isHit ? 250 : 175]);
+      const edgeY = n.incomingVy > 0 ? ry + 1 : ry + effBrickH - 5;
+      fb.blendRect(rx + 3, edgeY, effBrickW - 6, 4, [255, 255, 255, isHit ? 255 : 175]);
     } else {
-      const edgeX = n.incomingVx > 0 ? rx + 1 : rx + n.brickW - 5;
-      fb.blendRect(edgeX, ry + 3, 4, n.brickH - 6, [255, 255, 255, isHit ? 250 : 175]);
+      const edgeX = n.incomingVx > 0 ? rx + 1 : rx + effBrickW - 5;
+      fb.blendRect(edgeX, ry + 3, 4, effBrickH - 6, [255, 255, 255, isHit ? 255 : 175]);
     }
 
     fb.strokeRoundRect(
       rx,
       ry,
-      n.brickW,
-      n.brickH,
+      effBrickW,
+      effBrickH,
       3,
-      activeFlash > 0.1 ? 3.5 : 2.5,
-      [col[0], col[1], col[2], isHit ? 255 : 215],
+      isBrickWhiteout ? 4.5 : activeFlash > 0.1 ? 3.5 : 2.5,
+      isBrickWhiteout ? [255, 255, 255, 255] : [col[0], col[1], col[2], isHit ? 255 : 215],
     );
 
-    if (vn.cycle === 0 && dtHit >= 0 && dtHit < 0.38) {
-      const p = dtHit / 0.38;
-      const expand = p * (n.strong ? 72 : 50);
-      const alpha = Math.round((1 - p) * 235);
+    // 【碎片升级】：3 层音游级物理碎晶迸射系统（双层冲击波框 + 旋转菱形/方片碎晶 + 高速拉丝电火花）
+    if (vn.cycle === 0 && dtHit >= 0 && dtHit < 0.42) {
+      const p = dtHit / 0.42;
+      const easeOutP = 1 - Math.pow(1 - p, 2.6);
+      const expand = easeOutP * (n.strong ? 82 : 56);
+      const alpha = Math.round(Math.pow(1 - p, 1.3) * 245);
       fb.strokeRoundRect(
         rx - expand,
         ry - expand,
-        n.brickW + expand * 2,
-        n.brickH + expand * 2,
-        3,
-        Math.max(1.5, (1 - p) * 4),
+        effBrickW + expand * 2,
+        effBrickH + expand * 2,
+        4,
+        Math.max(1.5, (1 - p) * 4.2),
         [col[0], col[1], col[2], alpha],
       );
 
-      const count = n.strong ? 8 : 5;
-      const hitContactX = toScreenX(vn.x + normX * SQ_R);
-      const hitContactY = toScreenY(vn.y + normY * SQ_R);
-      for (let k = 0; k < count; k++) {
-        const baseAng = Math.atan2(-normY, -normX);
-        const spread = ((k / Math.max(1, count - 1)) - 0.5) * 2.0;
-        const ang = baseAng + spread;
-        const dist = (18 + (k % 3) * 12) + p * (n.strong ? 95 : 68);
-        const px = hitContactX + Math.cos(ang) * dist;
-        const py = hitContactY + Math.sin(ang) * dist;
-        const pSize = Math.max(3, (1 - p) * 9);
-        fb.fillRect(
-          px - pSize * 0.5,
-          py - pSize * 0.5,
-          pSize,
-          pSize,
-          k % 2 === 0
-            ? [255, 255, 255, Math.round((1 - p) * 245)]
-            : [col[0], col[1], col[2], Math.round((1 - p) * 235)],
+      // 强拍或初击瞬间叠加第二道纯白高速内圈冲击框
+      if (dtHit < 0.22) {
+        const p2 = dtHit / 0.22;
+        const expand2 = (1 - Math.pow(1 - p2, 2.2)) * (n.strong ? 46 : 32);
+        fb.strokeRoundRect(
+          rx - expand2,
+          ry - expand2,
+          effBrickW + expand2 * 2,
+          effBrickH + expand2 * 2,
+          3,
+          Math.max(1.2, (1 - p2) * 3.2),
+          [255, 255, 255, Math.round((1 - p2) * 240)],
         );
       }
 
-      drawFitText(
-        fb,
-        atlas,
-        n.noteName,
-        sx - normX * 42,
-        sy - normY * 42 - 12 - p * 18,
-        [255, 255, 255, Math.round((1 - p) * 250)],
-        120,
-        0.34,
-        "center",
-        2,
-      );
+      const hitContactX = toScreenX(vn.x + normX * SQ_R);
+      const hitContactY = toScreenY(vn.y + normY * SQ_R);
+      const baseAng = Math.atan2(-normY, -normX);
+
+      // 子层 A：接触面瞬态激光横闪（Contact Flare Bar）
+      if (dtHit < 0.09) {
+        const pf = 1 - dtHit / 0.09;
+        const flareLen = (n.strong ? 46 : 34) * pf;
+        const tangX = -normY;
+        const tangY = normX;
+        fb.drawLine(
+          hitContactX - tangX * flareLen,
+          hitContactY - tangY * flareLen,
+          hitContactX + tangX * flareLen,
+          hitContactY + tangY * flareLen,
+          5.5 * pf,
+          [255, 255, 255, Math.round(255 * pf)],
+        );
+      }
+
+      // 子层 B：高速拉丝电火花（Radial Spark Streaks）
+      if (dtHit < 0.24) {
+        const ps = dtHit / 0.24;
+        const sparkCount = n.strong ? 8 : 5;
+        for (let s = 0; s < sparkCount; s++) {
+          const sSpread = ((s / Math.max(1, sparkCount - 1)) - 0.5) * 2.35;
+          const sAng = baseAng + sSpread;
+          const rInner = 12 + ps * (n.strong ? 68 : 48);
+          const rOuter = rInner + (1 - ps) * (n.strong ? 26 : 18);
+          fb.drawLine(
+            hitContactX + Math.cos(sAng) * rInner,
+            hitContactY + Math.sin(sAng) * rInner,
+            hitContactX + Math.cos(sAng) * rOuter,
+            hitContactY + Math.sin(sAng) * rOuter,
+            Math.max(1.2, (1 - ps) * 2.8),
+            s % 2 === 0
+              ? [255, 255, 255, Math.round((1 - ps) * 245)]
+              : [col[0], col[1], col[2], Math.round((1 - ps) * 235)],
+          );
+        }
+      }
+
+      // 子层 C：带空气阻力减速、重力微坠与自旋的几何碎晶（Tumbling Crystal Shards）
+      const shardCount = n.strong ? 14 : 10;
+      for (let k = 0; k < shardCount; k++) {
+        const hash = ((vn.vIdx * 37 + k * 53) & 1023) / 1023;
+        const spread = ((k / Math.max(1, shardCount - 1)) - 0.5) * 2.25 + (hash - 0.5) * 0.18;
+        const ang = baseAng + spread;
+        const maxDist = (38 + (k % 4) * 18 + hash * 22) * (n.strong ? 1.32 : 1.0);
+        const dist = 10 + easeOutP * maxDist;
+        const gravityDroop = p * p * 26;
+        const px = hitContactX + Math.cos(ang) * dist;
+        const py = hitContactY + Math.sin(ang) * dist + gravityDroop;
+
+        const fade = Math.pow(1 - p, 1.25);
+        const shardCol: RGBA =
+          k % 3 === 0 || dtHit < 0.06
+            ? [255, 255, 255, Math.round(fade * 252)]
+            : k % 3 === 1
+              ? [col[0], col[1], col[2], Math.round(fade * 245)]
+              : [
+                  Math.min(255, col[0] + 75),
+                  Math.min(255, col[1] + 75),
+                  Math.min(255, col[2] + 75),
+                  Math.round(fade * 235),
+                ];
+
+        // 旋转菱形碎晶 vs 旋转方片碎晶交替
+        const rot = k * 1.15 + easeOutP * (k % 2 === 0 ? 5.4 : -4.8);
+        const ux = Math.cos(rot);
+        const uy = Math.sin(rot);
+        const vxShard = -uy;
+        const vyShard = ux;
+        const rLong = Math.max(2.5, (7.5 + (k % 3) * 2.8) * (0.35 + 0.65 * fade));
+        const rShort = Math.max(1.8, rLong * (k % 2 === 0 ? 0.48 : 0.78));
+
+        fillConvexQuad(
+          fb,
+          [
+            [px + ux * rLong, py + uy * rLong],
+            [px + vxShard * rShort, py + vyShard * rShort],
+            [px - ux * rLong, py - uy * rLong],
+            [px - vxShard * rShort, py - vyShard * rShort],
+          ],
+          shardCol,
+        );
+      }
     }
   }
 
-  // 6. 绘制零断层连续多边形丝带拖尾（Continuous Polygon Ribbon Trail）
+  // 6. 【拖尾升级 B：双层流光丝带拖尾（外层霓虹流体带 + 内芯纯白高能灯丝）】
   trail.push({ x: bx, y: by });
-  if (trail.length > 18) trail.shift();
+  if (trail.length > 20) trail.shift();
 
+  const pulseBoost = 1 + hitPulse * 0.24;
   for (let i = 0; i < trail.length - 1; i++) {
     const p0 = trail[i];
     const p1 = trail[i + 1];
@@ -1504,9 +1643,10 @@ export function renderMazeMode(
     if (len < 0.5) continue;
     const nx = -dy / len;
     const ny = dx / len;
-    const w0 = SQ_R * (0.18 + 0.78 * f0);
-    const w1 = SQ_R * (0.18 + 0.78 * f1);
-    const alpha = Math.round(f1 * f1 * 175);
+    const w0 = SQ_R * (0.16 + 0.84 * f0) * pulseBoost;
+    const w1 = SQ_R * (0.16 + 0.84 * f1) * pulseBoost;
+    const alpha = Math.round(f1 * f1 * 195);
+    // 外层：音符霓虹流光宽带
     fillConvexQuad(
       fb,
       [
@@ -1517,28 +1657,180 @@ export function renderMazeMode(
       ],
       [curCol[0], curCol[1], curCol[2], alpha],
     );
+    // 内层：前 70% 轨迹叠加一条纯白高能内芯细丝，形成音游刀光层次感
+    if (f1 > 0.30) {
+      const cw0 = w0 * 0.36;
+      const cw1 = w1 * 0.36;
+      const coreAlpha = Math.round(Math.pow((f1 - 0.30) / 0.70, 1.5) * 225);
+      fillConvexQuad(
+        fb,
+        [
+          [sx0 + nx * cw0, sy0 + ny * cw0],
+          [sx1 + nx * cw1, sy1 + ny * cw1],
+          [sx1 - nx * cw1, sy1 - ny * cw1],
+          [sx0 - nx * cw0, sy0 - ny * cw0],
+        ],
+        [255, 255, 255, coreAlpha],
+      );
+    }
   }
 
-  // 7. 绘制主角「锐利几何发光音符方块」（r = 3px，外层纯白亮框 + 随音高实时变色的霓虹能量内芯）
-  const lastNode = nodes[segIdx];
-  const squashAmt = hitPulse > 0.15 ? (hitPulse - 0.15) * 0.28 : 0;
-  const scaleX = lastNode?.hitAxis === "x" ? 1 - squashAmt : 1 + squashAmt * 0.55;
-  const scaleY = lastNode?.hitAxis === "y" ? 1 - squashAmt : 1 + squashAmt * 0.55;
+  // 6.5 【顶层音符唱名冒字与短暂显现淡出（♪ do / re / mi / fa / so / la / si）】：
+  // 触板瞬间 Q 弹冒出（0 ~ 0.30s），在刚走过的 2~3 块板子旁短暂显现停驻（0.30s ~ 0.72s），随后在 0.72s ~ 1.15s 内干净淡出归零（绝不永久残留！）
+  const totalCycleSpan = Math.max(1, last.t - first.t + outroSpan + introSpan);
+  for (let vIdx = segIdx - 4; vIdx <= segIdx; vIdx++) {
+    const vn = getVirtualNode(vIdx);
+    const n = vn.base;
+    const exactNodeT = vn.cycle * totalCycleSpan + n.t;
+    const dtHit = gt - exactNodeT;
+    const stepsAgo = segIdx - vIdx;
+    if (dtHit < 0 || dtHit >= 1.15 || stepsAgo > 3) continue;
+
+    const pPop = clamp(dtHit / 0.30, 0, 1);
+    const easeOutP = 1 - Math.pow(1 - pPop, 2.4);
+    // 0 ~ 0.65s 保持清晰显现，0.65s ~ 1.15s（或超过 3 步）平滑淡出至 0，更早走过的板子保持干净无残留
+    const timeFade =
+      dtHit < 0.65
+        ? 1.0
+        : Math.pow(clamp(1 - (dtHit - 0.65) / 0.50, 0, 1), 1.35);
+    const stepFade = stepsAgo <= 2 ? 1.0 : 0.55;
+    const lingerFade = timeFade * stepFade;
+    if (lingerFade <= 0.03) continue;
+
+    const normX = n.hitAxis === "x" ? (n.incomingVx > 0 ? 1 : -1) : 0;
+    const normY = n.hitAxis === "y" ? (n.incomingVy > 0 ? 1 : -1) : 0;
+    const sx = toScreenX(vn.brickX);
+    const sy = toScreenY(vn.brickY);
+    if (sy < 180 || sy > H + 120 || sx < -120 || sx > W + 120) continue;
+
+    const solfege = noteToSolfege(n.noteName);
+    const col = n.color;
+
+    // 弹性冒出缩放：前 85ms 从 0.28 快速弹至 0.48，0.30s 时回落至 0.36 短暂显现
+    const popScale =
+      dtHit < 0.085
+        ? lerp(0.28, 0.48, dtHit / 0.085)
+        : dtHit < 0.30
+          ? lerp(0.48, 0.36, (dtHit - 0.085) / 0.215)
+          : 0.36;
+
+    // 紧贴受击板子内侧表面旁显现
+    const popX =
+      n.hitAxis === "x"
+        ? sx - normX * (34 + easeOutP * 14)
+        : sx;
+    const popY =
+      n.hitAxis === "y"
+        ? normY < 0
+          ? sy + 14 + easeOutP * 10
+          : sy - 30 - easeOutP * 12
+        : sy - 11 - easeOutP * 6;
+
+    // 伴生小音符 ♪ 在前 0.48s 内向外侧上方轻盈飘散
+    if (dtHit < 0.48) {
+      const pNote = dtHit / 0.48;
+      const noteEase = 1 - Math.pow(1 - pNote, 2.2);
+      const noteAlpha = Math.round(Math.pow(1 - pNote, 1.3) * 235);
+      const sideSign = n.hitAxis === "x" ? -normX : vIdx % 2 === 0 ? 1 : -1;
+      drawFitText(
+        fb,
+        atlas,
+        "♪",
+        popX + sideSign * (38 + noteEase * 24),
+        popY - 16 - noteEase * 22,
+        [col[0], col[1], col[2], noteAlpha],
+        64,
+        0.30,
+        "center",
+        2,
+      );
+    }
+
+    // 主唱名标签：♪ do / ♪ re / ♪ mi / ♪ fa / ♪ so / ♪ la / ♪ si
+    const whiteMix = dtHit < 0.30 ? lerp(105, 55, dtHit / 0.30) : 50;
+    const alpha = Math.round(252 * lingerFade);
+    drawFitText(
+      fb,
+      atlas,
+      `♪ ${solfege}`,
+      popX,
+      popY,
+      [
+        Math.min(255, Math.round(col[0] + whiteMix)),
+        Math.min(255, Math.round(col[1] + whiteMix)),
+        Math.min(255, Math.round(col[2] + whiteMix)),
+        alpha,
+      ],
+      175,
+      popScale,
+      "center",
+      3,
+    );
+  }
+
+  // 7. 【挤压升级 2 + 闪白升级 3】：绘制主角「锐利几何发光音符方块」
+  // 撞击瞬间沿法线方向压扁至 0.62x、切向扩宽至 1.38x，并紧贴墙面，随后触发弹簧阻尼过冲回弹（0.62 -> 1.15 -> 0.96 -> 1.0）
+  let normalScale = 1.0;
+  let tangentScale = 1.0;
+  let wallClingOffsetX = 0;
+  let wallClingOffsetY = 0;
+
+  if (sinceHit >= 0 && sinceHit < 0.21) {
+    const u = sinceHit / 0.21;
+    // 阻尼余弦弹簧波：u=0 时处于最大正压扁 (+1.0)，u=0.48 时反弹过冲至拉伸态 (-0.42)，随后收敛归零
+    const springWave = Math.cos(u * Math.PI * 2.15) * Math.pow(1 - u, 1.55);
+    const maxSquash = activeLastNode?.strong ? 0.38 : 0.33;
+    const deform = maxSquash * springWave;
+    normalScale = 1.0 - deform;
+    tangentScale = 1.0 + deform * 0.95;
+
+    // 压扁瞬间把方块中心向受击墙面微推，确保前表面 100% 紧贴音砖表面压扁，而不是悬空缩小
+    if (deform > 0 && activeLastNode) {
+      const clingShift = deform * SQ_R * 0.75;
+      if (activeLastNode.hitAxis === "x") {
+        wallClingOffsetX = (activeLastNode.incomingVx > 0 ? 1 : -1) * clingShift;
+      } else {
+        wallClingOffsetY = (activeLastNode.incomingVy > 0 ? 1 : -1) * clingShift;
+      }
+    }
+  } else if (untilNextHit < 0.04 && nextNodeInRun) {
+    // 撞墙前 1 帧微幅预拉伸，强化高速扑向音砖的动量感
+    const preRatio = 1 - untilNextHit / 0.04;
+    normalScale = 1.0 + 0.10 * preRatio;
+    tangentScale = 1.0 - 0.08 * preRatio;
+  }
+
+  const hitAxisForScale =
+    untilNextHit < 0.04 && nextNodeInRun
+      ? nextNodeInRun.hitAxis
+      : (activeLastNode?.hitAxis ?? "x");
+  const scaleX = hitAxisForScale === "x" ? normalScale : tangentScale;
+  const scaleY = hitAxisForScale === "y" ? normalScale : tangentScale;
   const sqW = SQ_R * 2 * scaleX;
   const sqH = SQ_R * 2 * scaleY;
-  const sbx = toScreenX(bx) - sqW * 0.5;
-  const sby = toScreenY(by) - sqH * 0.5;
+  const centerScreenX = toScreenX(bx + wallClingOffsetX);
+  const centerScreenY = toScreenY(by + wallClingOffsetY);
+  const sbx = centerScreenX - sqW * 0.5;
+  const sby = centerScreenY - sqH * 0.5;
 
-  fb.drawGlowCircle(toScreenX(bx), toScreenY(by), 68 + hitPulse * 32, [curCol[0], curCol[1], curCol[2], 185]);
+  // 撞击前 2 帧（sinceHit < 0.062s）主角方块全身触发纯白过曝闪光
+  const isBallWhiteout = sinceHit >= 0 && sinceHit < 0.062;
+
+  fb.drawGlowCircle(
+    centerScreenX,
+    centerScreenY,
+    (isBallWhiteout ? 92 : 68) + hitPulse * 36,
+    isBallWhiteout ? [255, 255, 255, 225] : [curCol[0], curCol[1], curCol[2], 195],
+  );
   fb.blendRoundRect(sbx, sby, sqW, sqH, 3, [255, 255, 255, 255]);
-  const borderPad = 4.5;
+  const borderPad = isBallWhiteout ? 2.5 : 4.5;
   fb.blendRoundRect(
     sbx + borderPad,
     sby + borderPad,
     Math.max(8, sqW - borderPad * 2),
     Math.max(8, sqH - borderPad * 2),
     2,
-    [curCol[0], curCol[1], curCol[2], 255],
+    isBallWhiteout ? [255, 255, 255, 255] : [curCol[0], curCol[1], curCol[2], 255],
   );
   const corePad = 11;
   fb.blendRoundRect(
@@ -1547,7 +1839,7 @@ export function renderMazeMode(
     Math.max(4, sqW - corePad * 2),
     Math.max(4, sqH - corePad * 2),
     1.5,
-    [255, 255, 255, 235],
+    [255, 255, 255, 245],
   );
 }
 
@@ -1898,40 +2190,101 @@ export function renderStaircaseMode(
       );
     }
 
+    const solfege = noteToSolfege(n.noteName);
     drawFitText(
       fb,
       atlas,
-      n.noteName,
+      isHit ? `♪ ${solfege}` : solfege,
       topCenter[0],
       topCenter[1] - 11,
-      [255, 255, 255, activeFlash > 0.12 ? 255 : isHit ? 245 : 185],
-      90,
-      0.30,
+      [255, 255, 255, activeFlash > 0.12 ? 255 : isHit ? 250 : 175],
+      115,
+      isHit ? 0.34 : 0.30,
       "center",
       2,
     );
 
-    // 沿 3D 等轴测水平面扩散的平行四边形波纹环
-    if (dtHit >= 0 && dtHit < 0.44) {
-      const p = dtHit / 0.44;
-      const expand = p * (n.strong ? 52 : 36);
+    // 沿 3D 等轴测水平面扩散的双层平行四边形波纹环 + 向上飞溅的琉璃碎晶（Crystal Shards）
+    if (dtHit >= 0 && dtHit < 0.50) {
+      const p = dtHit / 0.50;
+      const easeOutP = 1 - Math.pow(1 - p, 2.4);
+      const expand = easeOutP * (n.strong ? 58 : 40);
       const r00 = isoProject(x0 - expand, y0 - expand, zTop, camWx, camWy, camWz, W, H);
       const r10 = isoProject(x1 + expand, y0 - expand, zTop, camWx, camWy, camWz, W, H);
       const r11 = isoProject(x1 + expand, y1 + expand, zTop, camWx, camWy, camWz, W, H);
       const r01 = isoProject(x0 - expand, y1 + expand, zTop, camWx, camWy, camWz, W, H);
-      strokeQuad(fb, [r00, r10, r11, r01], Math.max(1.5, (1 - p) * 3.8), [col[0], col[1], col[2], Math.round((1 - p) * 230)]);
+      strokeQuad(fb, [r00, r10, r11, r01], Math.max(1.5, (1 - p) * 3.8), [col[0], col[1], col[2], Math.round((1 - p) * 235)]);
 
+      if (dtHit < 0.22) {
+        const p2 = dtHit / 0.22;
+        const expand2 = (1 - Math.pow(1 - p2, 2.1)) * (n.strong ? 32 : 22);
+        const q00 = isoProject(x0 - expand2, y0 - expand2, zTop, camWx, camWy, camWz, W, H);
+        const q10 = isoProject(x1 + expand2, y0 - expand2, zTop, camWx, camWy, camWz, W, H);
+        const q11 = isoProject(x1 + expand2, y1 + expand2, zTop, camWx, camWy, camWz, W, H);
+        const q01 = isoProject(x0 - expand2, y1 + expand2, zTop, camWx, camWy, camWz, W, H);
+        strokeQuad(fb, [q00, q10, q11, q01], Math.max(1.2, (1 - p2) * 3.0), [255, 255, 255, Math.round((1 - p2) * 240)]);
+      }
+
+      const shardCount = n.strong ? 12 : 8;
+      for (let k = 0; k < shardCount; k++) {
+        const ang = -Math.PI * 0.5 + ((k / Math.max(1, shardCount - 1)) - 0.5) * 2.1;
+        const dist = 12 + easeOutP * (38 + (k % 3) * 18) * (n.strong ? 1.25 : 1.0);
+        const sxShard = topCenter[0] + Math.cos(ang) * dist;
+        const syShard = topCenter[1] + Math.sin(ang) * dist * 0.78 + p * p * 28;
+        const fade = Math.pow(1 - p, 1.3);
+        const rLong = Math.max(2.2, (6.5 + (k % 3) * 2.2) * fade);
+        const rShort = rLong * 0.52;
+        const rot = k * 0.9 + easeOutP * 4.2;
+        const ux = Math.cos(rot);
+        const uy = Math.sin(rot);
+        fillConvexQuad(
+          fb,
+          [
+            [sxShard + ux * rLong, syShard + uy * rLong],
+            [sxShard - uy * rShort, syShard + ux * rShort],
+            [sxShard - ux * rLong, syShard - uy * rLong],
+            [sxShard + uy * rShort, syShard - ux * rShort],
+          ],
+          k % 2 === 0
+            ? [255, 255, 255, Math.round(fade * 248)]
+            : [col[0], col[1], col[2], Math.round(fade * 238)],
+        );
+      }
+
+      const popScale =
+        dtHit < 0.085
+          ? lerp(0.28, 0.48, dtHit / 0.085)
+          : lerp(0.48, 0.40, (dtHit - 0.085) / 0.415);
+      const fade = Math.pow(1 - p, 1.25);
+      const sideSign = i % 2 === 0 ? 1 : -1;
       drawFitText(
         fb,
         atlas,
-        `♪ ${n.noteName}`,
-        topCenter[0],
-        topCenter[1] - 38 - p * 48,
-        [col[0], col[1], col[2], Math.round((1 - p) * 250)],
-        160,
-        0.40,
+        "♪",
+        topCenter[0] + sideSign * (30 + easeOutP * 18),
+        topCenter[1] - 52 - easeOutP * 58,
+        [col[0], col[1], col[2], Math.round(fade * 235)],
+        64,
+        popScale * 0.78,
         "center",
         2,
+      );
+      drawFitText(
+        fb,
+        atlas,
+        `♪ ${solfege}`,
+        topCenter[0],
+        topCenter[1] - 38 - easeOutP * 50,
+        [
+          Math.min(255, col[0] + 105),
+          Math.min(255, col[1] + 105),
+          Math.min(255, col[2] + 105),
+          Math.round(fade * 255),
+        ],
+        175,
+        popScale,
+        "center",
+        3,
       );
     }
   }
@@ -1947,13 +2300,14 @@ export function renderStaircaseMode(
   const s01 = isoProject(ballWx - shR, ballWy + shR, groundWz, camWx, camWy, camWz, W, H);
   fillConvexQuad(fb, [s00, s10, s11, s01], [3, 5, 14, shAlpha]);
 
-  // 6. 绘制流光水晶琉璃球的连续丝带光轨与高折射球体
+  // 6. 绘制流光水晶琉璃球的双层丝带光轨（外层霓虹 + 内芯亮白）与高折射弹簧挤压球体
   const ballScreen = isoProject(ballWx, ballWy, ballWz, camWx, camWy, camWz, W, H);
   const worldScreenX = ballScreen[0] + camState.x;
   const worldScreenY = ballScreen[1] + camState.y;
   trail.push({ x: worldScreenX, y: worldScreenY });
-  if (trail.length > 18) trail.shift();
+  if (trail.length > 20) trail.shift();
 
+  const pulseBoost = 1 + hitPulse * 0.22;
   for (let i = 0; i < trail.length - 1; i++) {
     const p0 = trail[i];
     const p1 = trail[i + 1];
@@ -1969,8 +2323,8 @@ export function renderStaircaseMode(
     if (len < 0.5) continue;
     const nx = -dy / len;
     const ny = dx / len;
-    const w0 = ORB_R * (0.14 + 0.68 * f0);
-    const w1 = ORB_R * (0.14 + 0.68 * f1);
+    const w0 = ORB_R * (0.14 + 0.72 * f0) * pulseBoost;
+    const w1 = ORB_R * (0.14 + 0.72 * f1) * pulseBoost;
     fillConvexQuad(
       fb,
       [
@@ -1979,15 +2333,42 @@ export function renderStaircaseMode(
         [sx1 - nx * w1, sy1 - ny * w1],
         [sx0 - nx * w0, sy0 - ny * w0],
       ],
-      [curCol[0], curCol[1], curCol[2], Math.round(f1 * f1 * 155)],
+      [curCol[0], curCol[1], curCol[2], Math.round(f1 * f1 * 175)],
     );
+    if (f1 > 0.30) {
+      const cw0 = w0 * 0.36;
+      const cw1 = w1 * 0.36;
+      const coreAlpha = Math.round(Math.pow((f1 - 0.30) / 0.70, 1.5) * 215);
+      fillConvexQuad(
+        fb,
+        [
+          [sx0 + nx * cw0, sy0 + ny * cw0],
+          [sx1 + nx * cw1, sy1 + ny * cw1],
+          [sx1 - nx * cw1, sy1 - ny * cw1],
+          [sx0 - nx * cw0, sy0 - ny * cw0],
+        ],
+        [255, 255, 255, coreAlpha],
+      );
+    }
   }
 
+  const sinceStairHit = Math.max(0, gt - (nodes[segIdx]?.t ?? 0));
+  const isOrbWhiteout = sinceStairHit >= 0 && sinceStairHit < 0.062;
   const sbx = ballScreen[0];
-  const sby = ballScreen[1];
-  fb.drawGlowCircle(sbx, sby, 82 + hitPulse * 38, [curCol[0], curCol[1], curCol[2], 185]);
+  const sby = ballScreen[1] + (sinceStairHit < 0.14 ? Math.sin((1 - sinceStairHit / 0.14) * Math.PI) * 5 : 0);
+  fb.drawGlowCircle(
+    sbx,
+    sby,
+    (isOrbWhiteout ? 105 : 82) + hitPulse * 38,
+    isOrbWhiteout ? [255, 255, 255, 225] : [curCol[0], curCol[1], curCol[2], 185],
+  );
   fb.fillCircle(sbx, sby, ORB_R + 2, [255, 255, 255, 248]);
-  fb.fillCircle(sbx, sby, ORB_R - 1.5, [curCol[0], curCol[1], curCol[2], 255]);
+  fb.fillCircle(
+    sbx,
+    sby,
+    ORB_R - 1.5,
+    isOrbWhiteout ? [255, 255, 255, 255] : [curCol[0], curCol[1], curCol[2], 255],
+  );
   fb.fillCircle(sbx + ORB_R * 0.14, sby + ORB_R * 0.16, ORB_R * 0.68, [
     Math.round(curCol[0] * 0.72),
     Math.round(curCol[1] * 0.72),
@@ -2151,11 +2532,12 @@ export function renderPendulumMode(
       trackFlash > 0.1 ? 255 : 155,
     ]);
 
-    // 轨道右侧常驻轻量化音高刻度标签
+    // 轨道右侧常驻轻量化唱名刻度标签
+    const trackSolfege = noteToSolfege(NOTE_NAMES[k]);
     drawFitText(
       fb,
       atlas,
-      NOTE_NAMES[k],
+      trackSolfege,
       pivotX + 26,
       nodeY - 11,
       [col[0], col[1], col[2], trackFlash > 0.1 ? 255 : 130],
@@ -2165,7 +2547,7 @@ export function renderPendulumMode(
       1,
     );
 
-    // 跨弦瞬间：在中央激光弦锚点爆开同心水波纹 + 高亮音符飘字
+    // 跨弦瞬间：在中央激光弦锚点爆开同心水波纹 + 高亮音符唱名飘字
     if (lastHitEv && gt >= lastHitEv.t && gt - lastHitEv.t < 0.48) {
       const p = (gt - lastHitEv.t) / 0.48;
       const r1 = 16 + p * (lastHitEv.strong ? 115 : 80);
@@ -2186,12 +2568,12 @@ export function renderPendulumMode(
       drawFitText(
         fb,
         atlas,
-        `♪ ${NOTE_NAMES[k]}`,
+        `♪ ${trackSolfege}`,
         pivotX - 75,
         nodeY - 18 - p * 28,
         [col[0], col[1], col[2], Math.round((1 - p) * 250)],
         140,
-        0.38,
+        0.40,
         "center",
         2,
       );

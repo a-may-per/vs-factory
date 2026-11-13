@@ -29,6 +29,7 @@ import {
 } from "./themes.ts";
 import {
   buildViralNodes,
+  noteToSolfege,
   renderMazeMode,
   renderPendulumMode,
   renderStaircaseMode,
@@ -916,17 +917,17 @@ export async function renderMusicBallVideo(
                 Math.round((1 - p) * 245),
               ]);
             }
-            // 极简音符判定微浮字（无冗长 PERFECT 词条，仅保留灵动音高）
+            // 极简音符唱名微浮字（♪ do / re / mi / fa / so / la / si）
             const popY = sy - 50 - p * 36;
             drawFitText(
               fb,
               atlas,
-              `♪ ${n.noteName}`,
+              `♪ ${noteToSolfege(n.noteName)}`,
               hitX + dir * 78,
               popY,
               n.strong ? [255, 232, 95, Math.round((1 - p) * 245)] : [140, 240, 255, Math.round((1 - p) * 225)],
               160,
-              n.strong ? 0.38 : 0.34,
+              n.strong ? 0.40 : 0.36,
               "center",
               2,
             );
@@ -1157,12 +1158,12 @@ export async function renderMusicBallVideo(
             drawFitText(
               fb,
               atlas,
-              `♪ ${n.noteName}`,
+              `♪ ${noteToSolfege(n.noteName)}`,
               sx,
               sy - 62 - p * 40,
               n.strong ? [255, 232, 95, Math.round((1 - p) * 245)] : [135, 240, 255, Math.round((1 - p) * 225)],
               160,
-              n.strong ? 0.38 : 0.34,
+              n.strong ? 0.40 : 0.36,
               "center",
               2,
             );

@@ -1,16 +1,21 @@
-// siege 一键流水线：窄口防线死守模拟 → 持久化战损渲染 → 1080x1920 竖屏成片
+// siege 一键流水线：窄口绝境死守 / 死角光暗手电搜房 / 断电探照灯 / 声呐潜行 / 多队迷宫汇合 → 26人交叉火网反推丧尸母巢
 // 用法:
-//   npx tsx siege/run.ts [seed] [--map canyon-bridge|twin-corridor|cross-bunker] [--duration 19] [--out output/siege/demo.mp4]
-import { mkdirSync, readdirSync, copyFileSync } from "node:fs";
+//   node --experimental-strip-types siege/run.ts [seed] [--mode combo|rescue|infect|multiply|bunker|scavenge|blackout|sonar|maze-infect|random] [--map canyon-bridge|twin-corridor|cross-bunker] [--duration 42] [--bgm path/to/bgm.mp3]
+import { mkdirSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { SIEGE_MAPS, SIEGE_MAP_IDS, type SiegeMapId } from "./src/config.ts";
+import {
+  SIEGE_MAPS,
+  SIEGE_MAP_IDS,
+  SIEGE_MODE_IDS,
+  SIEGE_MODE_META,
+  type SiegeMapId,
+  type SiegeModeId,
+} from "./src/config.ts";
 import { renderSiegeVideo } from "./src/render.ts";
 
 const PROJ_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const TOP_OUT_DIR = join(PROJ_ROOT, "output");
 const SIEGE_OUT_DIR = join(PROJ_ROOT, "output/siege");
-mkdirSync(TOP_OUT_DIR, { recursive: true });
 mkdirSync(SIEGE_OUT_DIR, { recursive: true });
 
 function getFlag(name: string): string | undefined {
@@ -53,29 +58,36 @@ const explicitSeedArg = process.argv
   .find(a => !a.startsWith("--") && /^\d+$/.test(a) && a !== getFlag("--duration"));
 const seed = explicitSeedArg ? Number(explicitSeedArg) : 200 + nextVer * 17;
 const rawDur = getFlag("--duration");
-const durationSec = rawDur ? Math.max(10, Number(rawDur) || 20) : undefined;
+const durationSec = rawDur ? Math.max(15, Number(rawDur) || 42) : undefined;
+
+// 4. 解析玩法模式 (--mode combo|rescue|infect|multiply|bunker|random)
+const modeArg = getFlag("--mode");
+let modeId: SiegeModeId = "combo";
+if (modeArg === "random") {
+  modeId = SIEGE_MODE_IDS[seed % SIEGE_MODE_IDS.length];
+} else if (modeArg && modeArg in SIEGE_MODE_META) {
+  modeId = modeArg as SiegeModeId;
+}
+const modeMeta = SIEGE_MODE_META[modeId];
 
 const customOut = getFlag("--out");
-const mp4FileName = `siege_${verTag}_seed${seed}_${mapId}.mp4`;
+const bgmPath = getFlag("--bgm");
+const mp4FileName = `siege_${verTag}_seed${seed}_${mapId}_${modeId}.mp4`;
 const outMp4 = customOut ?? join(SIEGE_OUT_DIR, mp4FileName);
-const topOutMp4 = join(TOP_OUT_DIR, mp4FileName);
 
 console.log(
-  `[1/2] starting siege ${verTag} | map=${mapCfg.name} (${mapId}) | seed=${seed} | dur=${durationSec ? `${durationSec}s` : "auto(决出胜负)"} ...`,
+  `[1/2] starting siege ${verTag} | mode=${modeMeta.name} (${modeId}) | map=${mapCfg.name} (${mapId}) | seed=${seed} | dur=${durationSec ? `${durationSec}s` : "auto(反推母巢决胜)"}${bgmPath ? ` | bgm=${bgmPath}` : " | bgm=3-Act-Phonk+ASMR"} ...`,
 );
 const stats = await renderSiegeVideo({
   mapId,
+  modeId,
   seed,
   durationSec,
   outMp4,
-  hookTitle: mapCfg.hookTitle,
+  hookTitle: modeMeta.hookTitle,
+  bgmPath,
 });
 
 console.log(
-  `[2/2] finished -> ${outMp4} | dur=${stats.durationSec}s | kills=${stats.kills} | bosses=${stats.bossesKilled}/${stats.totalBosses} | aliveGreens=${stats.aliveGreens}/${stats.totalGreens}`,
+  `[2/2] finished -> ${outMp4} | dur=${stats.durationSec}s | mode=${stats.modeId} | kills=${stats.kills} | bosses=${stats.bossesKilled}/${stats.totalBosses} | squad=${stats.aliveGreens} | rescued=${stats.rescuedCount} | casualties=${stats.casualties}`,
 );
-
-if (!customOut) {
-  copyFileSync(outMp4, topOutMp4);
-  console.log(`[done] also copied to top-level output -> ${topOutMp4}`);
-}
