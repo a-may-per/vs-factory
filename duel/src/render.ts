@@ -5,7 +5,7 @@
 // 底部：彻底移除冗余数据卡片，仅保留无边框高光事件单行播报。
 import { FrameBuf, type RGBA } from "../../shared/render/framebuf.ts";
 import { FontAtlas } from "../../shared/render/atlas.ts";
-import { SpriteSheet } from "../../shared/render/png.ts";
+import { SpriteSheet, writePng } from "../../shared/render/png.ts";
 import { encodeFrames } from "../../shared/render/encoder.ts";
 import { synthSfx, writeWav } from "../../shared/audio/sfx.ts";
 import { mixTracks, normalize } from "../../shared/audio/mixer.ts";
@@ -109,10 +109,10 @@ function easeOutBack(t: number): number {
 export async function renderDuel(
   eventsPath: string,
   outMp4: string,
-  opts: { coldOpen?: boolean; bgm?: boolean; hookText?: string } = {},
+  opts: { coldOpen?: boolean; bgm?: boolean; hookText?: string; coverPath?: string } = {},
 ): Promise<void> {
-  // 默认开启 1.75s 高燃开局对战卡（展示双方环绕武器 + 进化法则契约），随后无缝切入高速拼刀对冲
-  const { coldOpen = false, bgm = true, hookText } = opts;
+  // 默认开启 0.0s 冷启动直接进高亮霓虹竞技场（消除前3秒暗色属性卡劝退），可通过 coldOpen: false 显式启用旧版对战卡
+  const { coldOpen = true, bgm = true, hookText, coverPath } = opts;
   const lines = readFileSync(eventsPath, "utf-8").trim().split("\n");
   const events: SimEvent[] = lines.map(l => JSON.parse(l));
 
@@ -226,33 +226,90 @@ export async function renderDuel(
   const endEv = events.find(e => e.type === "end") as Extract<SimEvent, { type: "end" }> | undefined;
   const duration = endEv ? endEv.duration : 24;
 
-  // ---------- 紧凑时间轴段（首帧满配 VS 海报封面 + 0.35s 闪击立即开打 + 1.35s 绝杀慢放击飞演出） ----------
+  // ---------- 紧凑高完播时间轴（0.0s 冷启动直入战场 + 20~23.5s 高密度决战 + 0.92s 绝杀慢放即止，0秒黑屏结算卡） ----------
   const VS_SEC = coldOpen ? 0 : 0.25;
   const INTRO_SEC = coldOpen ? 0 : 0.35;
-  const battleSec = Math.min(duration + 1.35, 65);
-  const settleSec = 1.40;
+  const battleSec = Math.min(duration + 0.64, 48);
+  const settleSec = 0;
   const totalSec = INTRO_SEC + battleSec + settleSec;
   const totalFrames = Math.ceil(totalSec * FPS);
 
-  // ---------- 音频：高辨识度金属拼刀 / 技能触发 SFX + 低占比 BGM ----------
+  // ---------- 预解析「时间静止」与重击闪避窗口（供音频 BGM 抽空与画面结界共用） ----------
+  interface TimeStopWindow {
+    id: Side;
+    target: Side;
+    x: number;
+    y: number;
+    tStart: number;
+    tEnd: number;
+  }
+  const timeStopWindows: TimeStopWindow[] = [];
+  const heavyDuckWindows: Array<{ t0: number; t1: number; floorGain: number }> = [];
+  for (const ev of events) {
+    if (ev.type === "timeStopStart") {
+      timeStopWindows.push({
+        id: ev.id,
+        target: ev.target,
+        x: ev.x,
+        y: ev.y,
+        tStart: ev.t,
+        tEnd: ev.t + ev.duration,
+      });
+    } else if (ev.type === "timeStopEnd") {
+      for (let k = timeStopWindows.length - 1; k >= 0; k--) {
+        if (timeStopWindows[k].id === ev.id && Math.abs(timeStopWindows[k].tEnd - ev.t) < 0.25) {
+          timeStopWindows[k].tEnd = ev.t;
+          break;
+        }
+      }
+    } else if (ev.type === "seriousPunch" || ev.type === "railgunShot") {
+      heavyDuckWindows.push({
+        t0: INTRO_SEC + ev.t,
+        t1: INTRO_SEC + ev.t + 0.18,
+        floorGain: 0.035,
+      });
+    }
+  }
+  for (const w of timeStopWindows) {
+    heavyDuckWindows.push({
+      t0: INTRO_SEC + w.tStart,
+      t1: INTRO_SEC + w.tEnd,
+      floorGain: 0.36,
+    });
+  }
+
+  // ---------- 音频：0.02s抓耳钟鸣 + 五声音阶递进碰撞 SFX + 时停BGM抽空反差 ----------
   const sfxTracks: { pcm: Float32Array; offsetSec: number; gain?: number }[] = [];
+  const PENTA_SCALE = [1.0, 1.122, 1.26, 1.498, 1.682, 1.888];
+  let musicalStep = 0;
+  let lastMusicalHitT = -10;
   if (!coldOpen) {
     sfxTracks.push({ pcm: synthSfx("vs-slam"), offsetSec: 0.02, gain: 0.98 });
     sfxTracks.push({ pcm: synthSfx("parry", 888, 1.25), offsetSec: 0.08, gain: 0.85 });
+  } else {
+    // 0秒冷启动抓耳钩子：清脆双音阶金属开战铃，划入瞬间唤醒听觉注意力
+    sfxTracks.push({ pcm: synthSfx("parry", 912, 1.32), offsetSec: 0.015, gain: 0.78 });
+    sfxTracks.push({ pcm: synthSfx("coin", 777, 1.18), offsetSec: 0.045, gain: 0.54 });
   }
   for (const ev of events) {
     const at = INTRO_SEC + ev.t;
     if (ev.type === "parry") {
-      // 连续拼刀音高阶梯式上扬 (1.0x -> 1.65x)，产生强烈多巴胺听觉爽感
-      const pitch = 1 + Math.min(0.65, (ev.combo - 1) * 0.14);
+      // 连续碰撞按五声音阶递进上扬 (Do-Re-Mi-Sol-La)，产生清脆解压的多巴胺听觉律动
+      if (ev.t - lastMusicalHitT <= 1.38) {
+        musicalStep = Math.min(PENTA_SCALE.length - 1, musicalStep + 1);
+      } else {
+        musicalStep = 0;
+      }
+      lastMusicalHitT = ev.t;
+      const pitch = PENTA_SCALE[musicalStep];
       sfxTracks.push({
         pcm: synthSfx("parry", 700 + Math.floor(ev.t * 19), pitch),
         offsetSec: at,
-        gain: 0.98,
+        gain: 0.96,
       });
     } else if (ev.type === "seriousPunch") {
       sfxTracks.push({ pcm: synthSfx("vs-slam", 500 + Math.floor(ev.t * 17)), offsetSec: at, gain: 1.0 });
-      sfxTracks.push({ pcm: synthSfx("crit", 710 + Math.floor(ev.t * 13), 0.92), offsetSec: at + 0.03, gain: 0.95 });
+      sfxTracks.push({ pcm: synthSfx("crit", 710 + Math.floor(ev.t * 13), 0.96), offsetSec: at + 0.025, gain: 0.95 });
     } else if (ev.type === "latchStart") {
       sfxTracks.push({ pcm: synthSfx("skill", 340 + Math.floor(ev.t * 11), 1.18), offsetSec: at, gain: 0.90 });
     } else if (ev.type === "webHit") {
@@ -265,8 +322,18 @@ export async function renderDuel(
     } else if (ev.type === "frostNova") {
       sfxTracks.push({ pcm: synthSfx("parry", 840 + Math.floor(ev.t * 19), 1.45), offsetSec: at, gain: 0.88 });
       sfxTracks.push({ pcm: synthSfx("skill", 510 + Math.floor(ev.t * 15), 1.18), offsetSec: at + 0.02, gain: 0.82 });
+    } else if (ev.type === "timeStopStart") {
+      sfxTracks.push({ pcm: synthSfx("vs-slam", 420 + Math.floor(ev.t * 13)), offsetSec: at, gain: 0.98 });
+      sfxTracks.push({ pcm: synthSfx("parry", 880 + Math.floor(ev.t * 17), 1.48), offsetSec: at + 0.02, gain: 0.92 });
+      sfxTracks.push({ pcm: synthSfx("skill", 310 + Math.floor(ev.t * 11), 0.72), offsetSec: at + 0.05, gain: 0.88 });
+    } else if (ev.type === "timeStopEnd") {
+      sfxTracks.push({ pcm: synthSfx("vs-slam", 640 + Math.floor(ev.t * 19)), offsetSec: at, gain: 0.98 });
+      sfxTracks.push({ pcm: synthSfx("crit", 760 + Math.floor(ev.t * 17), 1.18), offsetSec: at + 0.02, gain: 0.95 });
+      sfxTracks.push({ pcm: synthSfx("parry", 920 + Math.floor(ev.t * 23), 1.52), offsetSec: at + 0.04, gain: 0.88 });
     } else if (ev.type === "ultCast") {
-      if (ev.style === "beam") {
+      if (ev.kind === "time_stop") {
+        // 由 timeStopStart 专属时停音效统一承载，避免双倍叠音
+      } else if (ev.style === "beam") {
         sfxTracks.push({ pcm: synthSfx("vs-slam", 610 + Math.floor(ev.t * 17)), offsetSec: at, gain: 0.94 });
         sfxTracks.push({ pcm: synthSfx("skill", 740 + Math.floor(ev.t * 13), 1.34), offsetSec: at + 0.02, gain: 0.90 });
       } else if (ev.style === "rush") {
@@ -280,15 +347,28 @@ export async function renderDuel(
         sfxTracks.push({ pcm: synthSfx("skill", 520 + Math.floor(ev.t * 17), 1.14), offsetSec: at + 0.02, gain: 0.88 });
       }
     } else if (ev.type === "propHit") {
-      if (
-        ev.propKind === "chili_bomb" ||
+      if (ev.propKind === "chrono_strike") {
+        // 时停五连斩：逐刀升调的清脆怀表齿轮剑鸣音！
+        const hitStep = clamp(ev.value ?? 1, 1, 6);
+        const pitch = 1.08 + hitStep * 0.13;
+        sfxTracks.push({ pcm: synthSfx("parry", 810 + hitStep * 37, pitch), offsetSec: at, gain: 0.88 });
+        sfxTracks.push({ pcm: synthSfx("coin", 620 + hitStep * 29, pitch * 1.06), offsetSec: at + 0.015, gain: 0.68 });
+      } else if (ev.propKind === "slime_mitosis") {
+        sfxTracks.push({ pcm: synthSfx("skill", 540 + Math.floor(ev.t * 17), 1.32), offsetSec: at, gain: 0.90 });
+        sfxTracks.push({ pcm: synthSfx("coin", 680 + Math.floor(ev.t * 13), 1.18), offsetSec: at + 0.02, gain: 0.76 });
+      } else if (ev.propKind === "snake_sever") {
+        sfxTracks.push({ pcm: synthSfx("crit", 610 + Math.floor(ev.t * 19), 1.22), offsetSec: at, gain: 0.88 });
+      } else if (ev.propKind === "slime_clone") {
+        sfxTracks.push({ pcm: synthSfx("punch", 430 + Math.floor(ev.t * 19), 1.36), offsetSec: at, gain: 0.64 });
+      } else if (ev.propKind === "snake_seg") {
+        sfxTracks.push({ pcm: synthSfx("parry", 690 + Math.floor(ev.t * 17), 1.26), offsetSec: at, gain: 0.76 });
+      } else if (
         ev.propKind === "wall_shatter" ||
         ev.propKind === "wrecking_ball" ||
         ev.propKind === "brick_wall"
       ) {
         sfxTracks.push({ pcm: synthSfx("crit", 520 + Math.floor(ev.t * 17), 1.12), offsetSec: at, gain: 0.86 });
       } else if (
-        ev.propKind === "fish_hook" ||
         ev.propKind === "bumper_arc" ||
         ev.propKind === "bumper_peg" ||
         ev.propKind === "voodoo_effigy" ||
@@ -296,8 +376,6 @@ export async function renderDuel(
         ev.propKind === "shuriken"
       ) {
         sfxTracks.push({ pcm: synthSfx("parry", 760 + Math.floor(ev.t * 19), 1.36), offsetSec: at, gain: 0.84 });
-      } else if (ev.propKind === "milk_tea") {
-        sfxTracks.push({ pcm: synthSfx("coin", 560 + Math.floor(ev.t * 13), 1.25), offsetSec: at, gain: 0.68 });
       } else {
         sfxTracks.push({ pcm: synthSfx("skill", 480 + Math.floor(ev.t * 15), 1.18), offsetSec: at, gain: 0.80 });
       }
@@ -307,10 +385,11 @@ export async function renderDuel(
       sfxTracks.push({ pcm: synthSfx("skill", 200 + Math.floor(ev.t * 11), 1.04), offsetSec: at, gain: 0.92 });
     } else if (ev.type === "damage") {
       const isCrit = ev.value >= (byId.A.combatMode === "skillball" ? 48 : 135);
+      const dmgPitch = isCrit ? 1.08 : PENTA_SCALE[musicalStep % 4];
       sfxTracks.push({
-        pcm: synthSfx(isCrit ? "crit" : "punch", 310 + Math.floor(ev.t * 13), isCrit ? 1.08 : 1.0),
+        pcm: synthSfx(isCrit ? "crit" : "punch", 310 + Math.floor(ev.t * 13), dmgPitch),
         offsetSec: at + 0.02,
-        gain: isCrit ? 0.88 : 0.72,
+        gain: isCrit ? 0.88 : 0.74,
       });
     } else if (ev.type === "buff") {
       const pitch = 1 + Math.min(0.5, (ev.stacks - 1) * 0.06);
@@ -322,7 +401,7 @@ export async function renderDuel(
     } else if (ev.type === "heal") {
       sfxTracks.push({ pcm: synthSfx("coin", 410 + Math.floor(ev.t * 13), 1.12), offsetSec: at + 0.04, gain: 0.52 });
     } else if (ev.type === "wallBounce") {
-      sfxTracks.push({ pcm: synthSfx("hit", 600 + Math.floor(ev.t * 17), 0.92), offsetSec: at, gain: 0.18 });
+      sfxTracks.push({ pcm: synthSfx("hit", 600 + Math.floor(ev.t * 17), 0.98), offsetSec: at, gain: 0.22 });
     } else if (ev.type === "death") {
       sfxTracks.push({ pcm: synthSfx("death", 300 + Math.floor(ev.t * 5)), offsetSec: at, gain: 1.0 });
       sfxTracks.push({ pcm: synthSfx("vs-slam", 99), offsetSec: at + 0.35, gain: 0.85 });
@@ -349,9 +428,23 @@ export async function renderDuel(
       lead: matchHash % 2 === 0 ? "square" : "saw",
     });
     const need = Math.floor(totalSec * 44100);
+    const rampSec = 0.035;
     for (let i = 0; i < need; i++) {
-      // 降低 BGM 混音占比至 0.18，让每一次金属弹刀与技能音效都清晰炸裂
-      mixed[i] = mixed[i] + bgmPcm[i % bgmPcm.length] * 0.18;
+      const tAudio = i / 44100;
+      let bgmGain = 0.17;
+      for (const dw of heavyDuckWindows) {
+        if (tAudio >= dw.t0 - rampSec && tAudio <= dw.t1 + rampSec) {
+          let duckK = 1;
+          if (tAudio < dw.t0) {
+            duckK = clamp((tAudio - (dw.t0 - rampSec)) / rampSec, 0, 1);
+          } else if (tAudio > dw.t1) {
+            duckK = clamp((dw.t1 + rampSec - tAudio) / rampSec, 0, 1);
+          }
+          const g = 0.17 + (dw.floorGain - 0.17) * duckK;
+          if (g < bgmGain) bgmGain = g;
+        }
+      }
+      mixed[i] = mixed[i] + bgmPcm[i % bgmPcm.length] * bgmGain;
     }
   }
   const sfxPcm = normalize(mixed, 0.92);
@@ -378,6 +471,7 @@ export async function renderDuel(
       | "frostNovaRing"
       | "ultBurst"
       | "propBurst"
+      | "timeStopShatter"
       | "webCutSpark"
       | "latchClamp"
       | "killExplosion";
@@ -395,6 +489,7 @@ export async function renderDuel(
     big?: boolean;
     combo?: number;
     val?: number;
+    tEnd?: number;
     fxStyle?: "bolt" | "whirl";
     ultStyle?: "beam" | "nova" | "rush" | "storm";
     propKind?: string;
@@ -457,17 +552,19 @@ export async function renderDuel(
         x: ev.x,
         y: ev.y,
         text: ev.broken ? "蛛网崩断!" : "蛛丝切割!",
-        color: [56, 250, 152, 255],
+        color: ev.broken && ev.value === 0 ? [255, 226, 92, 255] : [56, 250, 152, 255],
       });
-      fxList.push({
-        t0: ev.t,
-        kind: "callout",
-        side: ev.target,
-        x: W / 2,
-        y: 1592,
-        text: `★ 误触剧毒蛛丝 · 切割扣血 -${ev.value} 并粘滞减速 ★`,
-        color: [68, 252, 162, 255],
-      });
+      if (ev.value > 0) {
+        fxList.push({
+          t0: ev.t,
+          kind: "callout",
+          side: ev.target,
+          x: W / 2,
+          y: 1592,
+          text: `★ 误触剧毒蛛丝 · 切割扣血 -${ev.value} 并粘滞减速 ★`,
+          color: [68, 252, 162, 255],
+        });
+      }
     } else if (ev.type === "seriousPunch") {
       const caster = byId[ev.id];
       const pdx = ev.tx - ev.x;
@@ -594,21 +691,59 @@ export async function renderDuel(
         text: ev.callout,
         color: [Math.min(255, cr + 35), Math.min(255, cg + 35), Math.min(255, cb + 35), 255],
       });
+    } else if (ev.type === "timeStopEnd") {
+      const caster = byId[ev.id];
+      fxList.push({
+        t0: ev.t,
+        kind: "timeStopShatter",
+        side: ev.id,
+        x: ev.x,
+        y: ev.y,
+        val: ev.hits,
+        text: "",
+        color: [255, 212, 52, 255],
+      });
+      fxList.push({
+        t0: ev.t,
+        kind: "callout",
+        side: ev.id,
+        x: W / 2,
+        y: 1592,
+        text: `★ 时间恢复流动 · ${caster.name} 引爆 ${ev.hits} 连斩轰飞猎物 ★`,
+        color: [255, 228, 86, 255],
+      });
     } else if (ev.type === "propHit") {
       const caster = byId[ev.id];
       const [cr, cg, cb] = hex(caster.color);
+      const tsWin =
+        ev.propKind === "chrono_strike"
+          ? timeStopWindows.find(w => w.id === ev.id && ev.t >= w.tStart - 0.02 && ev.t <= w.tEnd + 0.05)
+          : undefined;
       fxList.push({
         t0: ev.t,
+        tEnd: tsWin ? tsWin.tEnd : undefined,
         kind: "propBurst",
         side: ev.id,
         x: ev.x,
         y: ev.y,
         tx: ev.tx,
         ty: ev.ty,
+        val: ev.value,
         text: ev.tag,
         color: [cr, cg, cb, 255],
         propKind: ev.propKind,
       });
+      if (ev.propKind === "snake_sever") {
+        fxList.push({
+          t0: ev.t,
+          kind: "callout",
+          side: ev.id,
+          x: W / 2,
+          y: 1592,
+          text: `★ 正面硬刚蛇头 · 当场斩断贪吃蛇 ${ev.value} 节蛇尾 ★`,
+          color: [118, 255, 168, 255],
+        });
+      }
     } else if (ev.type === "damage") {
       const offsetX = ev.id === "A" ? -42 : 42;
       const isSkillBall = byId.A.combatMode === "skillball" || byId.B.combatMode === "skillball";
@@ -624,7 +759,7 @@ export async function renderDuel(
       const hasSkillTag = Boolean(rawTag && rawTag !== "贴身冲撞");
       const isBig = isSkillBall
         ? ev.value >= 48 || Boolean(ev.tag?.includes("撞墙粉碎")) || nearUlt
-        : ev.value >= 115;
+        : ev.value >= 88 || Boolean(ev.tag?.includes("撞墙粉碎"));
       const dmgColor: RGBA = isBig
         ? [255, 232, 72, 255]
         : hasSkillTag
@@ -645,6 +780,20 @@ export async function renderDuel(
         color: [ar, ag, ab, 255],
         big: isBig || hasSkillTag,
       });
+      if (!isSkillBall && ev.tag?.includes("撞墙粉碎")) {
+        fxList.push({
+          t0: ev.t,
+          kind: "propBurst",
+          propKind: "wrecking_ball",
+          side: ev.from,
+          x: ev.x,
+          y: ev.y,
+          tx: ev.x,
+          ty: ev.y,
+          text: "",
+          color: [255, 214, 68, 255],
+        });
+      }
 
       // 行业顶尖「零汉字极简滚动合并跳字 (Rolling Damage Coalescing)」：
       // 同一角色在 0.38s 窗口内的连续受击自动累加合并为唯一 1 个纯数字，彻底消灭满屏汉字与多行叠字！
@@ -868,12 +1017,23 @@ export async function renderDuel(
           flashAlpha: 0,
           targetSide: ev.target,
         });
+      } else if (ev.type === "timeStopEnd") {
+        stops.push({
+          tStart: ev.t,
+          tEnd: ev.t + 0.075,
+          focusX: ARENA_W / 2,
+          focusY: ARENA_H / 2,
+          zoom: 1.0,
+          shake: 11,
+          flashAlpha: 0,
+          targetSide: ev.target,
+        });
       } else if (
         ev.type === "propHit" &&
-        (ev.propKind === "chili_bomb" ||
+        (ev.propKind === "slime_mitosis" ||
+          ev.propKind === "snake_sever" ||
           ev.propKind === "wrecking_ball" ||
           ev.propKind === "voodoo_effigy" ||
-          ev.propKind === "fish_hook" ||
           ev.propKind === "roast_grill")
       ) {
         stops.push({
@@ -915,32 +1075,45 @@ export async function renderDuel(
     if (ev.type === "parry") {
       stops.push({
         tStart: ev.t,
-        tEnd: ev.t + 0.04,
-        focusX: ev.x,
-        focusY: ev.y,
-        zoom: 1.02 + Math.min(0.03, ev.combo * 0.01),
-        shake: 6 + Math.min(6, ev.combo * 2),
+        tEnd: ev.t + 0.026,
+        focusX: ARENA_W / 2,
+        focusY: ARENA_H / 2,
+        zoom: 1.0,
+        shake: 5,
         flashAlpha: 0,
       });
     } else if (ev.type === "skill") {
       stops.push({
         tStart: ev.t,
-        tEnd: ev.t + 0.05,
-        focusX: ev.x,
-        focusY: ev.y,
-        zoom: 1.03,
-        shake: 8,
+        tEnd: ev.t + 0.042,
+        focusX: ARENA_W / 2,
+        focusY: ARENA_H / 2,
+        zoom: 1.0,
+        shake: 7,
         flashAlpha: 0,
+        targetSide: ev.target,
+      });
+    } else if (ev.type === "damage" && ev.tag?.includes("撞墙粉碎")) {
+      stops.push({
+        tStart: ev.t,
+        tEnd: ev.t + 0.055,
+        focusX: ARENA_W / 2,
+        focusY: ARENA_H / 2,
+        zoom: 1.0,
+        shake: 9,
+        flashAlpha: 0,
+        targetSide: ev.id,
       });
     } else if (ev.type === "death") {
       stops.push({
         tStart: ev.t,
-        tEnd: ev.t + 0.24,
-        focusX: ev.x,
-        focusY: ev.y,
-        zoom: 1.08,
-        shake: 12,
+        tEnd: ev.t + 0.18,
+        focusX: ARENA_W / 2,
+        focusY: ARENA_H / 2,
+        zoom: 1.0,
+        shake: 11,
         flashAlpha: 0,
+        targetSide: ev.id,
       });
     }
   }
@@ -954,7 +1127,7 @@ export async function renderDuel(
     flashAlpha: number;
     targetSide?: Side;
   } {
-    let zoom = 1;
+    let zoom = tBattle < 1.15 ? 1 + 0.045 * Math.sin(clamp(tBattle / 1.15, 0, 1) * Math.PI) : 1;
     let focusX = ARENA_W / 2;
     let focusY = ARENA_H / 2;
     let freeze = false;
@@ -1096,6 +1269,10 @@ export async function renderDuel(
       f.frozen = ev.frozen ?? false;
       f.vx = ev.vx ?? dx * 10;
       f.vy = ev.vy ?? dy * 10;
+      if (f.ballSkillKind === "time_stop") {
+        const inTs = timeStopWindows.some(w => w.id === ev.id && ev.t >= w.tStart - 0.02 && ev.t <= w.tEnd + 0.02);
+        f.statLabel = inTs ? "时间静止" : `时停 ${Math.min(100, Math.round(f.punchCharge))}%`;
+      }
       if (f.action === "idle") f.action = "walk";
     } else if (ev.type === "webSpawn") {
       activeWebs.set(ev.webId, {
@@ -1155,6 +1332,14 @@ export async function renderDuel(
       activeShurikens[ev.id] = ev.shurikens;
     } else if (ev.type === "propSync") {
       activeProps[ev.id] = ev.props;
+      const pf = byId[ev.id];
+      if (pf.ballSkillKind === "snake_tail") {
+        const segCnt = ev.props.filter(p => p.kind === "snake_seg").length;
+        pf.statLabel = `蛇身 ${segCnt + 1}节`;
+      } else if (pf.ballSkillKind === "slime_split") {
+        const cloneCnt = ev.props.filter(p => p.kind === "slime_clone").length;
+        pf.statLabel = `分裂 ×${cloneCnt + 1}`;
+      }
     } else if (
       ev.type === "seriousPunch" ||
       ev.type === "soundWave" ||
@@ -1189,8 +1374,8 @@ export async function renderDuel(
       const caster = byId[ev.id];
       const [cr, cg, cb] = hex(caster.color);
       const [fx, fy] = floorPt(ev.x, ev.y);
-      if (ev.propKind === "chili_bomb") {
-        bakeCrater(fx, fy, 38, [255, 92, 28, 255], Math.floor(ev.t * 91));
+      if (ev.propKind === "slime_mitosis") {
+        floorBuf.drawGlowCircle(fx, fy, 42, [36, 220, 255, 36]);
       } else if (ev.propKind === "wall_shatter" || ev.propKind === "brick_wall") {
         floorBuf.drawGlowCircle(fx, fy, 28, [215, 76, 36, 32]);
       } else if (ev.propKind === "acid_puddle") {
@@ -1252,7 +1437,7 @@ export async function renderDuel(
       f.wallSquashT = 0.14;
       const nearSideWall = ev.x < 130 || ev.x > ARENA_W - 130;
       f.wallOrient = nearSideWall ? Math.PI * 0.5 : 0;
-      if (f.ballSkillKind === "rider_turbo" || f.ballSkillKind === "courier_box") {
+      if (f.ballSkillKind === "rider_turbo") {
         const [fx, fy] = floorPt(ev.x, ev.y);
         floorBuf.drawGlowCircle(fx, fy, 30, [255, 142, 24, 42]);
       }
@@ -1294,7 +1479,7 @@ export async function renderDuel(
     return [sx, sy];
   }
 
-  // ---------- 绘制环绕实体进化武器（Weapon Ball 核心视觉锚点） ----------
+  // ---------- 绘制环绕实体进化武器（Weapon Ball 2.0 超高辨识度神兵锚点） ----------
   const drawOrbitingWeapons = (
     fb: FrameBuf,
     v: FighterView,
@@ -1307,17 +1492,33 @@ export async function renderDuel(
     const [r, g, b] = hex(v.color);
     const [r2, g2, b2] = hex(v.color2);
     const orbR = 52 * v.bodyScale * cam.zoom;
-    const innerR = orbR * 0.56;
+    const innerR = orbR * (v.scaleKind === "multiweapon" ? 1.16 : 0.72);
     const outerR = v.reach * SCALE_X * cam.zoom;
-    const bladeLen = Math.max(40, outerR - innerR);
+    const bladeLen = Math.max(42, outerR - innerR);
     const midR = innerR + bladeLen * 0.5;
     const spinRatio = v.spinSpeed / Math.max(1, v.baseSpinSpeed);
     const dirSign = v.id === "A" ? 1 : -1;
 
-    // 高转速时绘制环绕旋风残影外环
-    if (spinRatio >= 1.5) {
-      const cycloneAlpha = clamp(Math.round((spinRatio - 1.4) * 55), 20, 115);
-      fb.strokeRing(sx, sy, outerR * 0.92, Math.max(3, Math.round(6 * cam.zoom)), [r, g, b, cycloneAlpha]);
+    // 1) 超音速双锯 / 烈焰风火轮：随转速飙升点亮多层等离子音爆光环（最高 520% 五倍音速光轮）
+    if (v.scaleKind === "spin" && spinRatio >= 1.35) {
+      const pAlpha = clamp(Math.round((spinRatio - 1.25) * 62), 35, 195);
+      fb.strokeRing(sx, sy, Math.round(outerR * 0.96), Math.max(4, Math.round(8 * cam.zoom)), [r, g, b, pAlpha]);
+      fb.strokeRing(sx, sy, Math.round(outerR * 0.84), Math.max(2, Math.round(4 * cam.zoom)), [255, 250, 220, Math.round(pAlpha * 0.82)]);
+      if (spinRatio >= 2.6) {
+        fb.strokeRing(sx, sy, Math.round(outerR * 0.68), Math.max(2, Math.round(4 * cam.zoom)), [r, g, b, Math.round(pAlpha * 0.65)]);
+      }
+    } else if (v.scaleKind === "multiweapon") {
+      // 千刃绞肉机：内圈金属齿轮转盘基座 + 6刃以上外圈翠绿电风扇涡轮风环
+      fb.strokeRing(sx, sy, Math.round(orbR * 1.20), Math.max(4, Math.round(6 * cam.zoom)), [22, 34, 30, 235]);
+      fb.strokeRing(sx, sy, Math.round(orbR * 1.20), Math.max(2, Math.round(3 * cam.zoom)), [r, g, b, 230]);
+      if (v.bladeCount >= 5) {
+        const fanAlpha = clamp(36 + (v.bladeCount - 4) * 18, 36, 175);
+        fb.strokeRing(sx, sy, Math.round(outerR * 0.94), Math.max(3, Math.round(6 * cam.zoom)), [r, g, b, fanAlpha]);
+        fb.strokeRing(sx, sy, Math.round(outerR * 0.98), 2, [230, 255, 242, Math.round(fanAlpha * 0.8)]);
+      }
+    } else if (spinRatio >= 1.45) {
+      const cycloneAlpha = clamp(Math.round((spinRatio - 1.35) * 55), 24, 120);
+      fb.strokeRing(sx, sy, Math.round(outerR * 0.93), Math.max(3, Math.round(6 * cam.zoom)), [r, g, b, cycloneAlpha]);
     }
 
     for (let k = 0; k < v.bladeCount; k++) {
@@ -1331,73 +1532,113 @@ export async function renderDuel(
       const tx = sx + cos * outerR;
       const ty = sy + sin * outerR;
 
-      // 1. 武器挥砍扇形流光拖尾 (Motion Blur Arc)
-      const sweepSpan = clamp(0.38 + (spinRatio - 1) * 0.22, 0.35, 1.05);
+      // 武器挥砍扇形残影弧（多刃电风扇缩短单刃拖尾，确保 12 把飞刀根根分明不糊成一团！）
+      const maxSpan = v.scaleKind === "multiweapon" ? Math.min(0.42, (Math.PI * 1.15) / Math.max(3, v.bladeCount)) : 1.08;
+      const sweepSpan = clamp(0.36 + (spinRatio - 1) * 0.24 + (v.weaponKind === "greatsword" ? v.rageStacks * 0.03 : 0), 0.16, maxSpan);
       const arcStart = dirSign > 0 ? ang - sweepSpan : ang;
       const arcEnd = dirSign > 0 ? ang : ang + sweepSpan;
-      fb.drawArc(sx, sy, outerR * 0.86, Math.round(22 * cam.zoom), arcStart, arcEnd, [r, g, b, 92]);
-      fb.drawArc(sx, sy, outerR * 0.96, Math.round(10 * cam.zoom), arcStart, arcEnd, [255, 245, 215, 135]);
+      fb.drawArc(sx, sy, outerR * 0.88, Math.round((v.scaleKind === "multiweapon" ? 14 : 24) * cam.zoom), arcStart, arcEnd, [r, g, b, 96]);
+      fb.drawArc(sx, sy, outerR * 0.96, Math.round((v.scaleKind === "multiweapon" ? 7 : 10) * cam.zoom), arcStart, arcEnd, [255, 246, 215, 148]);
 
       if (v.weaponKind === "greatsword") {
-        // 万圣巨剑：宽厚暗金护手 + 猩红巨型剑身 + 纯白高能剑脊 + 剑尖星芒
-        const w = Math.round((24 + Math.min(12, v.rageStacks * 1.5)) * cam.zoom);
-        fb.fillRotatedRect(mx, my, bladeLen, w + 8, ang, [r2, g2, b2, 220]);
+        // 四十米大刀：霸气龙牙宽刃巨剑 + 暗黑血槽 + 鎏金剑脊 + 宽翼十字护手（随层数一路暴涨横扫半屏！）
+        const w = Math.round((28 + Math.min(16, v.rageStacks * 1.8)) * cam.zoom);
+        fb.fillRotatedRect(mx, my, bladeLen, w + 10, ang, [28, 10, 18, 245]);
+        fb.fillRotatedRect(mx, my, bladeLen, w + 4, ang, [r2, g2, b2, 235]);
         fb.fillRotatedRect(mx, my, bladeLen, w, ang, [r, g, b, 255]);
-        fb.fillRotatedRect(mx, my, bladeLen * 0.92, Math.max(6, Math.round(w * 0.38)), ang, [255, 245, 220, 250]);
-        // 黄金十字护手
-        const gx = sx + cos * (innerR + 10 * cam.zoom);
-        const gy = sy + sin * (innerR + 10 * cam.zoom);
-        fb.fillRotatedRect(gx, gy, Math.round(14 * cam.zoom), Math.round(w * 2.1), ang, [255, 212, 78, 255]);
-        // 剑尖破空光球
-        fb.drawGlowCircle(tx, ty, Math.round(28 * cam.zoom), [255, 215, 95, 185]);
+        // 中央深邃血槽 + 纯白高能剑锋亮线
+        fb.fillRotatedRect(sx + cos * (innerR + bladeLen * 0.44), sy + sin * (innerR + bladeLen * 0.44), bladeLen * 0.68, Math.max(5, Math.round(w * 0.30)), ang, [42, 12, 24, 235]);
+        fb.fillRotatedRect(mx, my, bladeLen * 0.94, Math.max(5, Math.round(w * 0.22)), ang, [255, 248, 220, 255]);
+        // 剑尖菱形破甲锋刃 + 金芒光球
+        const tipBaseX = sx + cos * (outerR - 14 * cam.zoom);
+        const tipBaseY = sy + sin * (outerR - 14 * cam.zoom);
+        fb.fillRotatedRect(tipBaseX, tipBaseY, Math.round(24 * cam.zoom), Math.round(24 * cam.zoom), ang + Math.PI * 0.25, [255, 244, 198, 255]);
+        fb.drawGlowCircle(tx, ty, Math.round(32 * cam.zoom), [255, 212, 82, 195]);
         fb.fillCircle(tx, ty, Math.round(9 * cam.zoom), [255, 255, 245, 255]);
+        // 黄金宽翼十字大护手 + 红宝石剑格核心
+        const gx = sx + cos * (innerR + 12 * cam.zoom);
+        const gy = sy + sin * (innerR + 12 * cam.zoom);
+        fb.fillRotatedRect(gx, gy, Math.round(18 * cam.zoom), Math.round(w * 2.35), ang, [32, 20, 12, 250]);
+        fb.fillRotatedRect(gx, gy, Math.round(13 * cam.zoom), Math.round(w * 2.20), ang, [255, 214, 72, 255]);
+        fb.fillCircle(gx, gy, Math.max(5, Math.round(7 * cam.zoom)), [255, 42, 78, 255]);
       } else if (v.weaponKind === "twinblade") {
-        // 狂暴双刀 / 寒霜双剑：凌厉流线型双刃 + 亮青刀锋高光
-        const w = Math.round(17 * cam.zoom);
-        fb.fillRotatedRect(mx, my, bladeLen, w + 6, ang, [r2, g2, b2, 215]);
-        fb.fillRotatedRect(mx, my, bladeLen, w, ang, [r, g, b, 255]);
-        fb.fillRotatedRect(mx, my, bladeLen * 0.94, Math.max(5, Math.round(w * 0.42)), ang, [235, 252, 255, 255]);
-        // 刀锷
-        const gx = sx + cos * (innerR + 8 * cam.zoom);
-        const gy = sy + sin * (innerR + 8 * cam.zoom);
-        fb.fillRotatedRect(gx, gy, Math.round(11 * cam.zoom), Math.round(w * 1.8), ang, [255, 232, 118, 250]);
-        fb.drawGlowCircle(tx, ty, Math.round(22 * cam.zoom), [r, g, b, 190]);
-        fb.fillCircle(tx, ty, Math.round(7 * cam.zoom), [255, 255, 255, 255]);
+        if (v.scaleKind === "multiweapon") {
+          // 千刃绞肉机（3 -> 12把环绕飞刀电风扇）：根根分明的寒芒柳叶飞刀 + 黄金铆钉锁扣
+          const w = Math.round((v.bladeCount >= 9 ? 14 : 17) * cam.zoom);
+          fb.fillRotatedRect(mx, my, bladeLen, w + 6, ang, [14, 26, 22, 245]);
+          fb.fillRotatedRect(mx, my, bladeLen, w, ang, [r, g, b, 255]);
+          fb.fillRotatedRect(mx, my, bladeLen * 0.92, Math.max(4, Math.round(w * 0.38)), ang, [235, 255, 246, 255]);
+          fb.fillCircle(hx, hy, Math.max(5, Math.round(6.5 * cam.zoom)), [255, 224, 88, 255]);
+          fb.drawGlowCircle(tx, ty, Math.round(18 * cam.zoom), [r, g, b, 175]);
+          fb.fillCircle(tx, ty, Math.max(4, Math.round(5.5 * cam.zoom)), [255, 255, 255, 255]);
+        } else {
+          // 超音速双锯 / 烈焰风火轮：带高能等离子锯齿的链锯双刃
+          const w = Math.round(20 * cam.zoom);
+          fb.fillRotatedRect(mx, my, bladeLen, w + 8, ang, [14, 24, 38, 245]);
+          fb.fillRotatedRect(mx, my, bladeLen, w, ang, [r, g, b, 255]);
+          fb.fillRotatedRect(mx, my, bladeLen * 0.95, Math.max(6, Math.round(w * 0.44)), ang, [242, 254, 255, 255]);
+          // 锯身两侧高能等离子锯齿光钉
+          for (let tIdx = 1; tIdx <= 4; tIdx++) {
+            const tr = innerR + bladeLen * (0.18 + tIdx * 0.17);
+            const perpX = -sin * (w * 0.62);
+            const perpY = cos * (w * 0.62);
+            fb.fillCircle(sx + cos * tr + perpX, sy + sin * tr + perpY, Math.max(3, Math.round(4 * cam.zoom)), [255, 246, 175, 245]);
+            fb.fillCircle(sx + cos * tr - perpX, sy + sin * tr - perpY, Math.max(3, Math.round(4 * cam.zoom)), [255, 246, 175, 245]);
+          }
+          const gx = sx + cos * (innerR + 9 * cam.zoom);
+          const gy = sy + sin * (innerR + 9 * cam.zoom);
+          fb.fillRotatedRect(gx, gy, Math.round(12 * cam.zoom), Math.round(w * 1.9), ang, [255, 226, 98, 255]);
+          fb.drawGlowCircle(tx, ty, Math.round(26 * cam.zoom), [r, g, b, 205]);
+          fb.fillCircle(tx, ty, Math.round(8 * cam.zoom), [255, 255, 255, 255]);
+        }
       } else if (v.weaponKind === "scythe") {
-        // 噬血巨斧/战镰：修长暗红金属战柄 + 末端巨型新月战斧刃口（随 bodyScale 与 reach 狂暴放大）
-        const shaftW = Math.round(14 * v.bodyScale * cam.zoom);
-        fb.fillRotatedRect(mx, my, bladeLen * 0.88, shaftW, ang, [210, 185, 195, 245]);
-        const headR = outerR * 0.86;
+        // 狂化断头斧 · 噬魂巨镰：黑曜石长柄 + 夸张弯月死神巨镰刃口（随吞噬体型同步暴涨）
+        const shaftW = Math.round(15 * v.bodyScale * cam.zoom);
+        fb.fillRotatedRect(mx, my, bladeLen * 0.90, shaftW + 4, ang, [22, 12, 28, 248]);
+        fb.fillRotatedRect(mx, my, bladeLen * 0.90, shaftW, ang, [198, 175, 215, 248]);
+        const headR = outerR * 0.88;
         const headX = sx + cos * headR;
         const headY = sy + sin * headR;
-        const axeW = Math.round(38 * v.bodyScale * cam.zoom);
-        const axeH = Math.round(96 * v.bodyScale * cam.zoom);
-        fb.fillRotatedRect(headX, headY, axeW + 8, axeH + 8, ang, [r2, g2, b2, 235]);
-        fb.fillRotatedRect(headX, headY, axeW, axeH, ang, [r, g, b, 255]);
-        fb.drawArc(sx, sy, outerR * 0.94, Math.round(18 * v.bodyScale * cam.zoom), ang - 0.46, ang + 0.46, [255, 238, 215, 250]);
-        fb.drawGlowCircle(tx, ty, Math.round(34 * v.bodyScale * cam.zoom), [r, g, b, 195]);
+        fb.drawArc(sx, sy, outerR * 0.92, Math.round(30 * v.bodyScale * cam.zoom), ang - 0.62, ang + 0.52, [r2, g2, b2, 245]);
+        fb.drawArc(sx, sy, outerR * 0.95, Math.round(20 * v.bodyScale * cam.zoom), ang - 0.58, ang + 0.48, [r, g, b, 255]);
+        fb.drawArc(sx, sy, outerR * 0.98, Math.round(8 * v.bodyScale * cam.zoom), ang - 0.54, ang + 0.44, [255, 242, 230, 255]);
+        fb.fillCircle(headX, headY, Math.round(11 * v.bodyScale * cam.zoom), [255, 226, 96, 255]);
+        fb.drawGlowCircle(tx, ty, Math.round(36 * v.bodyScale * cam.zoom), [r, g, b, 195]);
       } else {
-        // 超载雷锤：能量战柄 + 巨型雷霆方锤头 + 电弧闪烁
-        const shaftW = Math.round(13 * cam.zoom);
-        fb.fillRotatedRect(mx, my, bladeLen * 0.82, shaftW, ang, [185, 220, 255, 245]);
-        const headDist = outerR * 0.86;
+        // 百吨破墙锤：重装合金长柄 + 随层数狂暴膨胀的百吨重甲攻城巨锤 + 破墙撞钉 + 狂雷电弧
+        const hGrow = 1 + Math.min(0.68, v.rageStacks * 0.068);
+        const shaftW = Math.round(16 * cam.zoom);
+        fb.fillRotatedRect(mx, my, bladeLen * 0.84, shaftW + 5, ang, [24, 18, 12, 248]);
+        fb.fillRotatedRect(mx, my, bladeLen * 0.84, shaftW, ang, [215, 224, 238, 250]);
+        const headDist = outerR * 0.84;
         const hx2 = sx + cos * headDist;
         const hy2 = sy + sin * headDist;
-        const hw = Math.round(42 * cam.zoom);
-        const hh = Math.round(68 * cam.zoom);
-        fb.fillRotatedRect(hx2, hy2, hw + 8, hh + 8, ang, [r2, g2, b2, 235]);
+        const hw = Math.round(52 * hGrow * v.bodyScale * cam.zoom);
+        const hh = Math.round(88 * hGrow * v.bodyScale * cam.zoom);
+        fb.fillRotatedRect(hx2, hy2, hw + 10, hh + 10, ang, [26, 18, 12, 250]);
+        fb.fillRotatedRect(hx2, hy2, hw + 4, hh + 4, ang, [r2, g2, b2, 245]);
         fb.fillRotatedRect(hx2, hy2, hw, hh, ang, [r, g, b, 255]);
-        fb.fillRotatedRect(hx2, hy2, Math.round(hw * 0.55), Math.round(hh * 0.78), ang, [240, 252, 255, 255]);
-        fb.drawGlowCircle(hx2, hy2, Math.round(36 * cam.zoom), [95, 225, 255, 195]);
-        // 锤头四周跳跃雷电光斑
-        const sparkAng = tNow * 24 + k * 2.1;
-        const lx = hx2 + Math.cos(sparkAng) * 24 * cam.zoom;
-        const ly = hy2 + Math.sin(sparkAng) * 24 * cam.zoom;
-        fb.drawLine(hx2, hy2, lx, ly, 3, [255, 245, 130, 245]);
+        // 锤头中央亮银重甲腰封 + 两端黄金破墙撞击面
+        fb.fillRotatedRect(hx2, hy2, Math.round(hw * 0.52), Math.round(hh * 0.84), ang, [248, 250, 255, 255]);
+        for (const sideS of [-1, 1]) {
+          const fxFace = hx2 - sin * (hh * 0.48 * sideS);
+          const fyFace = hy2 + cos * (hh * 0.48 * sideS);
+          fb.fillRotatedRect(fxFace, fyFace, Math.round(hw * 0.86), Math.round(10 * hGrow * cam.zoom), ang, [255, 224, 82, 255]);
+        }
+        fb.drawGlowCircle(hx2, hy2, Math.round(42 * hGrow * cam.zoom), [255, 208, 68, 185]);
+        // 锤头四周迸射重雷电弧
+        for (let sIdx = 0; sIdx < 2; sIdx++) {
+          const sparkAng = tNow * 24 + k * 2.1 + sIdx * Math.PI;
+          const lx = hx2 + Math.cos(sparkAng) * (28 * hGrow * cam.zoom);
+          const ly = hy2 + Math.sin(sparkAng) * (28 * hGrow * cam.zoom);
+          fb.drawLine(hx2, hy2, lx, ly, 4, [255, 246, 128, 245]);
+        }
       }
 
-      // 握柄连接点高光环
-      fb.fillCircle(hx, hy, Math.round(7 * cam.zoom), [255, 236, 150, 240]);
+      if (v.scaleKind !== "multiweapon") {
+        // 握柄连接点黄金锁扣
+        fb.fillCircle(hx, hy, Math.round(7.5 * cam.zoom), [255, 236, 140, 248]);
+      }
     }
   };
 
@@ -1430,25 +1671,36 @@ export async function renderDuel(
     const aimPerpY = aimX;
 
     if (kind === "vampire_latch") {
-      // 鲜血吸血鬼：两侧扇动恶魔血蝠翼 + 球体前缘猩红獠牙 + 钳制吸附锁链与咬合血环
+      // 鲜血吸血鬼 V4.0：随吸血层数巨化展开的遮天恶魔血蝠翼 + 环身猩红血蝠群 + 钳制锁链
       const isDominating = Boolean(v.latchedTo);
-      const wingScale = isDominating ? 1.22 : 1.0;
+      const wingScale = (isDominating ? 1.26 : 1.04) + v.rageStacks * 0.068;
       const flap = Math.sin(tNow * (isDominating ? 28 : 18)) * (isDominating ? 0.42 : 0.34);
       for (const sideSign of [-1, 1]) {
         const wingAng = sideSign * (0.25 + flap);
         const wx1 = sx + sideSign * orbR * 0.85;
         const wy1 = sy - orbR * 0.12;
-        const wx2 = wx1 + sideSign * Math.cos(wingAng) * orbR * 1.05 * wingScale;
-        const wy2 = wy1 - Math.sin(wingAng) * orbR * 0.85 * wingScale;
-        fb.drawLine(wx1, wy1, wx2, wy2, Math.max(4, Math.round(8 * cam.zoom)), [r, g, b, 245]);
-        // 3 根翼骨与暗红翼膜
+        const wx2 = wx1 + sideSign * Math.cos(wingAng) * orbR * 1.08 * wingScale;
+        const wy2 = wy1 - Math.sin(wingAng) * orbR * 0.88 * wingScale;
+        fb.drawLine(wx1, wy1, wx2, wy2, Math.max(4, Math.round(9 * cam.zoom)), [r, g, b, 248]);
         for (let bIdx = 0; bIdx < 3; bIdx++) {
           const subAng = wingAng + (bIdx + 1) * 0.32 * sideSign;
-          const bx = wx1 + sideSign * Math.cos(subAng) * orbR * (0.88 - bIdx * 0.12) * wingScale;
-          const by = wy1 + Math.sin(Math.abs(subAng)) * orbR * (0.45 + bIdx * 0.18) * wingScale;
-          fb.drawLine(wx2, wy2, bx, by, Math.max(3, Math.round(5 * cam.zoom)), [r2, g2, b2, 220]);
-          fb.drawLine(wx1, wy1, bx, by, Math.max(3, Math.round(6 * cam.zoom)), [255, 85, 120, 210]);
+          const bx = wx1 + sideSign * Math.cos(subAng) * orbR * (0.90 - bIdx * 0.12) * wingScale;
+          const by = wy1 + Math.sin(Math.abs(subAng)) * orbR * (0.46 + bIdx * 0.18) * wingScale;
+          fb.drawLine(wx2, wy2, bx, by, Math.max(3, Math.round(6 * cam.zoom)), [r2, g2, b2, 228]);
+          fb.drawLine(wx1, wy1, bx, by, Math.max(3, Math.round(6 * cam.zoom)), [255, 85, 120, 215]);
         }
+      }
+      // 随进化召唤 1~4 只环身盘旋的猩红嗜血小蝙蝠
+      const batCount = Math.min(4, Math.floor((v.rageStacks + 1) / 2));
+      for (let bi = 0; bi < batCount; bi++) {
+        const ba = tNow * 4.8 + (bi * Math.PI * 2) / Math.max(1, batCount);
+        const bRad = orbR * (1.42 + v.rageStacks * 0.04);
+        const bx = sx + Math.cos(ba) * bRad;
+        const by = sy + Math.sin(ba) * bRad;
+        const bFlap = Math.sin(tNow * 26 + bi * 1.7) * 6 * cam.zoom;
+        fb.fillCircle(bx, by, Math.max(4, Math.round(7 * cam.zoom)), [255, 32, 76, 245]);
+        fb.drawLine(bx - Math.round(13 * cam.zoom), by - bFlap, bx, by, 4, [255, 92, 128, 240]);
+        fb.drawLine(bx + Math.round(13 * cam.zoom), by - bFlap, bx, by, 4, [255, 92, 128, 240]);
       }
       // 球体下方一对纯白带血尖锐獠牙
       for (const fSign of [-1, 1]) {
@@ -1460,7 +1712,6 @@ export async function renderDuel(
         fb.fillCircle(fx2, fy2, Math.max(2, Math.round(4 * cam.zoom)), [255, 36, 72, 255]);
       }
 
-      // 钳制吸附状态：吸血鬼作为行动主人，伸出双道猩红血爪死死钳住猎物拖拽掠行
       if (v.latchedTo) {
         const target = byId[v.latchedTo];
         const [tx, ty] = worldToScreen(visX[target.id], visY[target.id], cam, shx, shy);
@@ -1481,16 +1732,17 @@ export async function renderDuel(
         fb.strokeRing(tx, ty, Math.round(64 * bitePulse * cam.zoom), Math.max(4, Math.round(6 * cam.zoom)), [255, 32, 76, 235]);
       }
     } else if (kind === "spider_web") {
-      // 剧毒蜘蛛王：左右各 4 条双关节机械毒蛛长腿（被吸血鬼钳制时高频挣扎抽动）
+      // 剧毒蜘蛛王 V4.0：随进化巨化暴涨的 8 条双关节荧光毒蛛镰刃巨腿！
       const foeSide: Side = v.id === "A" ? "B" : "A";
       const isCaptured = byId[foeSide].latchedTo === v.id;
+      const legGrow = 1 + Math.min(0.62, v.rageStacks * 0.052);
       for (const sideSign of [-1, 1]) {
         for (let leg = 0; leg < 4; leg++) {
           const baseSpread = (leg - 1.5) * 0.34;
           const stepWave = Math.sin(tNow * (isCaptured ? 36 : 16) + leg * 1.4 + (sideSign > 0 ? 0 : Math.PI)) * (isCaptured ? 0.28 : 0.18);
           const ang1 = (sideSign > 0 ? 0 : Math.PI) + baseSpread * sideSign + stepWave;
-          const len1 = orbR * 0.95;
-          const len2 = orbR * 0.88;
+          const len1 = orbR * 0.96 * legGrow;
+          const len2 = orbR * 0.90 * legGrow;
           const rootX = sx + Math.cos(ang1) * orbR * 0.78;
           const rootY = sy + Math.sin(ang1) * orbR * 0.78;
           const kneeX = rootX + Math.cos(ang1 - sideSign * 0.35) * len1;
@@ -1499,23 +1751,22 @@ export async function renderDuel(
           const tipX = kneeX + Math.cos(tipAng) * len2;
           const tipY = kneeY + Math.sin(tipAng) * len2;
 
-          fb.drawLine(rootX, rootY, kneeX, kneeY, Math.max(4, Math.round(7 * cam.zoom)), [r2, g2, b2, 245]);
-          fb.drawLine(rootX, rootY, kneeX, kneeY, Math.max(2, Math.round(4 * cam.zoom)), [r, g, b, 255]);
-          fb.drawLine(kneeX, kneeY, tipX, tipY, Math.max(3, Math.round(5 * cam.zoom)), [195, 255, 225, 255]);
-          fb.fillCircle(kneeX, kneeY, Math.max(3, Math.round(5 * cam.zoom)), [255, 255, 255, 240]);
-          fb.fillCircle(tipX, tipY, Math.max(2, Math.round(4 * cam.zoom)), [46, 255, 148, 255]);
+          fb.drawLine(rootX, rootY, kneeX, kneeY, Math.max(5, Math.round(9 * cam.zoom)), [r2, g2, b2, 248]);
+          fb.drawLine(rootX, rootY, kneeX, kneeY, Math.max(3, Math.round(5 * cam.zoom)), [r, g, b, 255]);
+          fb.drawLine(kneeX, kneeY, tipX, tipY, Math.max(4, Math.round(7 * cam.zoom)), [195, 255, 225, 255]);
+          fb.fillCircle(kneeX, kneeY, Math.max(3, Math.round(6 * cam.zoom)), [255, 255, 255, 245]);
+          fb.fillCircle(tipX, tipY, Math.max(3, Math.round(5 * cam.zoom)), [46, 255, 148, 255]);
         }
       }
     } else if (kind === "one_punch") {
-      // 一拳光头：随真实运动反方向飘扬的纯白正义披风 + 黄金蓄力进度光环 + 朝对手瞄准的红色重拳拳套
+      // 一拳光头 V4.0：正义白披风 + 黄金蓄力环 + 随进化膨胀至陨石尺寸的巨型红金重拳！
       const capeAng = moveAng + Math.PI + Math.sin(tNow * 14) * 0.12;
-      const capeLen = orbR * 1.48;
+      const capeLen = orbR * (1.48 + v.rageStacks * 0.045);
       const cxp = sx - fwdX * orbR * 0.96;
       const cyp = sy - fwdY * orbR * 0.96;
-      fb.fillRotatedRect(cxp, cyp, capeLen, orbR * 1.15, capeAng, [245, 248, 255, 235]);
-      fb.fillRotatedRect(cxp, cyp, capeLen * 0.85, orbR * 0.85, capeAng, [215, 224, 242, 220]);
+      fb.fillRotatedRect(cxp, cyp, capeLen, orbR * 1.18, capeAng, [245, 248, 255, 235]);
+      fb.fillRotatedRect(cxp, cyp, capeLen * 0.85, orbR * 0.88, capeAng, [215, 224, 242, 220]);
 
-      // 黄金蓄力环 (0..100%)
       const charge = clamp((v.punchCharge || 35) / 100, 0.08, 1);
       const chargeSpan = charge * Math.PI * 2;
       fb.drawArc(
@@ -1528,37 +1779,37 @@ export async function renderDuel(
         charge >= 0.85 ? [255, 72, 48, 255] : [255, 218, 58, 240],
       );
 
-      // 朝向对手方向的双红拳套（随蓄力高频出拳抖动）
+      const gGrow = 1 + v.rageStacks * 0.082;
+      const gRad = Math.round(21 * gGrow * cam.zoom);
       const punchBob = Math.sin(tNow * 20) * 12 * cam.zoom;
       for (const gSign of [-1, 1]) {
-        const reach = orbR * 1.08 + (gSign > 0 ? punchBob : -punchBob);
-        const gx = sx + aimX * reach + aimPerpX * gSign * orbR * 0.42;
-        const gy = sy + aimY * reach + aimPerpY * gSign * orbR * 0.42;
-        fb.drawGlowCircle(gx, gy, Math.round(28 * cam.zoom), [255, 195, 48, 185]);
-        fb.fillCircle(gx, gy, Math.round(20 * cam.zoom), [235, 38, 38, 255]);
-        fb.strokeRing(gx, gy, Math.round(20 * cam.zoom), 3, [255, 235, 130, 255]);
-        fb.fillCircle(gx - aimX * 4 * cam.zoom, gy - aimY * 4 * cam.zoom, Math.round(6 * cam.zoom), [255, 185, 185, 235]);
+        const reach = orbR * (1.10 + v.rageStacks * 0.045) + (gSign > 0 ? punchBob : -punchBob);
+        const gx = sx + aimX * reach + aimPerpX * gSign * orbR * 0.48;
+        const gy = sy + aimY * reach + aimPerpY * gSign * orbR * 0.48;
+        fb.drawGlowCircle(gx, gy, Math.round(gRad * 1.42), [255, 195, 48, 195]);
+        fb.fillCircle(gx, gy, gRad, [238, 36, 38, 255]);
+        fb.strokeRing(gx, gy, gRad, Math.max(3, Math.round(4 * cam.zoom)), [255, 235, 130, 255]);
+        fb.fillCircle(gx - aimX * 4 * cam.zoom, gy - aimY * 4 * cam.zoom, Math.round(gRad * 0.32), [255, 195, 195, 235]);
       }
     } else if (kind === "dance_granny") {
-      // 广场舞老太：球顶/身侧背负大功率霓虹音响 + 跳动频谱柱 + 环绕声波脉冲环
-      const spkX = sx - v.facing * orbR * 0.92;
+      // 广场舞老太 V4.0：越战越巨大的重低音霓虹战箱 + 环绕声波脉冲环
+      const spkGrow = 1 + v.rageStacks * 0.048;
+      const spkX = sx - v.facing * orbR * 0.96;
       const spkY = sy - orbR * 0.25;
-      const spkW = Math.round(46 * cam.zoom);
-      const spkH = Math.round(68 * cam.zoom);
+      const spkW = Math.round(48 * spkGrow * cam.zoom);
+      const spkH = Math.round(70 * spkGrow * cam.zoom);
       fb.fillRoundRect(spkX - spkW / 2 - 3, spkY - spkH / 2 - 3, spkW + 6, spkH + 6, 10, [34, 240, 255, 255]);
       fb.fillRoundRect(spkX - spkW / 2, spkY - spkH / 2, spkW, spkH, 8, [24, 18, 42, 250]);
-      // 双低音喇叭振膜随节拍缩放
-      const beatR = Math.round((10 + 3 * Math.sin(tNow * 24)) * cam.zoom);
-      fb.fillCircle(spkX, spkY - Math.round(14 * cam.zoom), beatR, [255, 58, 195, 255]);
-      fb.fillCircle(spkX, spkY + Math.round(14 * cam.zoom), beatR, [34, 235, 255, 255]);
+      const beatR = Math.round((11 + 3.5 * Math.sin(tNow * 24)) * spkGrow * cam.zoom);
+      fb.fillCircle(spkX, spkY - Math.round(15 * spkGrow * cam.zoom), beatR, [255, 58, 195, 255]);
+      fb.fillCircle(spkX, spkY + Math.round(15 * spkGrow * cam.zoom), beatR, [34, 235, 255, 255]);
 
-      // 环绕球体的霓虹律动音波弧
       for (let wIdx = 0; wIdx < 3; wIdx++) {
         const a = tNow * 5 + (wIdx * Math.PI * 2) / 3;
-        fb.drawArc(sx, sy, orbR * (1.22 + 0.12 * Math.sin(tNow * 16 + wIdx)), Math.max(3, Math.round(6 * cam.zoom)), a, a + 0.9, [38, 240, 255, 220]);
+        fb.drawArc(sx, sy, orbR * (1.26 + v.rageStacks * 0.03 + 0.12 * Math.sin(tNow * 16 + wIdx)), Math.max(3, Math.round(6 * cam.zoom)), a, a + 0.95, [38, 240, 255, 225]);
       }
     } else if (kind === "thunder_rail") {
-      // 雷电磁暴王：实时瞄准对手的360度双联电磁轨道炮管 + 旋转蓝白磁暴线圈环 + 跳跃电弧与蓄力光圈
+      // 雷电磁暴王 V4.0：随充能与进化暴涨伸长的双联巨型电磁轨道炮管 + 跳跃磁暴电弧环
       const charge = clamp((v.punchCharge || 35) / 100, 0.08, 1);
       const chargeSpan = charge * Math.PI * 2;
       fb.drawArc(
@@ -1570,23 +1821,25 @@ export async function renderDuel(
         -Math.PI * 0.5 + chargeSpan,
         charge >= 0.85 ? [255, 242, 92, 255] : [36, 232, 255, 245],
       );
+      const barrelLen = Math.round((48 + v.rageStacks * 6.5) * cam.zoom);
+      const barrelW = Math.round((15 + v.rageStacks * 0.8) * cam.zoom);
       for (const pSign of [-1, 1]) {
-        const px = sx + aimX * orbR * 0.98 + aimPerpX * pSign * orbR * 0.36;
-        const py = sy + aimY * orbR * 0.98 + aimPerpY * pSign * orbR * 0.36;
-        fb.fillRotatedRect(px, py, Math.round(46 * cam.zoom), Math.round(14 * cam.zoom), aimAng, [14, 78, 128, 250]);
-        fb.fillRotatedRect(px + aimX * 6 * cam.zoom, py + aimY * 6 * cam.zoom, Math.round(34 * cam.zoom), Math.round(7 * cam.zoom), aimAng, [95, 245, 255, 255]);
-        fb.drawGlowCircle(px + aimX * 18 * cam.zoom, py + aimY * 18 * cam.zoom, Math.round(22 * cam.zoom), [42, 235, 255, 195]);
+        const px = sx + aimX * (orbR * 0.92 + barrelLen * 0.35) + aimPerpX * pSign * orbR * 0.38;
+        const py = sy + aimY * (orbR * 0.92 + barrelLen * 0.35) + aimPerpY * pSign * orbR * 0.38;
+        fb.fillRotatedRect(px, py, barrelLen, barrelW, aimAng, [14, 78, 128, 250]);
+        fb.fillRotatedRect(px + aimX * 6 * cam.zoom, py + aimY * 6 * cam.zoom, Math.round(barrelLen * 0.78), Math.round(barrelW * 0.52), aimAng, [95, 245, 255, 255]);
+        fb.drawGlowCircle(px + aimX * barrelLen * 0.45, py + aimY * barrelLen * 0.45, Math.round(24 * cam.zoom), [42, 235, 255, 205]);
       }
       for (let eIdx = 0; eIdx < 4; eIdx++) {
         const ang = tNow * 14 + (eIdx * Math.PI) / 2;
         const x1 = sx + Math.cos(ang) * orbR * 0.92;
         const y1 = sy + Math.sin(ang) * orbR * 0.92;
-        const x2 = sx + Math.cos(ang + 0.38) * orbR * 1.32;
-        const y2 = sy + Math.sin(ang + 0.38) * orbR * 1.32;
-        fb.drawLine(x1, y1, x2, y2, 3, [155, 248, 255, 235]);
+        const x2 = sx + Math.cos(ang + 0.38) * orbR * (1.36 + v.rageStacks * 0.04);
+        const y2 = sy + Math.sin(ang + 0.38) * orbR * (1.36 + v.rageStacks * 0.04);
+        fb.drawLine(x1, y1, x2, y2, 4, [155, 248, 255, 235]);
       }
     } else if (kind === "ninja_shuriken") {
-      // 暗影忍者王：顺应运动反方向飘逸的猩红双忍巾飘带 + 环绕周身旋转的护体手里剑星刃
+      // 暗影忍者王 V4.0：飘逸猩红双忍巾 + 随进化增殖变大的护体风魔手里剑环（2->5枚）
       const backAng = moveAng + Math.PI;
       const wave1 = Math.sin(tNow * 18) * 0.16;
       const wave2 = Math.cos(tNow * 18) * 0.16;
@@ -1594,29 +1847,34 @@ export async function renderDuel(
       const s1y = sy - fwdY * orbR * 0.98 + perpY * orbR * 0.18;
       const s2x = sx - fwdX * orbR * 1.12 - perpX * orbR * 0.14;
       const s2y = sy - fwdY * orbR * 1.12 - perpY * orbR * 0.14;
-      fb.fillRotatedRect(s1x, s1y, orbR * 1.38, Math.round(18 * cam.zoom), backAng + 0.18 + wave1, [255, 38, 82, 245]);
-      fb.fillRotatedRect(s2x, s2y, orbR * 1.18, Math.round(13 * cam.zoom), backAng - 0.18 + wave2, [215, 24, 68, 225]);
-      for (let k = 0; k < 2; k++) {
-        const orbitAng = tNow * 9 + k * Math.PI;
-        const ox = sx + Math.cos(orbitAng) * orbR * 1.24;
-        const oy = sy + Math.sin(orbitAng) * orbR * 1.24;
+      fb.fillRotatedRect(s1x, s1y, orbR * (1.38 + v.rageStacks * 0.04), Math.round(18 * cam.zoom), backAng + 0.18 + wave1, [255, 38, 82, 245]);
+      fb.fillRotatedRect(s2x, s2y, orbR * (1.18 + v.rageStacks * 0.03), Math.round(13 * cam.zoom), backAng - 0.18 + wave2, [215, 24, 68, 225]);
+      const guardCount = 2 + Math.min(3, Math.floor(v.rageStacks / 3));
+      const guardSz = Math.round((32 + v.rageStacks * 2.0) * cam.zoom);
+      for (let k = 0; k < guardCount; k++) {
+        const orbitAng = tNow * 9 + (k * Math.PI * 2) / guardCount;
+        const ox = sx + Math.cos(orbitAng) * orbR * (1.28 + v.rageStacks * 0.025);
+        const oy = sy + Math.sin(orbitAng) * orbR * (1.28 + v.rageStacks * 0.025);
         const spin = tNow * 24 + k;
-        fb.fillRotatedRect(ox, oy, Math.round(30 * cam.zoom), Math.round(8 * cam.zoom), spin, [225, 240, 255, 245]);
-        fb.fillRotatedRect(ox, oy, Math.round(30 * cam.zoom), Math.round(8 * cam.zoom), spin + Math.PI * 0.5, [195, 118, 255, 245]);
-        fb.fillCircle(ox, oy, Math.round(4 * cam.zoom), [22, 16, 36, 255]);
+        fb.fillRotatedRect(ox, oy, guardSz, Math.round(9 * cam.zoom), spin, [225, 240, 255, 245]);
+        fb.fillRotatedRect(ox, oy, guardSz, Math.round(9 * cam.zoom), spin + Math.PI * 0.5, [195, 118, 255, 245]);
+        fb.fillCircle(ox, oy, Math.round(5 * cam.zoom), [22, 16, 36, 255]);
       }
     } else if (kind === "frost_freeze") {
-      // 急冻冰霜王：球顶三叉极寒冰冠 + 环绕周身旋转的六角冰晶雪花与寒气光环
-      fb.strokeRing(sx, sy, Math.round(orbR * 1.22), Math.max(3, Math.round(5 * cam.zoom)), [95, 245, 255, 195]);
-      for (let i = 0; i < 4; i++) {
-        const ang = -tNow * 4.5 + (i * Math.PI) / 2;
-        const ix = sx + Math.cos(ang) * orbR * 1.26;
-        const iy = sy + Math.sin(ang) * orbR * 1.26;
-        const rFlake = Math.round(13 * cam.zoom);
-        fb.drawLine(ix - rFlake, iy, ix + rFlake, iy, 3, [225, 252, 255, 245]);
-        fb.drawLine(ix, iy - rFlake, ix, iy + rFlake, 3, [225, 252, 255, 245]);
-        fb.drawLine(ix - rFlake * 0.7, iy - rFlake * 0.7, ix + rFlake * 0.7, iy + rFlake * 0.7, 2, [115, 245, 255, 235]);
-        fb.drawLine(ix - rFlake * 0.7, iy + rFlake * 0.7, ix + rFlake * 0.7, iy - rFlake * 0.7, 2, [115, 245, 255, 235]);
+      // 急冻冰霜王 V4.0：随进化扩张增殖的巨型极寒冰晶轮刃（4->6枚）
+      const iceCount = 4 + Math.min(2, Math.floor(v.rageStacks / 4));
+      const orbitRad = orbR * (1.28 + v.rageStacks * 0.035);
+      fb.strokeRing(sx, sy, Math.round(orbitRad * 0.96), Math.max(3, Math.round(6 * cam.zoom)), [95, 245, 255, 205]);
+      for (let i = 0; i < iceCount; i++) {
+        const ang = -tNow * 4.8 + (i * Math.PI * 2) / iceCount;
+        const ix = sx + Math.cos(ang) * orbitRad;
+        const iy = sy + Math.sin(ang) * orbitRad;
+        const rFlake = Math.round((15 + v.rageStacks * 1.4) * cam.zoom);
+        fb.drawGlowCircle(ix, iy, Math.round(rFlake * 1.35), [68, 238, 255, 145]);
+        fb.drawLine(ix - rFlake, iy, ix + rFlake, iy, 4, [225, 252, 255, 250]);
+        fb.drawLine(ix, iy - rFlake, ix, iy + rFlake, 4, [225, 252, 255, 250]);
+        fb.drawLine(ix - rFlake * 0.72, iy - rFlake * 0.72, ix + rFlake * 0.72, iy + rFlake * 0.72, 3, [115, 245, 255, 240]);
+        fb.drawLine(ix - rFlake * 0.72, iy + rFlake * 0.72, ix + rFlake * 0.72, iy - rFlake * 0.72, 3, [115, 245, 255, 240]);
       }
     } else if (kind === "rider_turbo") {
       // 极速黄骑士：沿真实速度反方向挂载黄金保温战箱 + 双排气管超长氮气烈焰 + 前方双层超音速马赫激波锥
@@ -1628,23 +1886,21 @@ export async function renderDuel(
       fb.fillRotatedRect(boxX, boxY, boxW, boxH, moveAng, [255, 196, 12, 255]);
       fb.fillRotatedRect(boxX, boxY, boxW - 10, 8, moveAng, [32, 24, 18, 235]);
 
-      // 双排气管喷射长尾焰（随进化层数与真实速度向量拉长旋转）
-      const flameLen = (58 + v.rageStacks * 11 + Math.sin(tNow * 38) * 16) * cam.zoom;
+      const flameLen = (64 + v.rageStacks * 14 + Math.sin(tNow * 38) * 16) * cam.zoom;
       for (const fSign of [-1, 1]) {
         const dist = orbR * 0.94 + flameLen * 0.46;
         const fx = sx - fwdX * dist + perpX * fSign * orbR * 0.24;
         const fy = sy - fwdY * dist + perpY * fSign * orbR * 0.24;
-        fb.fillRotatedRect(fx, fy, flameLen, Math.round(22 * cam.zoom), moveAng, [255, 86, 22, 235]);
+        fb.fillRotatedRect(fx, fy, flameLen, Math.round(24 * cam.zoom), moveAng, [255, 86, 22, 238]);
         fb.fillRotatedRect(
           fx + fwdX * flameLen * 0.14,
           fy + fwdY * flameLen * 0.14,
           flameLen * 0.70,
-          Math.round(12 * cam.zoom),
+          Math.round(13 * cam.zoom),
           moveAng,
           [255, 242, 108, 255],
         );
       }
-      // 前方双层超音速马赫破风激波锥（沿真实运动方向 moveAng 展开）
       fb.drawArc(
         sx + fwdX * orbR * 0.24,
         sy + fwdY * orbR * 0.24,
@@ -1658,7 +1914,7 @@ export async function renderDuel(
         fb.drawArc(
           sx + fwdX * orbR * 0.42,
           sy + fwdY * orbR * 0.42,
-          orbR * 1.42,
+          orbR * 1.44,
           Math.max(3, Math.round(5 * cam.zoom)),
           moveAng - 0.62,
           moveAng + 0.62,
@@ -1666,246 +1922,338 @@ export async function renderDuel(
         );
       }
     } else if (kind === "alchemist_puddle") {
-      // 绝命毒师：手持倾倒强酸的三角锥形化学烧瓶 + 环绕3只带塞荧光绿锥形烧瓶与上升毒汽泡
+      // 绝命毒师 V4.0：环绕高速旋转且随进化膨胀的荧光绿锥形化学烧瓶
+      const fScale = (1 + v.rageStacks * 0.04) * cam.zoom;
       for (let i = 0; i < 3; i++) {
-        const ang = tNow * 2.6 + (i * Math.PI * 2) / 3;
-        const bx = sx + Math.cos(ang) * orbR * 1.34;
-        const by = sy + Math.sin(ang) * orbR * 1.34;
-        const fScale = cam.zoom;
-        fb.drawGlowCircle(bx, by, Math.round(24 * fScale), [112, 255, 42, 145]);
-        // 锥形烧瓶玻璃外轮廓（宽底三角肚 + 细长瓶颈 + 瓶口塞）
+        const ang = tNow * 3.0 + (i * Math.PI * 2) / 3;
+        const bx = sx + Math.cos(ang) * orbR * 1.36;
+        const by = sy + Math.sin(ang) * orbR * 1.36;
+        fb.drawGlowCircle(bx, by, Math.round(26 * fScale), [112, 255, 42, 155]);
         fb.fillRoundRect(bx - Math.round(14 * fScale), by + Math.round(1 * fScale), Math.round(28 * fScale), Math.round(15 * fScale), 6, [215, 255, 232, 235]);
         fb.fillRoundRect(bx - Math.round(10 * fScale), by - Math.round(7 * fScale), Math.round(20 * fScale), Math.round(12 * fScale), 5, [215, 255, 232, 235]);
         fb.fillRoundRect(bx - Math.round(5 * fScale), by - Math.round(17 * fScale), Math.round(10 * fScale), Math.round(12 * fScale), 3, [225, 255, 240, 245]);
-        // 瓶内沸腾荧光绿强酸液面
         fb.fillRoundRect(bx - Math.round(12 * fScale), by + Math.round(3 * fScale), Math.round(24 * fScale), Math.round(11 * fScale), 5, [62, 248, 38, 255]);
         fb.fillRoundRect(bx - Math.round(8 * fScale), by - Math.round(2 * fScale), Math.round(16 * fScale), Math.round(7 * fScale), 3, [158, 255, 64, 255]);
-        // 棕色木塞与上升气泡
         fb.fillRoundRect(bx - Math.round(6 * fScale), by - Math.round(20 * fScale), Math.round(12 * fScale), Math.round(5 * fScale), 2, [168, 102, 48, 255]);
         const bubY = by - (18 + ((tNow * 28 + i * 9) % 14)) * fScale;
         fb.fillCircle(bx + Math.sin(tNow * 8 + i) * 4 * fScale, bubY, Math.max(2, Math.round(3.5 * fScale)), [178, 255, 92, 235]);
       }
     } else if (kind === "bulldozer_wall") {
-      // 暴走拆迁队：双液压撑杆连接的重型黄黑斜纹推土铲 + 5根破墙钢齿
-      const bladeDist = orbR * 1.16;
+      // 暴走拆迁队 V4.0：随进化加宽的重型黄黑斜纹推土钢铲 + 5根破城合金钢齿
+      const plowSpan = orbR * (1.78 + v.rageStacks * 0.055);
+      const bladeDist = orbR * 1.18;
       const bx = sx + fwdX * bladeDist;
       const by = sy + fwdY * bladeDist;
       for (const sSign of [-1, 1]) {
         const armX0 = sx + fwdX * orbR * 0.72 + perpX * sSign * orbR * 0.44;
         const armY0 = sy + fwdY * orbR * 0.72 + perpY * sSign * orbR * 0.44;
-        const armX1 = bx - fwdX * 6 * cam.zoom + perpX * sSign * orbR * 0.52;
-        const armY1 = by - fwdY * 6 * cam.zoom + perpY * sSign * orbR * 0.52;
+        const armX1 = bx - fwdX * 6 * cam.zoom + perpX * sSign * plowSpan * 0.30;
+        const armY1 = by - fwdY * 6 * cam.zoom + perpY * sSign * plowSpan * 0.30;
         fb.drawLine(armX0, armY0, armX1, armY1, Math.max(4, Math.round(8 * cam.zoom)), [168, 178, 196, 255]);
         fb.drawLine(armX0, armY0, armX1, armY1, Math.max(2, Math.round(4 * cam.zoom)), [235, 242, 255, 255]);
       }
-      // 重型推土钢铲背板与亮黄主铲面
-      fb.fillRotatedRect(bx, by, Math.round(32 * cam.zoom), Math.round(orbR * 1.78), moveAng, [28, 24, 22, 255]);
-      fb.fillRotatedRect(bx + fwdX * 3 * cam.zoom, by + fwdY * 3 * cam.zoom, Math.round(24 * cam.zoom), Math.round(orbR * 1.66), moveAng, [255, 188, 18, 255]);
-      // 黄黑工程警示斜纹 + 前缘5根破墙合金钢齿
+      fb.fillRotatedRect(bx, by, Math.round(34 * cam.zoom), Math.round(plowSpan), moveAng, [28, 24, 22, 255]);
+      fb.fillRotatedRect(bx + fwdX * 3 * cam.zoom, by + fwdY * 3 * cam.zoom, Math.round(25 * cam.zoom), Math.round(plowSpan * 0.94), moveAng, [255, 188, 18, 255]);
       for (let tIdx = -2; tIdx <= 2; tIdx++) {
-        const tx = bx + perpX * tIdx * orbR * 0.32;
-        const ty = by + perpY * tIdx * orbR * 0.32;
+        const tx = bx + perpX * tIdx * plowSpan * 0.18;
+        const ty = by + perpY * tIdx * plowSpan * 0.18;
         fb.fillRotatedRect(tx + fwdX * 3 * cam.zoom, ty + fwdY * 3 * cam.zoom, Math.round(22 * cam.zoom), Math.round(9 * cam.zoom), moveAng + 0.45, [28, 24, 20, 245]);
-        const toothX = tx + fwdX * 16 * cam.zoom;
-        const toothY = ty + fwdY * 16 * cam.zoom;
-        fb.fillRotatedRect(toothX, toothY, Math.round(14 * cam.zoom), Math.round(8 * cam.zoom), moveAng, [228, 236, 248, 255]);
+        const toothX = tx + fwdX * 17 * cam.zoom;
+        const toothY = ty + fwdY * 17 * cam.zoom;
+        fb.fillRotatedRect(toothX, toothY, Math.round(15 * cam.zoom), Math.round(9 * cam.zoom), moveAng, [228, 236, 248, 255]);
       }
-    } else if (kind === "angler_reel") {
-      // 深海垂钓王：身侧黄金纺车渔轮 + 大弧度弯弓碳素海钓竿 + 垂坠红白浮漂
-      const rodBaseX = sx + aimPerpX * orbR * 0.78;
-      const rodBaseY = sy + aimPerpY * orbR * 0.78;
-      const rodMidX = rodBaseX + aimX * orbR * 0.68 - aimPerpX * orbR * 0.22;
-      const rodMidY = rodBaseY + aimY * orbR * 0.68 - aimPerpY * orbR * 0.22 - orbR * 0.35;
-      const rodTipX = rodMidX + aimX * orbR * 0.72;
-      const rodTipY = rodMidY + aimY * orbR * 0.72 - orbR * 0.25 + Math.sin(tNow * 12) * 8 * cam.zoom;
-      // 黄金纺车渔轮
-      fb.fillCircle(rodBaseX, rodBaseY, Math.round(14 * cam.zoom), [255, 198, 38, 255]);
-      fb.strokeRing(rodBaseX, rodBaseY, Math.round(14 * cam.zoom), 3, [255, 248, 185, 255]);
-      fb.fillCircle(rodBaseX, rodBaseY, Math.round(6 * cam.zoom), [32, 48, 72, 255]);
-      // 碳素海钓竿两段弯弓竿身与导环
-      fb.drawLine(rodBaseX, rodBaseY, rodMidX, rodMidY, Math.max(5, Math.round(8 * cam.zoom)), [38, 52, 76, 255]);
-      fb.drawLine(rodBaseX, rodBaseY, rodMidX, rodMidY, Math.max(2, Math.round(4 * cam.zoom)), [92, 218, 255, 255]);
-      fb.drawLine(rodMidX, rodMidY, rodTipX, rodTipY, Math.max(3, Math.round(5 * cam.zoom)), [255, 215, 68, 255]);
-      fb.fillCircle(rodTipX, rodTipY, Math.round(6 * cam.zoom), [72, 245, 255, 255]);
-      // 环绕水波纹光弧
-      for (let wIdx = 0; wIdx < 2; wIdx++) {
-        const wa = tNow * 4 + wIdx * Math.PI;
-        fb.drawArc(sx, sy, orbR * 1.24, Math.max(3, Math.round(5 * cam.zoom)), wa, wa + 1.1, [38, 224, 255, 205]);
+    } else if (kind === "snake_tail") {
+      // 吞天贪吃蛇：外张眼镜王蛇颈肋翼 (Cobra Hood) + 往前高频吞吐的猩红分叉蛇信子（遇同绿对手自动切换赤金炎蟒配色，确保强对比！）
+      const isCrimsonSnake = r > 200 && g < 120;
+      const hoodCol: RGBA = isCrimsonSnake ? [168, 22, 38, 238] : [14, 128, 56, 235];
+      for (const hSign of [-1, 1]) {
+        const hx = sx - fwdX * orbR * 0.16 + perpX * hSign * orbR * 0.90;
+        const hy = sy - fwdY * orbR * 0.16 + perpY * hSign * orbR * 0.90;
+        fb.fillRotatedEllipse(hx, hy, Math.round(orbR * 0.58), Math.round(orbR * 0.36), moveAng + hSign * 0.45, hoodCol);
+        fb.fillRotatedEllipse(hx, hy, Math.round(orbR * 0.42), Math.round(orbR * 0.22), moveAng + hSign * 0.45, [255, 212, 52, 225]);
       }
-    } else if (kind === "courier_box") {
-      // 外卖闪电侠：背部蓝黄外卖箱（带红十字丝带与闪电标）+ 双联蓝金离子推进器 + 环身闪电链
-      const bx = sx - fwdX * orbR * 1.04;
-      const by = sy - fwdY * orbR * 1.04;
-      fb.fillRotatedRect(bx, by, Math.round(46 * cam.zoom), Math.round(54 * cam.zoom), moveAng, [18, 108, 245, 255]);
-      fb.fillRotatedRect(bx, by, Math.round(38 * cam.zoom), Math.round(46 * cam.zoom), moveAng, [255, 208, 18, 255]);
-      fb.fillRotatedRect(bx, by, Math.round(10 * cam.zoom), Math.round(44 * cam.zoom), moveAng, [255, 52, 68, 245]);
-      const jetLen = (52 + v.rageStacks * 9 + Math.sin(tNow * 36) * 14) * cam.zoom;
+      const flick = 0.65 + 0.42 * Math.max(0, Math.sin(tNow * 22));
+      const tBaseX = sx + fwdX * orbR * 0.96;
+      const tBaseY = sy + fwdY * orbR * 0.96;
+      const tMidX = sx + fwdX * orbR * (0.96 + 0.38 * flick);
+      const tMidY = sy + fwdY * orbR * (0.96 + 0.38 * flick);
+      fb.drawLine(tBaseX, tBaseY, tMidX, tMidY, Math.max(4, Math.round(6 * cam.zoom)), [255, 36, 78, 250]);
       for (const fSign of [-1, 1]) {
-        const jx = sx - fwdX * (orbR * 1.18 + jetLen * 0.42) + perpX * fSign * orbR * 0.25;
-        const jy = sy - fwdY * (orbR * 1.18 + jetLen * 0.42) + perpY * fSign * orbR * 0.25;
-        fb.fillRotatedRect(jx, jy, jetLen, Math.round(18 * cam.zoom), moveAng, [24, 178, 255, 235]);
-        fb.fillRotatedRect(jx, jy, jetLen * 0.68, Math.round(9 * cam.zoom), moveAng, [255, 248, 138, 255]);
+        const tipX = tMidX + (fwdX * 0.28 + perpX * fSign * 0.22) * orbR * flick;
+        const tipY = tMidY + (fwdY * 0.28 + perpY * fSign * 0.22) * orbR * flick;
+        fb.drawLine(tMidX, tMidY, tipX, tipY, Math.max(3, Math.round(4 * cam.zoom)), [255, 68, 98, 250]);
       }
-      fb.drawArc(
-        sx + fwdX * orbR * 0.22,
-        sy + fwdY * orbR * 0.22,
-        orbR * 1.25,
-        Math.max(3, Math.round(6 * cam.zoom)),
-        moveAng - 0.72,
-        moveAng + 0.72,
-        [82, 232, 255, 235],
+    } else if (kind === "slime_split") {
+      // 分裂史莱姆：Q弹呼吸晃动的半透明果冻外膜光晕 + 环身漂浮的果冻小水珠
+      const wobA = Math.sin(tNow * 14) * 0.11;
+      fb.fillRotatedEllipse(
+        sx,
+        sy,
+        Math.round(orbR * (1.16 + wobA)),
+        Math.round(orbR * (1.16 - wobA)),
+        moveAng,
+        [36, 220, 255, 92],
       );
+      for (let dIdx = 0; dIdx < 3; dIdx++) {
+        const da = tNow * 3.4 + (dIdx * Math.PI * 2) / 3;
+        const dx = sx + Math.cos(da) * orbR * 1.22;
+        const dy = sy + Math.sin(da) * orbR * 1.22;
+        const dr = Math.max(5, Math.round((8 - dIdx) * cam.zoom));
+        fb.fillCircle(dx, dy, dr, [86, 238, 255, 220]);
+        fb.fillCircle(dx - 2, dy - 2, Math.max(2, Math.round(dr * 0.4)), [255, 255, 255, 240]);
+      }
+    } else if (kind === "time_stop") {
+      // 时停钟表王：头顶皇家怀表发条表冠与吊环 + 外圈4枚咬合旋转黄金齿轮 + 越打越巨化的双黄金怀表飞剑刃
+      const crownY = sy - orbR * 1.14;
+      fb.strokeRing(sx, Math.round(crownY - 12 * cam.zoom), Math.round(14 * cam.zoom), Math.max(3, Math.round(4 * cam.zoom)), [255, 224, 82, 255]);
+      fb.fillRoundRect(
+        sx - Math.round(14 * cam.zoom),
+        Math.round(crownY - 4 * cam.zoom),
+        Math.round(28 * cam.zoom),
+        Math.round(16 * cam.zoom),
+        5,
+        [255, 196, 36, 255],
+      );
+      fb.strokeRoundRect(
+        sx - Math.round(14 * cam.zoom),
+        Math.round(crownY - 4 * cam.zoom),
+        Math.round(28 * cam.zoom),
+        Math.round(16 * cam.zoom),
+        5,
+        2,
+        [255, 250, 205, 255],
+      );
+      for (let gIdx = 0; gIdx < 4; gIdx++) {
+        const ga = tNow * 3.2 + (gIdx * Math.PI) / 2 + Math.PI * 0.25;
+        const gx = sx + Math.cos(ga) * orbR * 1.12;
+        const gy = sy + Math.sin(ga) * orbR * 1.12;
+        fb.fillRotatedRect(gx, gy, Math.round(18 * cam.zoom), Math.round(8 * cam.zoom), ga, [255, 208, 48, 240]);
+      }
+      const minSwordLen = orbR * (1.32 + v.rageStacks * 0.095);
+      const hrSwordLen = orbR * (1.02 + v.rageStacks * 0.072);
+      const extMinAng = tNow * 7.2;
+      const extHrAng = -tNow * 3.8 + 1.2;
+      fb.drawLine(sx, sy, sx + Math.cos(extMinAng) * minSwordLen, sy + Math.sin(extMinAng) * minSwordLen, Math.max(5, Math.round(10 * cam.zoom)), [255, 198, 36, 240]);
+      fb.drawLine(sx, sy, sx + Math.cos(extMinAng) * minSwordLen, sy + Math.sin(extMinAng) * minSwordLen, Math.max(2, Math.round(4 * cam.zoom)), [255, 252, 215, 255]);
+      fb.fillCircle(sx + Math.cos(extMinAng) * minSwordLen, sy + Math.sin(extMinAng) * minSwordLen, Math.max(4, Math.round(8 * cam.zoom)), [124, 252, 255, 255]);
+      fb.drawLine(sx, sy, sx + Math.cos(extHrAng) * hrSwordLen, sy + Math.sin(extHrAng) * hrSwordLen, Math.max(6, Math.round(12 * cam.zoom)), [255, 168, 28, 235]);
+      fb.drawLine(sx, sy, sx + Math.cos(extHrAng) * hrSwordLen, sy + Math.sin(extHrAng) * hrSwordLen, Math.max(3, Math.round(5 * cam.zoom)), [255, 238, 132, 250]);
+      const chargePct = clamp(v.punchCharge / 100, 0, 1);
+      if (chargePct > 0.05) {
+        fb.drawArc(
+          sx,
+          sy,
+          orbR * 1.24,
+          Math.max(4, Math.round(6 * cam.zoom)),
+          -Math.PI * 0.5,
+          -Math.PI * 0.5 + Math.PI * 2 * chargePct,
+          chargePct >= 0.92 ? [118, 252, 255, 255] : [255, 224, 72, 225],
+        );
+      }
     } else if (kind === "billiard_bank") {
-      // 赛博台球手：实时瞄准对手的修长黄金桌球杆（带伸缩击球动作）+ 青色几何激光瞄准虚线
+      // 赛博台球手 V4.0：随进化伸长的重型黄金大师桌球杆 + 翡翠激光制导虚线
+      const cueGrow = 1 + v.rageStacks * 0.055;
       const strokeOffset = Math.sin(tNow * 14) * 14 * cam.zoom;
-      const cueButtX = sx - aimX * (orbR * 1.68 + strokeOffset) + aimPerpX * orbR * 0.28;
-      const cueButtY = sy - aimY * (orbR * 1.68 + strokeOffset) + aimPerpY * orbR * 0.28;
+      const cueButtX = sx - aimX * (orbR * 1.72 * cueGrow + strokeOffset) + aimPerpX * orbR * 0.28;
+      const cueButtY = sy - aimY * (orbR * 1.72 * cueGrow + strokeOffset) + aimPerpY * orbR * 0.28;
       const cueMidX = sx - aimX * (orbR * 0.25 + strokeOffset) + aimPerpX * orbR * 0.28;
       const cueMidY = sy - aimY * (orbR * 0.25 + strokeOffset) + aimPerpY * orbR * 0.28;
-      const cueTipX = sx + aimX * (orbR * 1.28 - strokeOffset) + aimPerpX * orbR * 0.28;
-      const cueTipY = sy + aimY * (orbR * 1.28 - strokeOffset) + aimPerpY * orbR * 0.28;
-      // 球杆黑金后把 + 枫木前节 + 蓝巧克皮头
-      fb.drawLine(cueButtX, cueButtY, cueMidX, cueMidY, Math.max(6, Math.round(11 * cam.zoom)), [48, 32, 22, 255]);
-      fb.drawLine(cueButtX, cueButtY, cueMidX, cueMidY, Math.max(3, Math.round(5 * cam.zoom)), [255, 204, 68, 255]);
-      fb.drawLine(cueMidX, cueMidY, cueTipX, cueTipY, Math.max(4, Math.round(7 * cam.zoom)), [245, 218, 162, 255]);
-      fb.fillCircle(cueTipX, cueTipY, Math.round(6 * cam.zoom), [38, 228, 255, 255]);
-      // 前方几何激光瞄准线
-      for (let d = 1; d <= 3; d++) {
+      const cueTipX = sx + aimX * (orbR * 1.32 * cueGrow - strokeOffset) + aimPerpX * orbR * 0.28;
+      const cueTipY = sy + aimY * (orbR * 1.32 * cueGrow - strokeOffset) + aimPerpY * orbR * 0.28;
+      fb.drawLine(cueButtX, cueButtY, cueMidX, cueMidY, Math.max(6, Math.round(12 * cam.zoom)), [48, 32, 22, 255]);
+      fb.drawLine(cueButtX, cueButtY, cueMidX, cueMidY, Math.max(3, Math.round(6 * cam.zoom)), [255, 204, 68, 255]);
+      fb.drawLine(cueMidX, cueMidY, cueTipX, cueTipY, Math.max(4, Math.round(8 * cam.zoom)), [245, 218, 162, 255]);
+      fb.fillCircle(cueTipX, cueTipY, Math.round(7 * cam.zoom), [38, 228, 255, 255]);
+      for (let d = 1; d <= 4; d++) {
         const lx0 = cueTipX + aimX * (d * 24 - 10) * cam.zoom;
         const ly0 = cueTipY + aimY * (d * 24 - 10) * cam.zoom;
-        const lx1 = cueTipX + aimX * (d * 24 + 2) * cam.zoom;
-        const ly1 = cueTipY + aimY * (d * 24 + 2) * cam.zoom;
+        const lx1 = cueTipX + aimX * (d * 24 + 4) * cam.zoom;
+        const ly1 = cueTipY + aimY * (d * 24 + 4) * cam.zoom;
         fb.drawLine(lx0, ly0, lx1, ly1, 3, [48, 255, 208, 215]);
       }
     } else if (kind === "graffiti_paint") {
-      // 街头涂鸦王：左右两侧挂载高压霓虹喷漆罐（银色罐身+荧光色标+白色喷头）+ 实时向外喷射彩漆雾滴
+      // 街头涂鸦王 V4.0：随进化变大的双侧高压霓虹喷漆罐 + 狂喷彩漆雾滴
+      const canGrow = (1 + v.rageStacks * 0.045) * cam.zoom;
       for (const sSign of [-1, 1]) {
-        const canX = sx + perpX * sSign * orbR * 1.12;
-        const canY = sy + perpY * sSign * orbR * 1.12;
+        const canX = sx + perpX * sSign * orbR * 1.16;
+        const canY = sy + perpY * sSign * orbR * 1.16;
         const canAng = moveAng + sSign * 0.35;
         const paintCol: RGBA = sSign < 0 ? [255, 38, 178, 255] : [28, 242, 255, 255];
-        // 银色金属喷漆罐身 + 霓虹色带 + 白色按压喷嘴
-        fb.fillRotatedRect(canX, canY, Math.round(36 * cam.zoom), Math.round(22 * cam.zoom), canAng, [218, 228, 242, 255]);
-        fb.fillRotatedRect(canX, canY, Math.round(22 * cam.zoom), Math.round(22 * cam.zoom), canAng, paintCol);
-        const nozX = canX + Math.cos(canAng) * 21 * cam.zoom;
-        const nozY = canY + Math.sin(canAng) * 21 * cam.zoom;
-        fb.fillCircle(nozX, nozY, Math.round(6 * cam.zoom), [255, 255, 255, 255]);
-        // 喷嘴向外喷出的扇形彩漆雾滴
-        for (let m = 0; m < 3; m++) {
-          const mDist = (14 + ((tNow * 45 + m * 9) % 24)) * cam.zoom;
-          const mAng = canAng + (m - 1) * 0.28;
+        fb.fillRotatedRect(canX, canY, Math.round(38 * canGrow), Math.round(24 * canGrow), canAng, [218, 228, 242, 255]);
+        fb.fillRotatedRect(canX, canY, Math.round(24 * canGrow), Math.round(24 * canGrow), canAng, paintCol);
+        const nozX = canX + Math.cos(canAng) * 22 * canGrow;
+        const nozY = canY + Math.sin(canAng) * 22 * canGrow;
+        fb.fillCircle(nozX, nozY, Math.round(6 * canGrow), [255, 255, 255, 255]);
+        for (let m = 0; m < 4; m++) {
+          const mDist = (14 + ((tNow * 45 + m * 8) % 28)) * canGrow;
+          const mAng = canAng + (m - 1.5) * 0.25;
           fb.fillCircle(
             nozX + Math.cos(mAng) * mDist,
             nozY + Math.sin(mAng) * mDist,
-            Math.max(2, Math.round(4.5 * cam.zoom)),
+            Math.max(2, Math.round(5 * canGrow)),
             paintCol,
           );
         }
       }
     } else if (kind === "kebab_skewer") {
-      // 旋转烤肉王：贯穿全身高速旋转的巨型新疆红柳铁签烤串（串着焦香烤肉块、青椒与洋葱圈）
-      const ang = tNow * 5.2;
+      // 旋转烤肉王 V4.0：与物理碰撞 100% 同步、随进化暴涨至横跨半屏（740px）的「四十米烈焰铁签巨枪」！
+      const skDir = v.id === "A" ? 1 : -1;
+      const ang = v.weaponAngle || tNow * 5.4 * skDir;
       const cosA = Math.cos(ang);
       const sinA = Math.sin(ang);
-      const kx0 = sx - cosA * orbR * 1.62;
-      const ky0 = sy - sinA * orbR * 1.62;
-      const kx1 = sx + cosA * orbR * 1.68;
-      const ky1 = sy + sinA * orbR * 1.68;
-      // 钢签圆环握柄 + 贯穿铁签 + 红热签尖
-      fb.strokeRing(kx0, ky0, Math.round(11 * cam.zoom), 4, [255, 208, 68, 255]);
-      fb.drawLine(kx0, ky0, kx1, ky1, Math.max(5, Math.round(8 * cam.zoom)), [220, 232, 248, 255]);
-      fb.drawGlowCircle(kx1, ky1, Math.round(22 * cam.zoom), [255, 92, 24, 195]);
-      fb.fillCircle(kx1, ky1, Math.round(6 * cam.zoom), [255, 238, 92, 255]);
-      // 铁签两端串着的焦香烤肉块、青椒片与孜然油花
-      for (const dRatio of [-1.22, -0.96, 0.96, 1.24]) {
-        const mx = sx + cosA * orbR * dRatio;
-        const my = sy + sinA * orbR * dRatio;
-        const isPepper = Math.abs(dRatio) < 1.05;
-        if (isPepper) {
-          fb.fillRotatedRect(mx, my, Math.round(14 * cam.zoom), Math.round(24 * cam.zoom), ang, [52, 224, 78, 255]);
-        } else {
-          fb.fillRotatedRect(mx, my, Math.round(22 * cam.zoom), Math.round(28 * cam.zoom), ang + 0.2, [192, 68, 24, 255]);
-          fb.fillRotatedRect(mx, my, Math.round(14 * cam.zoom), Math.round(18 * cam.zoom), ang + 0.2, [255, 168, 48, 255]);
+      const halfSpanWorld = 112 + v.rageStacks * 22;
+      const [kx0, ky0] = worldToScreen(visX[v.id] - cosA * halfSpanWorld, visY[v.id] - sinA * halfSpanWorld, cam, shx, shy);
+      const [kx1, ky1] = worldToScreen(visX[v.id] + cosA * halfSpanWorld, visY[v.id] + sinA * halfSpanWorld, cam, shx, shy);
+      const spanScreen = Math.hypot(kx1 - sx, ky1 - sy);
+
+      // 双端烈焰旋转破风刀光弧
+      const sweepStart = skDir > 0 ? ang - 0.52 : ang;
+      const sweepEnd = skDir > 0 ? ang : ang + 0.52;
+      fb.drawArc(sx, sy, spanScreen * 0.92, Math.max(6, Math.round(14 * cam.zoom)), sweepStart, sweepEnd, [255, 98, 24, 125]);
+      fb.drawArc(sx, sy, spanScreen * 0.92, Math.max(6, Math.round(14 * cam.zoom)), sweepStart + Math.PI, sweepEnd + Math.PI, [255, 98, 24, 125]);
+
+      // 黄金圆环签柄 + 高亮精钢长签杆 + 双端赤红灼热签尖
+      fb.strokeRing(kx0, ky0, Math.round(13 * cam.zoom), 4, [255, 212, 62, 255]);
+      fb.drawLine(kx0, ky0, kx1, ky1, Math.max(6, Math.round(11 * cam.zoom)), [165, 182, 208, 255]);
+      fb.drawLine(kx0, ky0, kx1, ky1, Math.max(3, Math.round(6 * cam.zoom)), [245, 250, 255, 255]);
+      fb.drawGlowCircle(kx1, ky1, Math.round(28 * cam.zoom), [255, 92, 24, 215]);
+      fb.fillCircle(kx1, ky1, Math.round(8 * cam.zoom), [255, 242, 98, 255]);
+
+      // 沿巨型长签两侧串满越烤越丰盛的焦香大肉块与翠绿青椒片
+      const pairs = 2 + Math.min(3, Math.floor(v.rageStacks / 3));
+      for (const endSign of [-1, 1]) {
+        for (let idx = 0; idx < pairs; idx++) {
+          const u = 0.42 + ((idx + 0.5) / pairs) * 0.46;
+          const mx = sx + (endSign > 0 ? kx1 - sx : kx0 - sx) * u;
+          const my = sy + (endSign > 0 ? ky1 - sy : ky0 - sy) * u;
+          if (idx % 2 === 1) {
+            fb.fillRotatedRect(mx, my, Math.round(16 * cam.zoom), Math.round(28 * cam.zoom), ang, [52, 232, 82, 255]);
+          } else {
+            fb.fillRotatedRect(mx, my, Math.round(25 * cam.zoom), Math.round(32 * cam.zoom), ang + 0.18, [196, 68, 24, 255]);
+            fb.fillRotatedRect(mx, my, Math.round(15 * cam.zoom), Math.round(20 * cam.zoom), ang + 0.18, [255, 176, 48, 255]);
+          }
         }
       }
     } else if (kind === "pinball_bumper") {
-      // 街机弹珠王：前方一对高频拍击的街机弹珠挡板 (Flippers) + 尾部弹簧发射杆 + 霓虹灯珠环
+      // 街机弹珠王 V4.0：随进化加长的街机黄金闪电弹板 + 777霓虹高压电圈
       const flipSwing = Math.sin(tNow * 22) * 0.34;
+      const flipLen = orbR * (0.78 + v.rageStacks * 0.055);
       for (const fSign of [-1, 1]) {
-        const pivotX = sx + aimX * orbR * 0.72 + aimPerpX * fSign * orbR * 0.78;
-        const pivotY = sy + aimY * orbR * 0.72 + aimPerpY * fSign * orbR * 0.78;
+        const pivotX = sx + aimX * orbR * 0.72 + aimPerpX * fSign * orbR * 0.80;
+        const pivotY = sy + aimY * orbR * 0.72 + aimPerpY * fSign * orbR * 0.80;
         const fAng = aimAng - fSign * (0.45 - flipSwing);
-        const tipX = pivotX + Math.cos(fAng) * orbR * 0.72;
-        const tipY = pivotY + Math.sin(fAng) * orbR * 0.72;
-        fb.drawLine(pivotX, pivotY, tipX, tipY, Math.max(7, Math.round(14 * cam.zoom)), [255, 52, 92, 255]);
-        fb.drawLine(pivotX, pivotY, tipX, tipY, Math.max(4, Math.round(8 * cam.zoom)), [255, 224, 42, 255]);
+        const tipX = pivotX + Math.cos(fAng) * flipLen;
+        const tipY = pivotY + Math.sin(fAng) * flipLen;
+        fb.drawLine(pivotX, pivotY, tipX, tipY, Math.max(8, Math.round(15 * cam.zoom)), [255, 52, 92, 255]);
+        fb.drawLine(pivotX, pivotY, tipX, tipY, Math.max(4, Math.round(8 * cam.zoom)), [255, 228, 42, 255]);
         fb.fillCircle(pivotX, pivotY, Math.round(9 * cam.zoom), [255, 255, 255, 255]);
       }
-      fb.strokeRing(sx, sy, Math.round(orbR * 1.24), Math.max(3, Math.round(5 * cam.zoom)), [255, 218, 36, 220]);
+      fb.strokeRing(sx, sy, Math.round(orbR * (1.24 + v.rageStacks * 0.025)), Math.max(3, Math.round(6 * cam.zoom)), [255, 218, 36, 230]);
     } else if (kind === "beyblade_orbit") {
-      // 磁悬浮陀螺：高速旋转的六翼斜切金属锯齿攻击环 + 蓝金磨擦火花
-      const ang = tNow * 15.0;
-      fb.strokeRing(sx, sy, Math.round(orbR * 1.22), Math.max(5, Math.round(8 * cam.zoom)), [195, 218, 245, 245]);
-      fb.strokeRing(sx, sy, Math.round(orbR * 1.30), Math.max(3, Math.round(5 * cam.zoom)), [28, 232, 255, 235]);
-      for (let i = 0; i < 6; i++) {
-        const a = ang + (i * Math.PI) / 3;
-        const bx = sx + Math.cos(a) * orbR * 1.28;
-        const by = sy + Math.sin(a) * orbR * 1.28;
-        const tipX = sx + Math.cos(a + 0.28) * orbR * 1.52;
-        const tipY = sy + Math.sin(a + 0.28) * orbR * 1.52;
-        fb.fillRotatedRect(bx, by, Math.round(32 * cam.zoom), Math.round(13 * cam.zoom), a + 0.65, [225, 238, 255, 255]);
-        fb.drawLine(bx, by, tipX, tipY, Math.max(4, Math.round(7 * cam.zoom)), [255, 208, 42, 255]);
+      // 磁悬浮陀螺 V4.0：随进化扩张并增殖锯齿的巨型金属破城攻击环（6->10齿）
+      const ang = tNow * 16.0;
+      const ringR = orbR * (1.24 + v.rageStacks * 0.042);
+      const bladeCnt = 6 + Math.min(4, Math.floor(v.rageStacks / 2));
+      fb.strokeRing(sx, sy, Math.round(ringR * 0.96), Math.max(5, Math.round(9 * cam.zoom)), [195, 218, 245, 245]);
+      fb.strokeRing(sx, sy, Math.round(ringR * 1.03), Math.max(3, Math.round(5 * cam.zoom)), [28, 232, 255, 235]);
+      for (let i = 0; i < bladeCnt; i++) {
+        const a = ang + (i * Math.PI * 2) / bladeCnt;
+        const bx = sx + Math.cos(a) * ringR * 1.02;
+        const by = sy + Math.sin(a) * ringR * 1.02;
+        const tipX = sx + Math.cos(a + 0.26) * ringR * 1.24;
+        const tipY = sy + Math.sin(a + 0.26) * ringR * 1.24;
+        fb.fillRotatedRect(bx, by, Math.round(34 * cam.zoom), Math.round(14 * cam.zoom), a + 0.65, [225, 238, 255, 255]);
+        fb.drawLine(bx, by, tipX, tipY, Math.max(4, Math.round(8 * cam.zoom)), [255, 208, 42, 255]);
       }
     } else if (kind === "fireman_hose") {
-      // 暴躁消防员：背部双联红钢高压水罐 + 朝向对手的黄铜高压水炮枪与喷溅水花
-      for (const tSign of [-1, 1]) {
-        const tx = sx - aimX * orbR * 0.92 + aimPerpX * tSign * orbR * 0.34;
-        const ty = sy - aimY * orbR * 0.92 + aimPerpY * tSign * orbR * 0.34;
-        fb.fillRotatedRect(tx, ty, Math.round(36 * cam.zoom), Math.round(20 * cam.zoom), aimAng, [235, 38, 42, 255]);
-        fb.fillRotatedRect(tx, ty, Math.round(14 * cam.zoom), Math.round(20 * cam.zoom), aimAng, [255, 215, 52, 255]);
+      // 暴躁消防员 V4.0：随身扫射且越打越粗长的「巨型高压水龙激流炮」（与物理线段 100% 同步！）
+      const jetAng = v.weaponAngle || aimAng;
+      const jCos = Math.cos(jetAng);
+      const jSin = Math.sin(jetAng);
+      const jPerpX = -jSin;
+      const jPerpY = jCos;
+      const jetLenWorld = 190 + v.rageStacks * 19;
+      const [jx, jy] = worldToScreen(visX[v.id] + jCos * jetLenWorld, visY[v.id] + jSin * jetLenWorld, cam, shx, shy);
+      const nozStartX = sx + jCos * orbR * 1.18;
+      const nozStartY = sy + jSin * orbR * 1.18;
+
+      // 1) 三层奔涌高压水龙柱 + 6道高速推进泡沫水浪环 + 末端巨型水花轰爆
+      const beamScale = 1 + v.rageStacks * 0.045;
+      fb.drawLine(nozStartX, nozStartY, jx, jy, Math.max(16, Math.round(28 * beamScale * cam.zoom)), [24, 158, 255, 165]);
+      fb.drawLine(nozStartX, nozStartY, jx, jy, Math.max(9, Math.round(16 * beamScale * cam.zoom)), [78, 236, 255, 230]);
+      fb.drawLine(nozStartX, nozStartY, jx, jy, Math.max(4, Math.round(7 * beamScale * cam.zoom)), [242, 255, 255, 252]);
+      for (let w = 0; w < 6; w++) {
+        const u = (tNow * 5.2 + w / 6) % 1;
+        const wx = nozStartX + (jx - nozStartX) * u;
+        const wy = nozStartY + (jy - nozStartY) * u;
+        const wr = Math.round((9 + u * 16) * cam.zoom);
+        fb.fillCircle(wx + jPerpX * Math.sin(u * 14) * 5, wy + jPerpY * Math.sin(u * 14) * 5, wr, [215, 252, 255, Math.round(225 * (1 - u * 0.45))]);
       }
-      const nx = sx + aimX * orbR * 1.08;
-      const ny = sy + aimY * orbR * 1.08;
-      fb.fillRotatedRect(nx, ny, Math.round(42 * cam.zoom), Math.round(24 * cam.zoom), aimAng, [238, 42, 48, 255]);
-      fb.fillRotatedRect(nx + aimX * 14 * cam.zoom, ny + aimY * 14 * cam.zoom, Math.round(24 * cam.zoom), Math.round(16 * cam.zoom), aimAng, [255, 215, 48, 255]);
-      fb.drawGlowCircle(nx + aimX * 28 * cam.zoom, ny + aimY * 28 * cam.zoom, Math.round(26 * cam.zoom), [68, 232, 255, 210]);
-      fb.fillCircle(nx + aimX * 26 * cam.zoom, ny + aimY * 26 * cam.zoom, Math.round(9 * cam.zoom), [225, 252, 255, 255]);
+      fb.drawGlowCircle(jx, jy, Math.round(46 * beamScale * cam.zoom), [98, 242, 255, 215]);
+      for (let sp = 0; sp < 4; sp++) {
+        const sa = jetAng + (sp - 1.5) * 0.55 + Math.sin(tNow * 22 + sp) * 0.16;
+        fb.fillCircle(jx + Math.cos(sa) * 20 * cam.zoom, jy + Math.sin(sa) * 20 * cam.zoom, Math.round(11 * cam.zoom), [238, 255, 255, 240]);
+      }
+
+      // 2) 背部双联红钢高压水罐 + 黄铜水炮枪口
+      for (const tSign of [-1, 1]) {
+        const tx = sx - jCos * orbR * 0.92 + jPerpX * tSign * orbR * 0.34;
+        const ty = sy - jSin * orbR * 0.92 + jPerpY * tSign * orbR * 0.34;
+        fb.fillRotatedRect(tx, ty, Math.round(36 * cam.zoom), Math.round(20 * cam.zoom), jetAng, [235, 38, 42, 255]);
+        fb.fillRotatedRect(tx, ty, Math.round(14 * cam.zoom), Math.round(20 * cam.zoom), jetAng, [255, 215, 52, 255]);
+      }
+      const nx = sx + jCos * orbR * 1.08;
+      const ny = sy + jSin * orbR * 1.08;
+      fb.fillRotatedRect(nx, ny, Math.round(44 * cam.zoom), Math.round(25 * cam.zoom), jetAng, [238, 42, 48, 255]);
+      fb.fillRotatedRect(nx + jCos * 15 * cam.zoom, ny + jSin * 15 * cam.zoom, Math.round(26 * cam.zoom), Math.round(17 * cam.zoom), jetAng, [255, 215, 48, 255]);
     } else if (kind === "voodoo_doll") {
-      // 巫毒咒术师：环绕旋转的3根巨型红头巫毒诅咒银针 + 幽绿灵魂鬼火
+      // 巫毒咒术师 V4.0：随进化变长增殖的巨型诅咒银针环（3->6根）+ 幽绿鬼火
+      const pinCnt = 3 + Math.min(3, Math.floor(v.rageStacks / 3));
+      const pinOuter = orbR * (1.56 + v.rageStacks * 0.065);
       fb.strokeRing(sx, sy, Math.round(orbR * 1.24), Math.max(3, Math.round(5 * cam.zoom)), [178, 52, 255, 205]);
-      for (let i = 0; i < 3; i++) {
-        const a = -tNow * 3.4 + (i * Math.PI * 2) / 3;
-        const pinTipX = sx + Math.cos(a) * orbR * 1.06;
-        const pinTipY = sy + Math.sin(a) * orbR * 1.06;
-        const pinHeadX = sx + Math.cos(a) * orbR * 1.54;
-        const pinHeadY = sy + Math.sin(a) * orbR * 1.54;
-        fb.drawLine(pinTipX, pinTipY, pinHeadX, pinHeadY, Math.max(3, Math.round(5 * cam.zoom)), [225, 238, 255, 255]);
-        fb.drawGlowCircle(pinHeadX, pinHeadY, Math.round(18 * cam.zoom), [72, 255, 158, 175]);
-        fb.fillCircle(pinHeadX, pinHeadY, Math.round(10 * cam.zoom), i % 2 === 0 ? [255, 42, 92, 255] : [62, 255, 152, 255]);
+      for (let i = 0; i < pinCnt; i++) {
+        const a = -tNow * 3.6 + (i * Math.PI * 2) / pinCnt;
+        const pinTipX = sx + Math.cos(a) * orbR * 1.04;
+        const pinTipY = sy + Math.sin(a) * orbR * 1.04;
+        const pinHeadX = sx + Math.cos(a) * pinOuter;
+        const pinHeadY = sy + Math.sin(a) * pinOuter;
+        fb.drawLine(pinTipX, pinTipY, pinHeadX, pinHeadY, Math.max(3, Math.round(6 * cam.zoom)), [225, 238, 255, 255]);
+        fb.drawGlowCircle(pinHeadX, pinHeadY, Math.round(20 * cam.zoom), [72, 255, 158, 180]);
+        fb.fillCircle(pinHeadX, pinHeadY, Math.round(11 * cam.zoom), i % 2 === 0 ? [255, 42, 92, 255] : [62, 255, 152, 255]);
         fb.fillCircle(pinHeadX - 2 * cam.zoom, pinHeadY - 2 * cam.zoom, Math.round(3 * cam.zoom), [255, 255, 255, 255]);
       }
     } else if (kind === "boxer_rope") {
-      // 弹力拳击手：银白螺旋弹簧连接的双联重型红金拳击手套
-      const jab = Math.sin(tNow * 18) * 14 * cam.zoom;
+      // 弹力拳击手 V4.0：与物理射程 100% 同步、随进化越伸越长且拳头越打越巨化的「百米伸缩弹簧冠军重拳」！
+      const reachWorldBase = 92 + v.rageStacks * 16;
+      const gRad = Math.round((24 + v.rageStacks * 2.2) * cam.zoom);
+      const jabWorld = Math.sin(tNow * 18) * 18;
       for (const sideS of [-1, 1]) {
-        const rootX = sx + aimX * orbR * 0.72 + aimPerpX * sideS * orbR * 0.48;
-        const rootY = sy + aimY * orbR * 0.72 + aimPerpY * sideS * orbR * 0.48;
-        const reach = orbR * 1.22 + (sideS > 0 ? jab : -jab);
-        const gx = sx + aimX * reach + aimPerpX * sideS * orbR * 0.50;
-        const gy = sy + aimY * reach + aimPerpY * sideS * orbR * 0.50;
-        // 3段金属折线弹簧臂
-        const mid1X = rootX + (gx - rootX) * 0.33 + aimPerpX * 8 * cam.zoom;
-        const mid1Y = rootY + (gy - rootY) * 0.33 + aimPerpY * 8 * cam.zoom;
-        const mid2X = rootX + (gx - rootX) * 0.66 - aimPerpX * 8 * cam.zoom;
-        const mid2Y = rootY + (gy - rootY) * 0.66 - aimPerpY * 8 * cam.zoom;
-        fb.drawLine(rootX, rootY, mid1X, mid1Y, Math.max(3, Math.round(5 * cam.zoom)), [215, 228, 245, 255]);
-        fb.drawLine(mid1X, mid1Y, mid2X, mid2Y, Math.max(3, Math.round(5 * cam.zoom)), [215, 228, 245, 255]);
-        fb.drawLine(mid2X, mid2Y, gx, gy, Math.max(3, Math.round(5 * cam.zoom)), [215, 228, 245, 255]);
-        // 冠军红金拳击手套
-        fb.drawGlowCircle(gx, gy, Math.round(28 * cam.zoom), [255, 62, 48, 185]);
-        fb.fillCircle(gx, gy, Math.round(22 * cam.zoom), [242, 34, 46, 255]);
-        fb.strokeRing(gx, gy, Math.round(22 * cam.zoom), 3, [255, 218, 58, 255]);
-        fb.fillCircle(gx + aimX * 4 * cam.zoom, gy + aimY * 4 * cam.zoom, Math.round(7 * cam.zoom), [255, 195, 195, 235]);
+        const rootX = sx + aimX * orbR * 0.72 + aimPerpX * sideS * orbR * 0.50;
+        const rootY = sy + aimY * orbR * 0.72 + aimPerpY * sideS * orbR * 0.50;
+        const rWorld = reachWorldBase + (sideS > 0 ? jabWorld : -jabWorld);
+        const [gxBase, gyBase] = worldToScreen(visX[v.id] + aimX * rWorld, visY[v.id] + aimY * rWorld, cam, shx, shy);
+        const gx = gxBase + aimPerpX * sideS * orbR * 0.52;
+        const gy = gyBase + aimPerpY * sideS * orbR * 0.52;
+
+        // 4段高张力精钢折线弹簧臂
+        const zig = 11 * cam.zoom;
+        const m1x = rootX + (gx - rootX) * 0.25 + aimPerpX * zig;
+        const m1y = rootY + (gy - rootY) * 0.25 + aimPerpY * zig;
+        const m2x = rootX + (gx - rootX) * 0.50 - aimPerpX * zig;
+        const m2y = rootY + (gy - rootY) * 0.50 - aimPerpY * zig;
+        const m3x = rootX + (gx - rootX) * 0.75 + aimPerpX * zig;
+        const m3y = rootY + (gy - rootY) * 0.75 + aimPerpY * zig;
+        const coilW = Math.max(4, Math.round(6 * cam.zoom));
+        fb.drawLine(rootX, rootY, m1x, m1y, coilW, [215, 228, 245, 255]);
+        fb.drawLine(m1x, m1y, m2x, m2y, coilW, [215, 228, 245, 255]);
+        fb.drawLine(m2x, m2y, m3x, m3y, coilW, [215, 228, 245, 255]);
+        fb.drawLine(m3x, m3y, gx, gy, coilW, [215, 228, 245, 255]);
+
+        // 越战越巨大的冠军红金重拳手套
+        fb.drawGlowCircle(gx, gy, Math.round(gRad * 1.42), [255, 62, 48, 195]);
+        fb.fillCircle(gx, gy, gRad, [242, 34, 46, 255]);
+        fb.strokeRing(gx, gy, gRad, Math.max(3, Math.round(4 * cam.zoom)), [255, 218, 58, 255]);
+        fb.fillCircle(gx + aimX * 5 * cam.zoom, gy + aimY * 5 * cam.zoom, Math.round(gRad * 0.32), [255, 195, 195, 235]);
       }
     }
 
@@ -1976,6 +2324,7 @@ export async function renderDuel(
     alpha: number,
     tNow: number,
     isDead = false,
+    colorHex = "#22e878",
   ) => {
     const a255 = Math.round(255 * alpha);
     const dir = facing >= 0 ? 1 : -1;
@@ -2213,43 +2562,105 @@ export async function renderDuel(
       }
       fb.drawLine(sx + dir * orbR * 0.24, my + mh * 0.5, sx + dir * orbR * 0.54, my + mh * 0.2, 6, [138, 76, 36, a255]);
       fb.fillCircle(sx + dir * orbR * 0.56, my + mh * 0.18, Math.max(2, Math.round(orbR * 0.06)), [255, 96, 24, a255]);
-    } else if (kind === "angler_reel") {
-      // 深海垂钓王：深蓝船长海钓帽（饰金鱼钩徽章）+ 浓密海狼络腮胡 + 独眼龙黑眼罩 + 叼木烟斗
-      fb.fillCircle(sx, sy, Math.round(orbR * 0.80), [245, 206, 170, a255]);
-      // 灰蓝海狼大胡子包覆下巴
-      fb.drawArc(sx, sy + orbR * 0.06, orbR * 0.58, Math.max(8, Math.round(orbR * 0.28)), 0.2, Math.PI - 0.2, [42, 68, 92, a255]);
-      // 深蓝防水渔夫帽 + 金色帽带与鱼钩徽章
-      fb.fillRoundRect(sx - Math.round(orbR * 0.66), sy - Math.round(orbR * 0.68), Math.round(orbR * 1.32), Math.round(orbR * 0.42), 14, [16, 118, 188, a255]);
-      fb.drawLine(sx - orbR * 0.72, sy - orbR * 0.26, sx + orbR * 0.72, sy - orbR * 0.26, 5, [255, 208, 58, a255]);
-      // 左眼海盗独眼黑眼罩（带斜向绑带与刀疤）+ 右眼深海金瞳
-      fb.drawLine(sx - orbR * 0.56, sy - orbR * 0.22, sx + orbR * 0.18, sy + orbR * 0.08, 3, [22, 20, 28, a255]);
-      fb.fillCircle(sx - orbR * 0.26, sy - orbR * 0.04, Math.round(orbR * 0.17), [20, 18, 26, a255]);
-      fb.strokeRing(sx - orbR * 0.26, sy - orbR * 0.04, Math.round(orbR * 0.17), 2, [255, 208, 68, a255]);
-      fb.fillCircle(sx + orbR * 0.26, sy - orbR * 0.04, Math.round(orbR * 0.14), [24, 22, 32, a255]);
-      fb.fillCircle(sx + orbR * 0.26, sy - orbR * 0.04, Math.round(orbR * 0.09), [58, 238, 255, a255]);
-      fb.fillCircle(sx + orbR * 0.28, sy - orbR * 0.06, Math.max(2, Math.round(orbR * 0.04)), [255, 255, 255, a255]);
-      // 自信海盗坏笑 + 嘴角木烟斗
-      fb.drawArc(sx, sy + orbR * 0.16, orbR * 0.22, 4, 0.2, Math.PI - 0.2, [255, 245, 225, a255]);
-      fb.drawLine(sx + orbR * 0.18, sy + orbR * 0.22, sx + orbR * 0.48, sy + orbR * 0.12, 5, [142, 72, 28, a255]);
-      fb.fillCircle(sx + orbR * 0.50, sy + orbR * 0.08, Math.round(orbR * 0.09), [112, 52, 20, a255]);
-    } else if (kind === "courier_box") {
-      // 外卖闪电侠：亮黄防风头盔 + 双侧闪电翼耳 + 赛博蓝HUD测速护目镜 + 耳机麦克风
-      fb.fillCircle(sx, sy, Math.round(orbR * 0.82), [255, 208, 18, a255]);
+    } else if (kind === "snake_tail") {
+      // 吞天贪吃蛇：支持森绿眼镜王蛇头 / 赤金炎蟒头自适应高对比度配色 + 额顶黄金菱形王冠鳞纹 + 竖瞳熔金毒蛇眼
+      const isCrimson = parseInt(colorHex.slice(1, 3), 16) > 200 && parseInt(colorHex.slice(3, 5), 16) < 120;
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.84), isCrimson ? [142, 18, 34, a255] : [18, 152, 68, a255]);
+      fb.fillCircle(sx, sy - Math.round(orbR * 0.06), Math.round(orbR * 0.72), isCrimson ? [238, 52, 68, a255] : [36, 224, 106, a255]);
+      // 额顶黄金菱形王冠鳞
+      fb.fillRotatedRect(sx, sy - orbR * 0.42, Math.round(orbR * 0.30), Math.round(orbR * 0.30), Math.PI * 0.25, [255, 214, 48, a255]);
+      fb.fillRotatedRect(sx, sy - orbR * 0.42, Math.round(orbR * 0.14), Math.round(orbR * 0.14), Math.PI * 0.25, isCrimson ? [98, 12, 24, a255] : [18, 78, 36, a255]);
+      // 凶悍斜挑熔金蛇瞳 + 黑色针状竖瞳
       for (const es of [-1, 1]) {
-        fb.fillRotatedRect(sx + es * orbR * 0.52, sy - orbR * 0.48, Math.round(orbR * 0.32), Math.round(orbR * 0.14), es * 0.52, [255, 238, 68, a255]);
+        const ex = sx + es * orbR * 0.30 + dir * 2;
+        const ey = sy - orbR * 0.05;
+        fb.fillRotatedEllipse(ex, ey, Math.round(orbR * 0.22), Math.round(orbR * 0.14), es * 0.32, [255, 218, 38, a255]);
+        fb.strokeRing(ex, ey, Math.round(orbR * 0.16), 2, [12, 54, 24, a255]);
+        fb.fillRotatedRect(ex + dir * 2, ey, Math.max(3, Math.round(orbR * 0.06)), Math.round(orbR * 0.22), 0, [14, 12, 18, a255]);
+        fb.fillCircle(ex - es * 3, ey - 3, Math.max(2, Math.round(orbR * 0.04)), [255, 255, 255, a255]);
       }
-      // 下半脸肤色与元气笑容
-      fb.fillRoundRect(sx - Math.round(orbR * 0.46), sy - Math.round(orbR * 0.04), Math.round(orbR * 0.92), Math.round(orbR * 0.50), 12, [255, 224, 192, a255]);
-      // 赛博蓝防风护目镜 + 亮青速度箭头反光
-      fb.fillRoundRect(sx - Math.round(orbR * 0.56), sy - Math.round(orbR * 0.24), Math.round(orbR * 1.12), Math.round(orbR * 0.32), 10, [16, 96, 238, a255]);
-      fb.strokeRoundRect(sx - Math.round(orbR * 0.56), sy - Math.round(orbR * 0.24), Math.round(orbR * 1.12), Math.round(orbR * 0.32), 10, 3, [255, 255, 255, a255]);
+      // 裂口与两枚锋利雪白毒牙
+      fb.drawArc(sx, sy + orbR * 0.18, orbR * 0.32, 4, 0.18, Math.PI - 0.18, [12, 58, 28, a255]);
+      for (const fs of [-1, 1]) {
+        const fx1 = sx + fs * orbR * 0.20;
+        const fy1 = sy + orbR * 0.24;
+        fb.drawLine(fx1, fy1, fx1 + fs * 2, fy1 + orbR * 0.20, Math.max(3, Math.round(orbR * 0.08)), [250, 255, 250, a255]);
+      }
+    } else if (kind === "slime_split") {
+      // 分裂史莱姆：清澈通透冰蓝果冻史莱姆核心 + 内部悬浮气泡 + 玻璃弧形高光 + 萌凶大眼！
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.86), [22, 168, 238, Math.round(a255 * 0.92)]);
+      fb.fillCircle(sx, sy - Math.round(orbR * 0.05), Math.round(orbR * 0.68), [78, 236, 255, Math.round(a255 * 0.88)]);
+      // 果冻内部悬浮小气泡
+      fb.fillCircle(sx - Math.round(orbR * 0.42), sy + Math.round(orbR * 0.28), Math.max(3, Math.round(orbR * 0.10)), [210, 252, 255, Math.round(a255 * 0.82)]);
+      fb.fillCircle(sx + Math.round(orbR * 0.44), sy - Math.round(orbR * 0.26), Math.max(2, Math.round(orbR * 0.07)), [225, 255, 255, Math.round(a255 * 0.85)]);
+      // 左上角弧形果冻玻璃高光带
+      fb.drawArc(
+        sx - orbR * 0.10,
+        sy - orbR * 0.10,
+        orbR * 0.56,
+        Math.max(4, Math.round(orbR * 0.10)),
+        Math.PI * 1.08,
+        Math.PI * 1.54,
+        [255, 255, 255, Math.round(a255 * 0.88)],
+      );
+      // 炯炯有神深海蓝萌凶大眼 + 双星高光 + 战意虎牙嘴
       for (const es of [-1, 1]) {
-        const ex = sx + es * orbR * 0.22 + dir * 3;
-        const ey = sy - orbR * 0.08;
-        fb.fillCircle(ex, ey, Math.round(orbR * 0.08), [118, 248, 255, a255]);
-        fb.fillCircle(ex, ey, Math.max(2, Math.round(orbR * 0.04)), [255, 255, 255, a255]);
+        const ex = sx + es * orbR * 0.26 + dir * 3;
+        const ey = sy - orbR * 0.02;
+        fb.fillRotatedEllipse(ex, ey, Math.round(orbR * 0.14), Math.round(orbR * 0.19), 0, [14, 26, 54, a255]);
+        fb.fillCircle(ex - 2, ey - Math.round(orbR * 0.06), Math.max(2, Math.round(orbR * 0.055)), [255, 255, 255, a255]);
+        // 压低战意挑眉
+        fb.drawLine(
+          ex - es * orbR * 0.14,
+          ey - orbR * 0.22,
+          ex + es * orbR * 0.10,
+          ey - orbR * 0.15,
+          Math.max(3, Math.round(orbR * 0.06)),
+          [14, 32, 68, a255],
+        );
       }
-      fb.drawArc(sx + dir * 3, sy + orbR * 0.20, orbR * 0.22, 4, 0.2, Math.PI - 0.2, [228, 48, 38, a255]);
+      fb.drawArc(sx + dir * 2, sy + orbR * 0.20, orbR * 0.16, 4, 0.15, Math.PI - 0.15, [14, 28, 58, a255]);
+    } else if (kind === "time_stop") {
+      // 时停钟表王：皇家黑金古典钟盘面甲 + 12道黄金刻度 + 实时旋转时针/分针 + 时空青光护目瞳！
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.84), [22, 18, 38, a255]);
+      fb.strokeRing(sx, sy, Math.round(orbR * 0.78), Math.max(3, Math.round(orbR * 0.07)), [255, 208, 52, a255]);
+      // 12 道古典黄金表盘刻度
+      for (let hIdx = 0; hIdx < 12; hIdx++) {
+        const ha = (hIdx * Math.PI) / 6;
+        const inner = hIdx % 3 === 0 ? 0.58 : 0.66;
+        const x1 = sx + Math.cos(ha) * orbR * inner;
+        const y1 = sy + Math.sin(ha) * orbR * inner;
+        const x2 = sx + Math.cos(ha) * orbR * 0.76;
+        const y2 = sy + Math.sin(ha) * orbR * 0.76;
+        fb.drawLine(x1, y1, x2, y2, hIdx % 3 === 0 ? 4 : 2, [255, 226, 98, a255]);
+      }
+      // 实时飞转的黄金分针与时针
+      const minAng = tNow * 4.8 - Math.PI * 0.5;
+      const hrAng = tNow * 0.9 - Math.PI * 0.2;
+      fb.drawLine(
+        sx,
+        sy,
+        sx + Math.cos(minAng) * orbR * 0.54,
+        sy + Math.sin(minAng) * orbR * 0.54,
+        Math.max(3, Math.round(orbR * 0.06)),
+        [255, 238, 118, a255],
+      );
+      fb.drawLine(
+        sx,
+        sy,
+        sx + Math.cos(hrAng) * orbR * 0.36,
+        sy + Math.sin(hrAng) * orbR * 0.36,
+        Math.max(4, Math.round(orbR * 0.08)),
+        [255, 188, 38, a255],
+      );
+      // 钟表王冷酷发光青金双瞳
+      for (const es of [-1, 1]) {
+        const ex = sx + es * orbR * 0.26 + dir * 2;
+        const ey = sy + orbR * 0.04;
+        fb.fillRotatedRect(ex, ey, Math.round(orbR * 0.22), Math.round(orbR * 0.11), -es * 0.18, [68, 248, 255, a255]);
+        fb.fillCircle(ex, ey, Math.max(2, Math.round(orbR * 0.045)), [255, 255, 255, a255]);
+      }
+      fb.fillCircle(sx, sy, Math.max(4, Math.round(orbR * 0.09)), [255, 224, 78, a255]);
     } else if (kind === "billiard_bank") {
       // 赛博台球手：高光黑8球壳 + 额头白底「8」字圆章 + 赛博翡翠激光瞄准护目镜
       fb.fillCircle(sx, sy, Math.round(orbR * 0.82), [16, 18, 26, a255]);
@@ -2430,8 +2841,124 @@ export async function renderDuel(
     }
   };
 
-  // ---------- 1. 极简顶部 HUD (Y: 0..335)：纯粹保留双方英雄名称、血量条与当前属性栏，零文字解说干扰 ----------
-  const drawMinimalTopHud = (fb: FrameBuf, _tb: number, tNow: number) => {
+  // ---------- 武器球 2.0 专属高精度矢量战神面孔（告别 3.4x 模糊像素小人马赛克） ----------
+  const drawWeaponBallAvatar = (
+    fb: FrameBuf,
+    weaponKind: WeaponKind,
+    scaleKind: ScaleKind,
+    sx: number,
+    sy: number,
+    orbR: number,
+    facing: number,
+    isHit: boolean,
+    alpha: number,
+    tNow: number,
+    isDead = false,
+  ) => {
+    const a255 = Math.round(255 * alpha);
+    const dir = facing >= 0 ? 1 : -1;
+
+    if (weaponKind === "greatsword") {
+      // 四十米大刀：玄铁武士底盘 + 猩红钵卷战巾（镶黄金剑徽）+ 凌厉金芒剑客双眼 + 狂傲战意嘴角
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.80), [36, 16, 26, a255]);
+      fb.fillRoundRect(sx - Math.round(orbR * 0.68), sy - Math.round(orbR * 0.48), Math.round(orbR * 1.36), Math.round(orbR * 0.26), 8, [235, 32, 64, a255]);
+      fb.fillRoundRect(sx - Math.round(orbR * 0.22), sy - Math.round(orbR * 0.45), Math.round(orbR * 0.44), Math.round(orbR * 0.20), 5, [255, 214, 68, a255]);
+      for (const es of [-1, 1]) {
+        const ex = sx + es * orbR * 0.28 + dir * 3;
+        const ey = sy - orbR * 0.02;
+        fb.fillRotatedEllipse(ex, ey, Math.round(orbR * 0.18), Math.round(orbR * 0.10), es * 0.26, [255, 236, 98, a255]);
+        fb.fillCircle(ex + dir * 2, ey, Math.max(3, Math.round(orbR * 0.06)), [255, 255, 255, a255]);
+        fb.drawLine(ex - es * orbR * 0.18, ey - orbR * 0.14, ex + es * orbR * 0.18, ey - orbR * 0.06, 4, [255, 72, 92, a255]);
+      }
+      fb.drawArc(sx + dir * 4, sy + orbR * 0.16, Math.round(orbR * 0.22), 4, 0.2, Math.PI - 0.35, [255, 236, 195, a255]);
+    } else if (scaleKind === "multiweapon") {
+      // 千刃绞肉机：暗影机关面甲 + 额头黄金十字飞镖徽记 + 翠绿战术激光双瞳
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.80), [16, 28, 24, a255]);
+      // 下半脸黑色战术忍者面罩
+      fb.fillRoundRect(sx - Math.round(orbR * 0.62), sy + Math.round(orbR * 0.06), Math.round(orbR * 1.24), Math.round(orbR * 0.46), 12, [12, 18, 22, a255]);
+      fb.drawLine(sx - orbR * 0.48, sy + orbR * 0.10, sx + orbR * 0.48, sy + orbR * 0.10, 3, [46, 255, 162, a255]);
+      // 额头护额 + 黄金手里剑徽章
+      fb.fillRoundRect(sx - Math.round(orbR * 0.58), sy - Math.round(orbR * 0.50), Math.round(orbR * 1.16), Math.round(orbR * 0.22), 6, [28, 46, 42, a255]);
+      const embY = sy - Math.round(orbR * 0.39);
+      fb.fillRotatedRect(sx, embY, Math.round(orbR * 0.22), Math.round(orbR * 0.08), tNow * 6, [255, 224, 78, a255]);
+      fb.fillRotatedRect(sx, embY, Math.round(orbR * 0.22), Math.round(orbR * 0.08), tNow * 6 + Math.PI * 0.5, [255, 224, 78, a255]);
+      for (const es of [-1, 1]) {
+        const ex = sx + es * orbR * 0.27 + dir * 3;
+        const ey = sy - orbR * 0.08;
+        fb.fillRotatedEllipse(ex, ey, Math.round(orbR * 0.19), Math.round(orbR * 0.09), es * 0.22, [46, 255, 158, a255]);
+        fb.fillCircle(ex, ey, Math.max(2, Math.round(orbR * 0.05)), [235, 255, 245, a255]);
+      }
+    } else if (weaponKind === "twinblade") {
+      // 超音速双锯 / 烈焰风火轮：超音速防风护目镜 + 冰青/炽金电弧双瞳 + 极速狂飙锯齿笑
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.80), [16, 26, 44, a255]);
+      // 额头超音速银蓝护目镜框
+      for (const es of [-1, 1]) {
+        const gx = sx + es * orbR * 0.26;
+        const gy = sy - orbR * 0.42;
+        fb.fillCircle(gx, gy, Math.round(orbR * 0.18), [32, 232, 255, a255]);
+        fb.strokeRing(gx, gy, Math.round(orbR * 0.18), 3, [235, 248, 255, a255]);
+      }
+      for (const es of [-1, 1]) {
+        const ex = sx + es * orbR * 0.27 + dir * 3;
+        const ey = sy - orbR * 0.03;
+        fb.fillCircle(ex, ey, Math.round(orbR * 0.15), [42, 242, 255, a255]);
+        fb.fillCircle(ex, ey, Math.round(orbR * 0.07), [255, 255, 255, a255]);
+      }
+      fb.fillRoundRect(sx - Math.round(orbR * 0.30), sy + Math.round(orbR * 0.20), Math.round(orbR * 0.60), Math.round(orbR * 0.16), 6, [242, 252, 255, a255]);
+      for (let i = -1; i <= 1; i++) {
+        fb.drawLine(sx + i * orbR * 0.14, sy + orbR * 0.20, sx + i * orbR * 0.14, sy + orbR * 0.36, 2, [18, 32, 54, a255]);
+      }
+    } else if (weaponKind === "hammer") {
+      // 百吨破墙锤：黄金双角重装霸王战盔 + T字鼻梁重甲 + 怒目金瞳
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.80), [42, 28, 14, a255]);
+      // 战盔上半罩与鼻梁护甲
+      fb.fillRoundRect(sx - Math.round(orbR * 0.64), sy - Math.round(orbR * 0.54), Math.round(orbR * 1.28), Math.round(orbR * 0.34), 10, [242, 184, 38, a255]);
+      fb.fillRoundRect(sx - Math.round(orbR * 0.09), sy - Math.round(orbR * 0.26), Math.round(orbR * 0.18), Math.round(orbR * 0.36), 4, [242, 184, 38, a255]);
+      // 两侧威猛上扬黄金战角
+      for (const es of [-1, 1]) {
+        fb.drawLine(sx + es * orbR * 0.52, sy - orbR * 0.38, sx + es * orbR * 0.82, sy - orbR * 0.72, Math.max(5, Math.round(orbR * 0.14)), [255, 232, 118, a255]);
+        const ex = sx + es * orbR * 0.30 + dir * 2;
+        const ey = sy - orbR * 0.04;
+        fb.fillRotatedEllipse(ex, ey, Math.round(orbR * 0.16), Math.round(orbR * 0.10), es * 0.25, [255, 238, 92, a255]);
+        fb.fillCircle(ex, ey, Math.max(2, Math.round(orbR * 0.05)), [255, 255, 255, a255]);
+      }
+      fb.fillRoundRect(sx - Math.round(orbR * 0.28), sy + Math.round(orbR * 0.24), Math.round(orbR * 0.56), Math.round(orbR * 0.12), 4, [255, 224, 132, a255]);
+    } else {
+      // 狂化断头斧 · 噬魂巨镰：暗紫死神兜帽阴影 + 猩红幽冥双瞳 + 獠牙冷笑
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.80), [24, 12, 34, a255]);
+      fb.drawArc(sx, sy, Math.round(orbR * 0.68), Math.max(6, Math.round(orbR * 0.20)), Math.PI + 0.3, Math.PI * 2 - 0.3, [98, 28, 128, a255]);
+      for (const es of [-1, 1]) {
+        const ex = sx + es * orbR * 0.27 + dir * 3;
+        const ey = sy - orbR * 0.04;
+        fb.fillCircle(ex, ey, Math.round(orbR * 0.15), [255, 42, 98, a255]);
+        fb.fillCircle(ex, ey, Math.round(orbR * 0.06), [255, 240, 215, a255]);
+      }
+      fb.drawArc(sx, sy + orbR * 0.16, Math.round(orbR * 0.26), 4, 0.25, Math.PI - 0.25, [245, 195, 235, a255]);
+    }
+
+    if (isHit && !isDead) {
+      fb.strokeRing(sx, sy, Math.round(orbR * 0.78), 4, [255, 255, 255, Math.round(210 * alpha)]);
+    }
+
+    // 败方被绝杀 K.O. 后的眩晕叉叉眼 (X_X) 与张口击飞表情覆盖层
+    if (isDead) {
+      for (const es of [-1, 1]) {
+        const ex = sx + es * orbR * 0.27;
+        const ey = sy - orbR * 0.06;
+        const xr = Math.round(orbR * 0.16);
+        fb.fillCircle(ex, ey, Math.round(orbR * 0.20), [18, 14, 28, a255]);
+        fb.drawLine(ex - xr, ey - xr, ex + xr, ey + xr, 5, [255, 68, 82, a255]);
+        fb.drawLine(ex - xr, ey + xr, ex + xr, ey - xr, 5, [255, 68, 82, a255]);
+        fb.drawLine(ex - xr * 0.85, ey - xr * 0.85, ex + xr * 0.85, ey + xr * 0.85, 2, [255, 245, 210, a255]);
+        fb.drawLine(ex - xr * 0.85, ey + xr * 0.85, ex + xr * 0.85, ey - xr * 0.85, 2, [255, 245, 210, a255]);
+      }
+      fb.fillCircle(sx, sy + Math.round(orbR * 0.25), Math.round(orbR * 0.14), [18, 12, 24, a255]);
+      fb.strokeRing(sx, sy + Math.round(orbR * 0.25), Math.round(orbR * 0.14), 3, [255, 224, 110, a255]);
+    }
+  };
+
+  // ---------- 1. 极简顶部 HUD (Y: 0..335)：双方英雄名称、血量条、成长栏 + 开局4.6s轻量冲突钩子胶囊 ----------
+  const drawMinimalTopHud = (fb: FrameBuf, tb: number, tNow: number) => {
     fb.blendGradientRect(0, 0, W, 336, [8, 7, 16, 245], [12, 10, 24, 180], true);
 
     for (const id of ["A", "B"] as Side[]) {
@@ -2512,7 +3039,20 @@ export async function renderDuel(
       const textPulse = 1 + 0.14 * Math.sin(v.statPulse * Math.PI);
       const evoY = 198;
       const evoH = 48;
-      const evoFrac = clamp(0.18 + (v.rageStacks / 12) * 0.82, 0.18, 1);
+      const evoFrac =
+        v.combatMode !== "skillball"
+          ? v.scaleKind === "multiweapon"
+            ? clamp(v.bladeCount / 12, 0.25, 1)
+            : clamp(0.16 + (v.rageStacks / 10) * 0.84, 0.16, 1)
+          : v.ballSkillKind === "time_stop"
+            ? v.statLabel === "时间静止"
+              ? 1
+              : clamp(v.punchCharge / 100, 0.12, 1)
+            : v.ballSkillKind === "snake_tail"
+              ? clamp((activeProps[v.id].filter(p => p.kind === "snake_seg").length + 1) / 22, 0.22, 1)
+              : v.ballSkillKind === "slime_split"
+                ? clamp((activeProps[v.id].filter(p => p.kind === "slime_clone").length + 1) / 8, 0.18, 1)
+                : clamp(0.18 + (v.rageStacks / 12) * 0.82, 0.18, 1);
 
       const borderCol: RGBA = isPulsing ? [255, 232, 98, 255] : [Math.min(255, r + 55), Math.min(255, g + 55), Math.min(255, b + 55), 225];
       fb.fillRoundRect(barX - 2, evoY - 2, barW + 4, evoH + 4, 12, borderCol);
@@ -2560,6 +3100,34 @@ export async function renderDuel(
     });
     drawFit(fb, atlasBig, "VS", cx, 148, [255, 226, 98, 255], 92, 0.46, "center", 3);
     drawFit(fb, atlas, `对决 ${totalClashes}`, cx, 204, [235, 232, 255, 245], 98, 0.30, "center", 2);
+
+    // 开局黄金前4.6秒冲突悬念钩子胶囊（位于血条下方与擂台上沿之间的纯净安全带 Y: 264..324，绝不遮挡战场）
+    if (tb < 4.6) {
+      const fadeOut = tb > 3.9 ? clamp((4.6 - tb) / 0.7, 0, 1) : 1;
+      const hookStr = hookText ?? `${byId.A.title} VS ${byId.B.title}，谁能活到最后？`;
+      fb.drawCard(48, 264, W - 96, 58, {
+        bgTop: [24, 19, 46, Math.round(238 * fadeOut)],
+        bgBottom: [14, 11, 28, Math.round(244 * fadeOut)],
+        border: [255, 216, 82, Math.round(228 * fadeOut)],
+        borderWidth: 2,
+        radius: 16,
+        shadowAlpha: Math.round(90 * fadeOut),
+        shadowOffsetY: 4,
+      });
+      drawFit(
+        fb,
+        atlas,
+        `★ ${hookStr} ★`,
+        cx,
+        276,
+        [255, 242, 158, Math.round(255 * fadeOut)],
+        W - 136,
+        0.40,
+        "center",
+        2,
+        [10, 8, 22, Math.round(245 * fadeOut)],
+      );
+    }
   };
 
   // ---------- 2. 全屏巨型竖屏竞技场 (Y: 350..1550) ----------
@@ -2634,16 +3202,17 @@ export async function renderDuel(
         const disp = pluckAmp * env + harmonic;
         const px1 = x1 + dx * u + nx * disp;
         const py1 = y1 + dy * u + ny * disp;
-        // 翠绿高张力毒液丝线 + 纯白蛛丝内芯
-        fb.drawLine(px0, py0, px1, py1, Math.max(3, Math.round((isVibrating ? 8 : 5) * cam.zoom)), [36, 238, 138, isVibrating ? 245 : 150]);
-        fb.drawLine(px0, py0, px1, py1, Math.max(2, Math.round(2 * cam.zoom)), [230, 255, 240, 225]);
+        // 翠绿高张力激光毒液粗索 + 纯白蛛丝内芯（V4.0 高清加粗高饱和，手机竖屏一眼锁定！）
+        fb.drawLine(px0, py0, px1, py1, Math.max(5, Math.round((isVibrating ? 13 : 8) * cam.zoom)), [36, 248, 142, isVibrating ? 252 : 218]);
+        fb.drawLine(px0, py0, px1, py1, Math.max(2, Math.round(3 * cam.zoom)), [235, 255, 244, 240]);
         px0 = px1;
         py0 = py1;
       }
 
-      // 两端蛛网极简锚点小圆点
+      // 两端蛛网高亮翡翠锚点
       for (const [axp, ayp] of [[x1, y1], [x2, y2]]) {
-        fb.fillCircle(axp, ayp, Math.round(5 * cam.zoom), [185, 255, 220, 225]);
+        fb.fillCircle(axp, ayp, Math.round(7 * cam.zoom), [46, 255, 152, 238]);
+        fb.fillCircle(axp, ayp, Math.round(3 * cam.zoom), [255, 255, 255, 250]);
       }
     }
 
@@ -2657,8 +3226,8 @@ export async function renderDuel(
       const mx = (x1 + x2) * 0.5;
       const my = (y1 + y2) * 0.5;
       const alpha = Math.round(230 * (1 - k));
-      fb.drawLine(x1, y1, mx + (x1 - mx) * k, my + (y1 - my) * k, 4, [180, 255, 215, alpha]);
-      fb.drawLine(x2, y2, mx + (x2 - mx) * k, my + (y2 - my) * k, 4, [180, 255, 215, alpha]);
+      fb.drawLine(x1, y1, mx + (x1 - mx) * k, my + (y1 - my) * k, 5, [180, 255, 215, alpha]);
+      fb.drawLine(x2, y2, mx + (x2 - mx) * k, my + (y2 - my) * k, 5, [180, 255, 215, alpha]);
     }
 
     // 辅助函数：检测某坐标处的召唤物是否在最近 0.28s 内刚刚触发了攻击，若是则给予 1.38x Hit-Pop 弹跳放大与高亮金白脉冲环！
@@ -2675,7 +3244,7 @@ export async function renderDuel(
       return best;
     };
 
-    // ---------- Skill-Ball 场地机制 2：广场舞老太召唤的伴舞大妈分身球 ----------
+    // ---------- Skill-Ball 场地机制 2：广场舞老太召唤的伴舞大妈分身球（V4.0 放大且 0 头顶文字杂音！） ----------
     for (const side of ["A", "B"] as Side[]) {
       const clones = activeClones[side];
       if (!clones || clones.length === 0) continue;
@@ -2686,14 +3255,14 @@ export async function renderDuel(
       for (const c of clones) {
         const [cxp, cyp] = worldToScreen(c.x, c.y, cam, shx, shy);
         const hitPop = getSummonHitPop(c.x, c.y);
-        const cR = Math.round(32 * (1 + 0.36 * hitPop) * cam.zoom);
+        const cR = Math.round((36 + owner.rageStacks * 0.8) * (1 + 0.36 * hitPop) * cam.zoom);
         if (hitPop > 0) {
           fb.strokeRing(cxp, cyp, Math.round(cR * 1.25), 4, [255, 248, 152, Math.round(250 * hitPop)]);
         }
         fb.fillRotatedEllipse(cxp, cyp + cR * 0.72, cR * 0.9, Math.round(11 * cam.zoom), 0, [0, 0, 0, 130]);
-        fb.drawGlowCircle(cxp, cyp, Math.round(cR * 1.45), [r, g, b, 110]);
-        fb.fillCircle(cxp, cyp, cR, [r2, g2, b2, 225]);
-        fb.fillCircle(cxp, cyp, Math.round(cR * 0.84), [20, 16, 36, 240]);
+        fb.drawGlowCircle(cxp, cyp, Math.round(cR * 1.45), [r, g, b, 118]);
+        fb.fillCircle(cxp, cyp, cR, [r2, g2, b2, 228]);
+        fb.fillCircle(cxp, cyp, Math.round(cR * 0.84), [20, 16, 36, 242]);
         fb.strokeRing(cxp, cyp, cR, Math.max(3, Math.round(4 * cam.zoom)), [34, 238, 255, 250]);
         const col = Math.floor(tNow * 12 + c.id) % 4;
         if (owner.combatMode === "skillball") {
@@ -2706,129 +3275,152 @@ export async function renderDuel(
             outlinePx: 1,
           });
         }
-        drawFit(fb, atlas, "伴舞", cxp, cyp - cR - Math.round(22 * cam.zoom), [255, 238, 128, 245], 90, 0.28, "center", 2);
       }
     }
 
-    // ---------- Skill-Ball 场地机制 3：暗影忍者王发射的满场高速旋转手里剑 ----------
+    // ---------- Skill-Ball 场地机制 3：暗影忍者王发射的越旋越巨大的「风魔手里剑」（32px -> 60px，直径120px满屏飞剑！） ----------
     for (const side of ["A", "B"] as Side[]) {
       const shurikens = activeShurikens[side];
       if (!shurikens || shurikens.length === 0) continue;
+      const owner = byId[side];
       for (const s of shurikens) {
         const [sxp, syp] = worldToScreen(s.x, s.y, cam, shx, shy);
         const hitPop = getSummonHitPop(s.x, s.y);
-        const sR = Math.round(30 * (1 + 0.36 * hitPop) * cam.zoom);
+        const sR = Math.round((32 + owner.rageStacks * 2.4) * (1 + 0.34 * hitPop) * cam.zoom);
         if (hitPop > 0) {
           fb.strokeRing(sxp, syp, Math.round(sR * 1.25), 4, [255, 248, 152, Math.round(250 * hitPop)]);
         }
-        fb.drawGlowCircle(sxp, syp, Math.round(sR * 1.45), [195, 78, 255, 135]);
-        // 旋转残影环
-        fb.strokeRing(sxp, syp, Math.round(sR * 0.92), 3, [85, 242, 255, 175]);
-        // 四角寒光金属手里剑十字主刃
+        fb.drawGlowCircle(sxp, syp, Math.round(sR * 1.48), [195, 78, 255, 148]);
+        fb.strokeRing(sxp, syp, Math.round(sR * 0.94), 3, [85, 242, 255, 190]);
         const ang = s.angle + tNow * 18;
-        fb.fillRotatedRect(sxp, syp, Math.round(sR * 2.05), Math.round(11 * cam.zoom), ang, [225, 240, 255, 255]);
-        fb.fillRotatedRect(sxp, syp, Math.round(sR * 2.05), Math.round(11 * cam.zoom), ang + Math.PI * 0.5, [225, 240, 255, 255]);
-        fb.fillRotatedRect(sxp, syp, Math.round(sR * 1.55), Math.round(6 * cam.zoom), ang + Math.PI * 0.25, [195, 95, 255, 245]);
-        fb.fillRotatedRect(sxp, syp, Math.round(sR * 1.55), Math.round(6 * cam.zoom), ang + Math.PI * 0.75, [195, 95, 255, 245]);
-        // 中心忍者圆孔
-        fb.fillCircle(sxp, syp, Math.round(8 * cam.zoom), [18, 14, 32, 255]);
-        fb.strokeRing(sxp, syp, Math.round(8 * cam.zoom), 2, [255, 224, 92, 255]);
+        const bladeW = Math.max(10, Math.round(sR * 0.32));
+        fb.fillRotatedRect(sxp, syp, Math.round(sR * 2.12), bladeW, ang, [228, 242, 255, 255]);
+        fb.fillRotatedRect(sxp, syp, Math.round(sR * 2.12), bladeW, ang + Math.PI * 0.5, [228, 242, 255, 255]);
+        fb.fillRotatedRect(sxp, syp, Math.round(sR * 1.62), Math.max(6, Math.round(bladeW * 0.58)), ang + Math.PI * 0.25, [198, 95, 255, 248]);
+        fb.fillRotatedRect(sxp, syp, Math.round(sR * 1.62), Math.max(6, Math.round(bladeW * 0.58)), ang + Math.PI * 0.75, [198, 95, 255, 248]);
+        const holeR = Math.max(7, Math.round(sR * 0.22));
+        fb.fillCircle(sxp, syp, holeR, [18, 14, 32, 255]);
+        fb.strokeRing(sxp, syp, holeR, 3, [255, 224, 92, 255]);
       }
     }
 
-    // ---------- Skill-Ball 场地机制 4：12位新英雄二阶段场地机关/道具高精渲染 (activeProps) ----------
+    // ---------- Skill-Ball 场地机制 4：新英雄实体物理召唤体/机关渲染 (activeProps) ----------
     for (const side of ["A", "B"] as Side[]) {
-      const props = activeProps[side];
-      if (!props || props.length === 0) continue;
+      const rawProps = activeProps[side];
+      if (!rawProps || rawProps.length === 0) continue;
+      // 吞天贪吃蛇蛇身按 尾->头 倒序绘制，使越靠近蛇头的鳞甲自然叠压在后一节之上，形成无缝盘绕巨蟒！
+      const props = rawProps.some(item => item.kind === "snake_seg")
+        ? [...rawProps].sort((a, b) => (b.val ?? 0) - (a.val ?? 0))
+        : rawProps;
+      const maxSnakeVal = rawProps.reduce((mx, item) => (item.kind === "snake_seg" ? Math.max(mx, item.val ?? 0) : mx), -1);
       const ownerV = byId[side];
       const [oxp, oyp] = worldToScreen(ownerV.x, ownerV.y, cam, shx, shy);
       for (const p of props) {
         const [px, py] = worldToScreen(p.x, p.y, cam, shx, shy);
         const hitPop = getSummonHitPop(p.x, p.y);
-        const pr = Math.max(8, Math.round(p.r * (1 + 0.36 * hitPop) * cam.zoom));
+        const pr = Math.max(8, Math.round(p.r * (1 + 0.32 * hitPop) * cam.zoom));
         if (hitPop > 0) {
           fb.drawGlowCircle(px, py, Math.round(pr * 1.48), [255, 248, 165, Math.round(165 * hitPop)]);
           fb.strokeRing(px, py, Math.round(pr * 1.18), 4, [255, 250, 175, Math.round(248 * hitPop)]);
         }
-        if (p.kind === "acid_puddle") {
-          // 绝命毒师「强酸毒池」：不规则泼洒腐蚀液滩 + 倾倒碎裂的三角化学烧瓶 + 中心骷髅毒标 + 垂直上升破裂气泡（彻底告别圆形旋转球视觉！）
-          const pulse = 1 + 0.04 * Math.sin(tNow * 6 + p.id);
-          fb.drawGlowCircle(px, py, Math.round(pr * 1.28), [96, 255, 38, 85]);
-          // 1) 不规则扁平多瓣泼洒毒液滩（无圆形硬描边！）
-          fb.fillRotatedEllipse(px, py + 4, Math.round(pr * 1.14 * pulse), Math.round(pr * 0.76 * pulse), (p.id % 3) * 0.35, [18, 118, 38, 165]);
-          const lobeAngles = [0.15, 1.08, 2.05, 3.12, 4.18, 5.25];
-          const lobeDist = [0.78, 0.64, 0.82, 0.74, 0.62, 0.80];
-          const lobeRad = [0.46, 0.38, 0.44, 0.48, 0.36, 0.42];
-          for (let lb = 0; lb < 6; lb++) {
-            const la = lobeAngles[lb] + p.id * 0.9;
-            const lx = px + Math.cos(la) * pr * lobeDist[lb];
-            const ly = py + Math.sin(la) * pr * lobeDist[lb] * 0.78;
-            const lr = Math.round(pr * lobeRad[lb] * pulse);
-            fb.blendCircle(lx, ly, lr, [32, 185, 48, 155]);
-            fb.blendCircle(lx, ly, Math.round(lr * 0.68), [118, 255, 48, 135]);
-          }
-          fb.fillRotatedEllipse(px, py + 2, Math.round(pr * 0.78 * pulse), Math.round(pr * 0.52 * pulse), 0, [132, 255, 52, 148]);
-
-          // 2) 毒池中心醒目的荧光白绿「剧毒骷髅头」警示标志
-          const skX = px + Math.round(pr * 0.10);
-          const skY = py + Math.round(pr * 0.04);
-          const skR = Math.max(10, Math.round(pr * 0.24));
-          // 交叉骨头底衬
-          fb.drawLine(skX - skR * 1.25, skY - skR * 0.85, skX + skR * 1.25, skY + skR * 0.85, Math.max(3, Math.round(4 * cam.zoom)), [215, 255, 168, 210]);
-          fb.drawLine(skX - skR * 1.25, skY + skR * 0.85, skX + skR * 1.25, skY - skR * 0.85, Math.max(3, Math.round(4 * cam.zoom)), [215, 255, 168, 210]);
-          // 骷髅头骨与下颚
-          fb.fillCircle(skX, skY - Math.round(skR * 0.15), skR, [235, 255, 195, 235]);
-          fb.fillRoundRect(skX - Math.round(skR * 0.55), skY + Math.round(skR * 0.35), Math.round(skR * 1.10), Math.round(skR * 0.58), 3, [235, 255, 195, 235]);
-          fb.fillCircle(skX - Math.round(skR * 0.38), skY - Math.round(skR * 0.18), Math.max(2, Math.round(skR * 0.28)), [18, 58, 22, 245]);
-          fb.fillCircle(skX + Math.round(skR * 0.38), skY - Math.round(skR * 0.18), Math.max(2, Math.round(skR * 0.28)), [18, 58, 22, 245]);
-
-          // 3) 毒池左侧倾倒流淌强酸的玻璃化学烧瓶
-          const flX = px - Math.round(pr * 0.52);
-          const flY = py - Math.round(pr * 0.24);
-          fb.fillRotatedRect(flX, flY, Math.round(pr * 0.42), Math.round(pr * 0.34), 0.55, [220, 255, 238, 235]);
-          fb.fillRotatedRect(flX, flY, Math.round(pr * 0.32), Math.round(pr * 0.24), 0.55, [78, 255, 42, 245]);
-          fb.fillRotatedRect(flX + Math.round(pr * 0.20), flY + Math.round(pr * 0.12), Math.round(pr * 0.22), Math.round(pr * 0.14), 0.55, [235, 255, 245, 245]);
-
-          // 4) 垂直向上升腾并破裂的强酸腐蚀气泡（由下往上冒，不再绕圈旋转）
-          const bOffsets = [-0.46, -0.12, 0.24, 0.52];
-          for (let b = 0; b < 4; b++) {
-            const cycle = ((tNow * 1.35 + p.id * 0.41 + b * 0.27) % 1);
-            const bx = px + bOffsets[b] * pr + Math.sin(tNow * 5 + b) * 4;
-            const by = py + pr * 0.22 - cycle * pr * 0.82;
-            const br = Math.max(3, Math.round((1 - cycle * 0.45) * pr * 0.12));
-            if (cycle > 0.82) {
-              fb.strokeRing(bx, by, Math.round(br * 1.4), 2, [225, 255, 168, Math.round(240 * (1 - cycle) * 5)]);
-            } else {
-              fb.fillCircle(bx, by, br, [198, 255, 118, 220]);
-              fb.strokeRing(bx, by, br, 2, [245, 255, 215, 240]);
+        if (p.kind === "snake_seg") {
+          // 吞天贪吃蛇「铰链盘绕巨蟒蛇身」：支持森绿金鳞 / 赤金火鳞自适应高反差配色（杜绝与绿蜘蛛撞色）！
+          const isCrimson = parseInt(ownerV.color.slice(1, 3), 16) > 200 && parseInt(ownerV.color.slice(3, 5), 16) < 120;
+          const segIdx = p.val ?? 0;
+          const isTailTip = segIdx === maxSnakeVal && maxSnakeVal >= 1;
+          const [jxp, jyp] =
+            p.tx !== undefined && p.ty !== undefined
+              ? worldToScreen(p.tx, p.ty, cam, shx, shy)
+              : [oxp, oyp];
+          fb.fillRotatedEllipse(px, py + Math.round(pr * 0.62), Math.round(pr * 0.92), Math.round(10 * cam.zoom), 0, [0, 0, 0, 115]);
+          fb.drawLine(px, py, jxp, jyp, Math.max(8, Math.round(pr * 1.66)), isCrimson ? [112, 16, 28, 255] : [10, 82, 38, 255]);
+          fb.drawLine(px, py, jxp, jyp, Math.max(6, Math.round(pr * 1.34)), isCrimson ? [238, 52, 68, 255] : [26, 208, 96, 255]);
+          if (isTailTip) {
+            const tailDir = (p.angle ?? 0) + Math.PI;
+            for (let rt = 1; rt <= 3; rt++) {
+              const rx = px + Math.cos(tailDir) * pr * (0.42 + rt * 0.34);
+              const ry = py + Math.sin(tailDir) * pr * (0.42 + rt * 0.34);
+              const rr = Math.max(4, Math.round(pr * (0.48 - rt * 0.10)));
+              fb.fillCircle(rx, ry, rr, [255, 206, 42, 255]);
+              fb.strokeRing(rx, ry, rr, 2, [112, 68, 12, 255]);
             }
           }
+          fb.fillCircle(px, py, pr, isCrimson ? [128, 18, 32, 255] : [12, 98, 44, 255]);
+          fb.fillCircle(
+            px,
+            py - 2,
+            Math.round(pr * 0.84),
+            isCrimson
+              ? segIdx % 2 === 0 ? [255, 68, 82, 255] : [224, 42, 58, 255]
+              : segIdx % 2 === 0 ? [38, 238, 114, 255] : [24, 198, 88, 255],
+          );
+          fb.strokeRing(px, py, pr, 3, isCrimson ? [255, 196, 118, 235] : [142, 255, 182, 225]);
+          const sAng = p.angle ?? 0;
+          fb.fillRotatedRect(
+            px,
+            py - 1,
+            Math.round(pr * 0.62),
+            Math.round(pr * 0.42),
+            sAng,
+            segIdx % 2 === 0 ? [255, 218, 56, 245] : isCrimson ? [255, 152, 72, 235] : [188, 255, 126, 225],
+          );
+        } else if (p.kind === "slime_clone") {
+          // 分裂史莱姆分身群：Q弹高频果冻形变 + 通透冰青果冻球体 + 悬浮小气泡 + 弧形玻璃高光 + 战意迷你大眼（0头顶文字！）
+          const wob = Math.sin(tNow * 16 + p.id * 1.9) * 0.13;
+          const mAng = p.angle ?? 0;
+          const rx = Math.round(pr * (1 + wob));
+          const ry = Math.round(pr * (1 - wob * 0.85));
+          fb.fillRotatedEllipse(px, py + Math.round(pr * 0.68), Math.round(pr * 0.88), Math.round(10 * cam.zoom), 0, [0, 0, 0, 125]);
+          fb.drawGlowCircle(px, py, Math.round(pr * 1.36), [36, 220, 255, 125]);
+          fb.fillRotatedEllipse(px, py, rx, ry, mAng * 0.25, [16, 148, 226, 232]);
+          fb.fillRotatedEllipse(px, py - 2, Math.round(rx * 0.82), Math.round(ry * 0.82), mAng * 0.25, [76, 236, 255, 228]);
+          fb.strokeRing(px, py, pr, 3, [195, 252, 255, 240]);
+          // 内部小气泡与左上玻璃弧光
+          fb.fillCircle(px - Math.round(pr * 0.36), py + Math.round(pr * 0.24), Math.max(2, Math.round(pr * 0.12)), [225, 255, 255, 215]);
+          fb.drawArc(
+            px - pr * 0.08,
+            py - pr * 0.08,
+            pr * 0.62,
+            Math.max(3, Math.round(pr * 0.11)),
+            Math.PI * 1.06,
+            Math.PI * 1.52,
+            [255, 255, 255, 235],
+          );
+          // 迷你史莱姆萌凶双瞳
+          const lookDir = Math.cos(mAng) >= 0 ? 1 : -1;
+          for (const es of [-1, 1]) {
+            const ex = px + es * pr * 0.26 + lookDir * 2;
+            const ey = py - pr * 0.02;
+            fb.fillCircle(ex, ey, Math.max(3, Math.round(pr * 0.16)), [14, 26, 54, 255]);
+            fb.fillCircle(ex - 1, ey - 2, Math.max(1, Math.round(pr * 0.06)), [255, 255, 255, 255]);
+          }
+        } else if (p.kind === "acid_puddle") {
+          // 绝命毒师 V4.0「沸腾巨型强酸毒球」：高光立体荧光绿毒液弹球 + 剧毒骷髅核 + 飞溅尾滴（告别死板地滩！）
+          const wob = Math.sin(tNow * 14 + p.id) * 0.08;
+          const mAng = p.angle ?? 0;
+          fb.drawGlowCircle(px, py, Math.round(pr * 1.38), [96, 255, 38, 135]);
+          fb.fillRotatedEllipse(px, py, Math.round(pr * (1 + wob)), Math.round(pr * (1 - wob)), mAng, [18, 138, 42, 238]);
+          fb.fillRotatedEllipse(px, py - 2, Math.round(pr * 0.82), Math.round(pr * 0.82), mAng, [118, 255, 48, 235]);
+          fb.strokeRing(px, py, pr, 3, [215, 255, 158, 245]);
+          const skR = Math.max(9, Math.round(pr * 0.28));
+          fb.fillCircle(px, py - Math.round(skR * 0.14), skR, [242, 255, 205, 245]);
+          fb.fillRoundRect(px - Math.round(skR * 0.52), py + Math.round(skR * 0.34), Math.round(skR * 1.04), Math.round(skR * 0.54), 3, [242, 255, 205, 245]);
+          fb.fillCircle(px - Math.round(skR * 0.38), py - Math.round(skR * 0.16), Math.max(2, Math.round(skR * 0.28)), [16, 54, 22, 255]);
+          fb.fillCircle(px + Math.round(skR * 0.38), py - Math.round(skR * 0.16), Math.max(2, Math.round(skR * 0.28)), [16, 54, 22, 255]);
+          for (let d = 1; d <= 2; d++) {
+            const dx = px - Math.cos(mAng) * pr * (0.92 + d * 0.36);
+            const dy = py - Math.sin(mAng) * pr * (0.92 + d * 0.36);
+            fb.fillCircle(dx, dy, Math.max(3, Math.round(pr * (0.20 - d * 0.05))), [152, 255, 68, 220]);
+          }
         } else if (p.kind === "brick_wall") {
-          // 暴走拆迁队「钢筋红砖墙」：三层交错红砖砌体 + 顶部水泥压梁 + 底部黄黑施工警示墩 + 战损裂纹
           const bw = Math.round(pr * 1.42);
           const bh = Math.round(pr * 0.96);
           fb.fillRoundRect(px - bw - 4, py - bh - 4, bw * 2 + 8, bh * 2 + 8, 9, [32, 18, 12, 245]);
           fb.fillRoundRect(px - bw, py - bh, bw * 2, bh * 2, 7, [214, 78, 32, 252]);
-          // 顶部浅灰混凝土压顶梁 + 底部黄黑工程警示底座
           fb.fillRoundRect(px - bw - 2, py - bh - 4, bw * 2 + 4, Math.round(bh * 0.34), 5, [188, 196, 210, 255]);
           fb.fillRoundRect(px - bw - 2, py + bh - Math.round(bh * 0.28), bw * 2 + 4, Math.round(bh * 0.32), 4, [255, 196, 24, 255]);
-          for (let st = -2; st <= 2; st++) {
-            fb.fillRotatedRect(px + st * bw * 0.38, py + bh - Math.round(bh * 0.12), Math.round(bw * 0.22), Math.round(bh * 0.26), 0.45, [28, 24, 20, 245]);
-          }
-          // 交错水泥砖缝与砖面高光
-          fb.drawLine(px - bw + 4, py - bh * 0.22, px + bw - 4, py - bh * 0.22, 3, [86, 32, 16, 245]);
-          fb.drawLine(px - bw + 4, py + bh * 0.32, px + bw - 4, py + bh * 0.32, 3, [86, 32, 16, 245]);
-          fb.drawLine(px, py - bh * 0.65, px, py - bh * 0.22, 3, [86, 32, 16, 245]);
-          fb.drawLine(px - bw * 0.46, py - bh * 0.22, px - bw * 0.46, py + bh * 0.32, 3, [86, 32, 16, 245]);
-          fb.drawLine(px + bw * 0.46, py - bh * 0.22, px + bw * 0.46, py + bh * 0.32, 3, [86, 32, 16, 245]);
-          fb.drawLine(px, py + bh * 0.32, px, py + bh * 0.72, 3, [86, 32, 16, 245]);
-          if (p.val === 1) {
-            // 受创后墙体出现明显黑色闪电裂痕
-            fb.drawLine(px - bw * 0.25, py - bh * 0.55, px + bw * 0.12, py, 4, [24, 14, 10, 250]);
-            fb.drawLine(px + bw * 0.12, py, px - bw * 0.18, py + bh * 0.55, 4, [24, 14, 10, 250]);
-          }
         } else if (p.kind === "wrecking_ball") {
-          // 暴走拆迁队：重型黑铁锁链 + 环绕挥舞的带刺拆迁大铁球！
+          // 暴走拆迁队 V4.0：重型黑铁锁链 + 1~3颗越转越巨化的带刺流星大铁球！
           const chainLinks = 7;
           for (let lk = 0; lk <= chainLinks; lk++) {
             const u = lk / chainLinks;
@@ -2837,192 +3429,106 @@ export async function renderDuel(
             fb.fillCircle(lx, ly, Math.round(9 * cam.zoom), [42, 38, 48, 250]);
             fb.strokeRing(lx, ly, Math.round(9 * cam.zoom), 3, [210, 218, 232, 245]);
           }
-          // 铁球挥舞弧形破风残影
           const swingAng = p.angle ?? Math.atan2(py - oyp, px - oxp);
           const orbitDist = Math.hypot(px - oxp, py - oyp);
           const dirSign = side === "A" ? 1 : -1;
           const arcStart = dirSign > 0 ? swingAng - 0.65 : swingAng;
           const arcEnd = dirSign > 0 ? swingAng : swingAng + 0.65;
-          fb.drawArc(oxp, oyp, orbitDist, Math.round(18 * cam.zoom), arcStart, arcEnd, [255, 162, 32, 115]);
+          fb.drawArc(oxp, oyp, orbitDist, Math.round(20 * cam.zoom), arcStart, arcEnd, [255, 162, 32, 125]);
 
-          // 拆迁大铁球本体与8根重型破墙钢刺
-          fb.drawGlowCircle(px, py, Math.round(pr * 1.48), [255, 148, 28, 185]);
+          fb.drawGlowCircle(px, py, Math.round(pr * 1.48), [255, 148, 28, 195]);
           for (let sp = 0; sp < 8; sp++) {
             const sa = (p.angle ?? 0) * 1.5 + (sp * Math.PI) / 4;
             const sx1 = px + Math.cos(sa) * pr * 0.85;
             const sy1 = py + Math.sin(sa) * pr * 0.85;
-            const sx2 = px + Math.cos(sa) * pr * 1.32;
-            const sy2 = py + Math.sin(sa) * pr * 1.32;
-            fb.drawLine(sx1, sy1, sx2, sy2, Math.max(4, Math.round(7 * cam.zoom)), [235, 240, 250, 255]);
+            const sx2 = px + Math.cos(sa) * pr * 1.34;
+            const sy2 = py + Math.sin(sa) * pr * 1.34;
+            fb.drawLine(sx1, sy1, sx2, sy2, Math.max(4, Math.round(8 * cam.zoom)), [235, 240, 250, 255]);
           }
           fb.fillCircle(px, py, pr, [34, 32, 42, 255]);
           fb.fillCircle(px - Math.round(pr * 0.25), py - Math.round(pr * 0.25), Math.round(pr * 0.45), [86, 88, 108, 240]);
           fb.strokeRing(px, py, pr, 4, [255, 182, 42, 255]);
           fb.strokeRing(px, py, Math.round(pr * 0.58), 3, [255, 118, 24, 235]);
         } else if (p.kind === "flying_brick") {
-          // 铁球砸碎砖墙后爆射出的高速旋转红砖块（带双砖孔细节）
           const bAng = (p.angle ?? 0) + tNow * 16;
           fb.drawGlowCircle(px, py, Math.round(pr * 1.55), [255, 128, 38, 185]);
           fb.fillRotatedRect(px, py, Math.round(pr * 1.95), Math.round(pr * 1.15), bAng, [92, 32, 16, 255]);
           fb.fillRotatedRect(px, py, Math.round(pr * 1.72), Math.round(pr * 0.92), bAng, [228, 86, 32, 255]);
-          fb.fillCircle(px - Math.cos(bAng) * pr * 0.36, py - Math.sin(bAng) * pr * 0.36, Math.max(2, Math.round(pr * 0.18)), [92, 32, 16, 255]);
-          fb.fillCircle(px + Math.cos(bAng) * pr * 0.36, py + Math.sin(bAng) * pr * 0.36, Math.max(2, Math.round(pr * 0.18)), [92, 32, 16, 255]);
-        } else if (p.kind === "fish_hook") {
-          // 深海垂钓王「深海巨型倒刺锚钩 & 真实绷紧收线拖拽视觉」
-          const isReeling = p.val === 99;
-          // 1) 鱼线：平时为轻盈半透明青丝 (alpha=115)；一旦挂钩进入 0.45s 收线拖拽态 (isReeling)，化为加粗高亮金青绷紧主线 + 高速向垂钓王回流的收线脉冲珠！
-          fb.drawLine(oxp, oyp, px, py, isReeling ? 8 : 3, isReeling ? [255, 218, 58, 245] : [38, 218, 255, 115]);
-          fb.drawLine(oxp, oyp, px, py, isReeling ? 3 : 1, isReeling ? [245, 255, 255, 255] : [220, 250, 255, 155]);
-          if (isReeling) {
-            for (let k = 0; k < 4; k++) {
-              const u = 1 - ((tNow * 6.0 + k * 0.25) % 1);
-              const rx = Math.round(oxp + (px - oxp) * u);
-              const ry = Math.round(oyp + (py - oyp) * u);
-              fb.fillCircle(rx, ry, Math.round(8 * cam.zoom), [255, 245, 128, 250]);
-              fb.fillCircle(rx, ry, Math.round(4 * cam.zoom), [255, 255, 255, 255]);
-            }
-            // 挂钩点深海漩涡水链锁环 + V字破水拖拽尾浪
-            const pullAng = Math.atan2(oyp - py, oxp - px);
-            fb.strokeRing(px, py, Math.round(pr * 1.48), 5, [255, 224, 68, 245]);
-            fb.drawArc(px, py, Math.round(pr * 1.72), Math.round(8 * cam.zoom), pullAng - 1.0, pullAng + 1.0, [115, 248, 255, 240]);
-          }
-          // 2) 鱼线中后段挂载经典红白双色海钓浮漂（收线时高频抖动）
-          const jitter = isReeling ? Math.sin(tNow * 52) * 7 * cam.zoom : 0;
-          const bobX = Math.round(px * 0.72 + oxp * 0.28 + jitter);
-          const bobY = Math.round(py * 0.72 + oyp * 0.28 - jitter);
-          fb.fillCircle(bobX, bobY, Math.round(13 * cam.zoom), [255, 255, 255, 255]);
-          fb.drawArc(bobX, bobY, Math.round(9 * cam.zoom), Math.round(8 * cam.zoom), Math.PI, Math.PI * 2, [255, 42, 68, 255]);
-          fb.strokeRing(bobX, bobY, Math.round(13 * cam.zoom), 2, [24, 38, 58, 255]);
-
-          // 水漩涡光环 + 巨型弯钩主体（金扣环 + 精钢钩柄 + J型弯弧 + 锋利倒刺钩尖）
-          fb.drawGlowCircle(px, py, Math.round(pr * 1.48), [24, 212, 255, isReeling ? 235 : 165]);
-          const wAng = tNow * (isReeling ? 22 : 10) + p.id;
-          fb.drawArc(px, py, pr * 1.12, Math.max(3, Math.round(5 * cam.zoom)), wAng, wAng + 1.8, [125, 245, 255, 215]);
-          fb.drawArc(px, py, pr * 1.12, Math.max(3, Math.round(5 * cam.zoom)), wAng + Math.PI, wAng + Math.PI + 1.8, [125, 245, 255, 215]);
-
-          const shankTopX = px - pr * 0.18;
-          const shankTopY = py - pr * 0.78;
-          const shankBotX = px - pr * 0.18;
-          const shankBotY = py + pr * 0.18;
-          const bendCx = px + pr * 0.24;
-          const bendCy = py + pr * 0.18;
-          const bendR = pr * 0.42;
-          const tipX = px + pr * 0.66;
-          const tipY = py - pr * 0.18;
-          // 黄金挂线环
-          fb.strokeRing(shankTopX, shankTopY - pr * 0.14, Math.round(pr * 0.18), 4, [255, 212, 58, 255]);
-          // 精钢直钩柄与J型大弯钩
-          fb.drawLine(shankTopX, shankTopY, shankBotX, shankBotY, Math.max(6, Math.round(10 * cam.zoom)), [210, 228, 248, 255]);
-          fb.drawLine(shankTopX, shankTopY, shankBotX, shankBotY, Math.max(3, Math.round(5 * cam.zoom)), [255, 255, 255, 255]);
-          fb.drawArc(bendCx, bendCy, bendR, Math.max(6, Math.round(10 * cam.zoom)), 0, Math.PI, [210, 228, 248, 255]);
-          fb.drawArc(bendCx, bendCy, bendR, Math.max(3, Math.round(5 * cam.zoom)), 0, Math.PI, [255, 255, 255, 255]);
-          // 锋利倒刺钩尖
-          fb.drawLine(bendCx + bendR, bendCy, tipX, tipY, Math.max(5, Math.round(9 * cam.zoom)), [235, 248, 255, 255]);
-          fb.drawLine(tipX, tipY, tipX - pr * 0.24, tipY + pr * 0.16, Math.max(4, Math.round(6 * cam.zoom)), [255, 255, 255, 255]);
-          fb.drawLine(tipX, tipY, tipX + pr * 0.14, tipY + pr * 0.24, Math.max(3, Math.round(5 * cam.zoom)), [95, 245, 255, 255]);
-        } else if (p.kind === "delivery_box") {
-          if (p.val === 1) {
-            // 外卖闪电侠「回血珍珠奶茶杯」：冰爽奶茶杯身 + 白色雪顶盖 + 粗紫斜插吸管 + 杯底黑糖波霸珍珠
-            fb.drawGlowCircle(px, py, Math.round(pr * 1.42), [68, 255, 152, 165]);
-            const cw = Math.round(pr * 0.78);
-            const ch = Math.round(pr * 0.96);
-            // 粗紫波霸吸管（斜插出杯顶）
-            fb.drawLine(px + cw * 0.15, py - ch * 0.2, px + cw * 0.55, py - ch * 1.38, Math.max(6, Math.round(10 * cam.zoom)), [198, 52, 255, 255]);
-            fb.drawLine(px + cw * 0.15, py - ch * 0.2, px + cw * 0.55, py - ch * 1.38, Math.max(2, Math.round(4 * cam.zoom)), [248, 195, 255, 255]);
-            // 奶茶杯主体与奶盖
-            fb.fillRoundRect(px - cw - 3, py - ch + 6, cw * 2 + 6, ch * 2 - 4, 10, [52, 34, 24, 245]);
-            fb.fillRoundRect(px - cw, py - ch + 9, cw * 2, ch * 2 - 10, 8, [242, 198, 142, 255]);
-            fb.fillRoundRect(px - cw - 5, py - ch, cw * 2 + 10, Math.round(ch * 0.42), 8, [255, 252, 245, 255]);
-            fb.strokeRoundRect(px - cw, py - ch + 9, cw * 2, ch * 2 - 10, 8, 3, [82, 255, 162, 255]);
-            // 杯底6颗黑糖珍珠波霸
-            for (let b = 0; b < 5; b++) {
-              const bx = px + (b - 2) * cw * 0.34;
-              const by = py + ch * 0.58 + (b % 2) * 5;
-              fb.fillCircle(bx, by, Math.max(3, Math.round(pr * 0.13)), [38, 22, 16, 255]);
-              fb.fillCircle(bx - 1, by - 1, Math.max(1, Math.round(pr * 0.05)), [255, 225, 185, 235]);
-            }
-          } else {
-            // 外卖闪电侠「辣油炸弹外卖盒」：红金爆辣外卖箱 + 顶部滋滋冒火花的炸弹引线 + 火辣椒徽章
-            const sparkPulse = 1 + 0.12 * Math.sin(tNow * 28 + p.id);
-            fb.drawGlowCircle(px, py, Math.round(pr * 1.45 * sparkPulse), [255, 78, 24, 175]);
-            const bw = Math.round(pr * 0.92);
-            const bh = Math.round(pr * 0.88);
-            // 顶部弯曲炸弹引线与爆裂火星
-            const fuseX = px + Math.round(bw * 0.35);
-            const fuseY = py - bh - Math.round(pr * 0.38);
-            fb.drawLine(px, py - bh, fuseX, fuseY, Math.max(3, Math.round(5 * cam.zoom)), [215, 195, 165, 255]);
-            fb.drawGlowCircle(fuseX, fuseY, Math.round(18 * sparkPulse * cam.zoom), [255, 218, 38, 235]);
-            fb.fillCircle(fuseX, fuseY, Math.round(7 * sparkPulse * cam.zoom), [255, 255, 220, 255]);
-            // 外卖盒主体与金色封箱带
-            fb.fillRoundRect(px - bw - 3, py - bh - 3, bw * 2 + 6, bh * 2 + 6, 10, [42, 16, 14, 245]);
-            fb.fillRoundRect(px - bw, py - bh, bw * 2, bh * 2, 8, [238, 38, 38, 255]);
-            fb.strokeRoundRect(px - bw, py - bh, bw * 2, bh * 2, 8, 3, [255, 212, 38, 255]);
-            fb.fillRoundRect(px - Math.round(bw * 0.22), py - bh, Math.round(bw * 0.44), bh * 2, 3, [255, 208, 28, 255]);
-            fb.fillCircle(px, py, Math.round(pr * 0.34), [38, 18, 16, 255]);
-            fb.fillCircle(px, py, Math.round(pr * 0.22), [255, 138, 24, 255]);
-          }
         } else if (p.kind === "pool_ball") {
-          // 赛博台球手「几何彩球」：专业台球配色（全色球/花色横带球）+ 中心白圆黑字号 + 几何反弹虚线尾迹
-          const palette: RGBA[] = [
-            [255, 204, 18, 255],
-            [28, 128, 255, 255],
-            [255, 48, 64, 255],
-            [168, 48, 255, 255],
-            [255, 128, 24, 255],
-            [28, 224, 128, 255],
-          ];
-          const bCol = palette[p.id % palette.length];
-          const moveA = p.angle ?? 0;
-          // 前方青色几何瞄准虚线
-          const rayX = px + Math.cos(moveA) * pr * 1.95;
-          const rayY = py + Math.sin(moveA) * pr * 1.95;
-          fb.drawLine(px, py, rayX, rayY, 3, [48, 255, 208, 155]);
-          fb.drawGlowCircle(px, py, Math.round(pr * 1.38), [bCol[0], bCol[1], bCol[2], 150]);
-          // 花色球先铺白底再画宽彩带，全色球铺纯彩底
-          if (p.id % 2 === 0) {
-            fb.fillCircle(px, py, pr, [248, 250, 255, 255]);
-            fb.fillRoundRect(px - pr + 2, py - Math.round(pr * 0.56), pr * 2 - 4, Math.round(pr * 1.12), 6, bCol);
+          if (ownerV.ballSkillKind === "pinball_bumper") {
+            // 街机弹珠王 V4.0「777高压黄金电光球」：铬金电浆弹珠 + 外圈跳跃青金闪电弧！
+            fb.drawGlowCircle(px, py, Math.round(pr * 1.52), [255, 212, 38, 185]);
+            fb.fillCircle(px, py, pr, [46, 22, 78, 255]);
+            fb.fillCircle(px, py, Math.round(pr * 0.82), [255, 208, 28, 255]);
+            fb.strokeRing(px, py, pr, 4, [62, 248, 255, 250]);
+            fb.fillRotatedRect(px, py, Math.round(pr * 0.96), Math.round(pr * 0.26), tNow * 10, [255, 255, 255, 255]);
+            fb.fillRotatedRect(px, py, Math.round(pr * 0.96), Math.round(pr * 0.26), tNow * 10 + Math.PI * 0.5, [255, 255, 255, 255]);
+            for (let e = 0; e < 3; e++) {
+              const ea = tNow * 16 + p.id + (e * Math.PI * 2) / 3;
+              fb.drawLine(
+                px + Math.cos(ea) * pr * 0.92,
+                py + Math.sin(ea) * pr * 0.92,
+                px + Math.cos(ea + 0.45) * pr * 1.32,
+                py + Math.sin(ea + 0.45) * pr * 1.32,
+                3,
+                [92, 248, 255, 235],
+              );
+            }
           } else {
-            fb.fillCircle(px, py, pr, bCol);
+            const palette: RGBA[] = [
+              [255, 204, 18, 255],
+              [28, 128, 255, 255],
+              [255, 48, 64, 255],
+              [168, 48, 255, 255],
+              [255, 128, 24, 255],
+              [28, 224, 128, 255],
+            ];
+            const bCol = palette[p.id % palette.length];
+            const moveA = p.angle ?? 0;
+            const rayX = px + Math.cos(moveA) * pr * 1.95;
+            const rayY = py + Math.sin(moveA) * pr * 1.95;
+            fb.drawLine(px, py, rayX, rayY, 3, [48, 255, 208, 155]);
+            fb.drawGlowCircle(px, py, Math.round(pr * 1.38), [bCol[0], bCol[1], bCol[2], 150]);
+            if (p.id % 2 === 0) {
+              fb.fillCircle(px, py, pr, [248, 250, 255, 255]);
+              fb.fillRoundRect(px - pr + 2, py - Math.round(pr * 0.56), pr * 2 - 4, Math.round(pr * 1.12), 6, bCol);
+            } else {
+              fb.fillCircle(px, py, pr, bCol);
+            }
+            fb.strokeRing(px, py, pr, 3, [255, 255, 255, 245]);
+            const numR = Math.round(pr * 0.48);
+            fb.fillCircle(px, py, numR, [255, 255, 255, 255]);
+            fb.drawLine(px, py - numR * 0.52, px, py + numR * 0.52, 4, [18, 20, 28, 255]);
+            fb.drawLine(px - numR * 0.35, py + numR * 0.52, px + numR * 0.35, py + numR * 0.52, 3, [18, 20, 28, 255]);
+            fb.fillCircle(px - Math.round(pr * 0.35), py - Math.round(pr * 0.35), Math.max(2, Math.round(pr * 0.18)), [255, 255, 255, 235]);
           }
-          fb.strokeRing(px, py, pr, 3, [255, 255, 255, 245]);
-          // 中心白圆号牌与数字笔画
-          const numR = Math.round(pr * 0.48);
-          fb.fillCircle(px, py, numR, [255, 255, 255, 255]);
-          fb.drawLine(px, py - numR * 0.52, px, py + numR * 0.52, 4, [18, 20, 28, 255]);
-          fb.drawLine(px - numR * 0.35, py + numR * 0.52, px + numR * 0.35, py + numR * 0.52, 3, [18, 20, 28, 255]);
-          // 左上角高光白斑
-          fb.fillCircle(px - Math.round(pr * 0.35), py - Math.round(pr * 0.35), Math.max(2, Math.round(pr * 0.18)), [255, 255, 255, 235]);
         } else if (p.kind === "paint_splat") {
-          // 街头涂鸦王「霓虹喷漆地贴」：不规则飞溅油漆斑块 + 滴落漆泪 + 中心街头涂鸦三尖皇冠（彻底移除生硬黄圆圈！）
+          // 街头涂鸦王 V4.0「巨型霓虹彩漆弹球」：高饱和荧光彩弹球体 + 中心三尖街头皇冠 + 飞溅彩漆尾滴！
           const col: RGBA =
             p.id % 3 === 0
-              ? [255, 36, 172, 185]
+              ? [255, 36, 172, 242]
               : p.id % 3 === 1
-                ? [28, 242, 255, 185]
-                : [185, 255, 36, 185];
-          fb.drawGlowCircle(px, py, Math.round(pr * 1.25), [col[0], col[1], col[2], 95]);
-          fb.fillRotatedEllipse(px, py, Math.round(pr * 1.05), Math.round(pr * 0.82), p.id * 0.7, col);
-          // 7处不对称飞溅油漆点与流挂漆滴
-          const splatAngs = [0.2, 1.05, 1.85, 2.75, 3.6, 4.55, 5.4];
-          const splatDists = [0.88, 0.72, 0.94, 0.76, 0.90, 0.74, 0.85];
-          const splatRads = [0.42, 0.28, 0.36, 0.44, 0.26, 0.38, 0.30];
-          for (let s = 0; s < 7; s++) {
-            const sa = splatAngs[s] + p.id * 1.1;
-            const sxp = Math.round(px + Math.cos(sa) * pr * splatDists[s]);
-            const syp = Math.round(py + Math.sin(sa) * pr * splatDists[s]);
-            fb.blendCircle(sxp, syp, Math.round(pr * splatRads[s]), col);
+                ? [28, 242, 255, 242]
+                : [185, 255, 36, 242];
+          const mAng = p.angle ?? 0;
+          fb.drawGlowCircle(px, py, Math.round(pr * 1.38), [col[0], col[1], col[2], 135]);
+          fb.fillCircle(px, py, pr, [28, 18, 44, 245]);
+          fb.fillCircle(px, py - 1, Math.round(pr * 0.88), col);
+          fb.strokeRing(px, py, pr, 3, [255, 255, 255, 240]);
+          const cw = Math.round(pr * 0.42);
+          const ch = Math.round(pr * 0.26);
+          fb.drawLine(px - cw, py + ch, px + cw, py + ch, 5, [255, 238, 48, 255]);
+          fb.drawLine(px - cw, py + ch, px - cw * 0.85, py - ch, 4, [255, 238, 48, 255]);
+          fb.drawLine(px - cw * 0.85, py - ch, px - cw * 0.25, py + ch * 0.2, 4, [255, 238, 48, 255]);
+          fb.drawLine(px - cw * 0.25, py + ch * 0.2, px, py - ch * 1.25, 4, [255, 238, 48, 255]);
+          fb.drawLine(px, py - ch * 1.25, px + cw * 0.25, py + ch * 0.2, 4, [255, 238, 48, 255]);
+          fb.drawLine(px + cw * 0.25, py + ch * 0.2, px + cw * 0.85, py - ch, 4, [255, 238, 48, 255]);
+          fb.drawLine(px + cw * 0.85, py - ch, px + cw, py + ch, 4, [255, 238, 48, 255]);
+          for (let d = 1; d <= 2; d++) {
+            const dx = px - Math.cos(mAng) * pr * (0.94 + d * 0.35);
+            const dy = py - Math.sin(mAng) * pr * (0.94 + d * 0.35);
+            fb.fillCircle(dx, dy, Math.max(3, Math.round(pr * (0.20 - d * 0.05))), col);
           }
-          // 中心街头涂鸦标志性「三尖金皇冠 (Street Crown)」Tag
-          const cw = Math.round(pr * 0.44);
-          const ch = Math.round(pr * 0.28);
-          fb.drawLine(px - cw, py + ch, px + cw, py + ch, 5, [255, 238, 48, 245]);
-          fb.drawLine(px - cw, py + ch, px - cw * 0.85, py - ch, 4, [255, 238, 48, 245]);
-          fb.drawLine(px - cw * 0.85, py - ch, px - cw * 0.25, py + ch * 0.2, 4, [255, 238, 48, 245]);
-          fb.drawLine(px - cw * 0.25, py + ch * 0.2, px, py - ch * 1.25, 4, [255, 238, 48, 245]);
-          fb.drawLine(px, py - ch * 1.25, px + cw * 0.25, py + ch * 0.2, 4, [255, 238, 48, 245]);
-          fb.drawLine(px + cw * 0.25, py + ch * 0.2, px + cw * 0.85, py - ch, 4, [255, 238, 48, 245]);
-          fb.drawLine(px + cw * 0.85, py - ch, px + cw, py + ch, 4, [255, 238, 48, 245]);
         } else if (p.kind === "roast_grill") {
           // 旋转烤肉王「炭火烧烤炉」：铸铁双耳黑炭盆 + 内部通红燃烧木炭 + 4根银亮不锈钢烤网 + 滋滋冒油的烤肉串
           const pulse = 1 + 0.08 * Math.sin(tNow * 14 + p.id);
@@ -3210,17 +3716,25 @@ export async function renderDuel(
     const [r2, g2, b2] = hex(v.color2);
     const sheet = sheets[v.id];
 
-    // 1. 残影轨迹（极速黄骑士与外卖闪电侠额外拉出高燃氮气烈焰尾迹带）
-    const isSpeedster = v.ballSkillKind === "rider_turbo" || v.ballSkillKind === "courier_box";
+    // 1. 残影轨迹（极速黄骑士与时停穿梭态钟表王拉出流光尾迹带）
+    const isChronoDash = v.ballSkillKind === "time_stop" && Math.hypot(v.vx, v.vy) > 900;
+    const isSpeedster = v.ballSkillKind === "rider_turbo" || isChronoDash;
     let prevTx = sx;
     let prevTy = sy;
     for (let i = 0; i < v.trail.length; i++) {
       const tr = v.trail[i];
-      tr.alpha *= isSpeedster ? 0.78 : 0.72;
+      tr.alpha *= isSpeedster ? 0.80 : 0.72;
       if (tr.alpha < 0.08) continue;
       const [tx, ty] = worldToScreen(tr.x, tr.y, cam, shx, shy);
       const trR = Math.round(44 * tr.bodyScale * cam.zoom);
-      if (isSpeedster) {
+      if (isChronoDash) {
+        const ribbonW = Math.max(8, Math.round((32 - i * 5) * cam.zoom));
+        fb.drawLine(prevTx, prevTy, tx, ty, ribbonW, [255, 208, 38, Math.round(tr.alpha * 185)]);
+        fb.drawLine(prevTx, prevTy, tx, ty, Math.max(4, Math.round(ribbonW * 0.45)), [195, 255, 255, Math.round(tr.alpha * 235)]);
+        fb.fillCircle(tx, ty, Math.round(trR * 0.85), [255, 224, 72, Math.round(tr.alpha * 95)]);
+        prevTx = tx;
+        prevTy = ty;
+      } else if (isSpeedster) {
         const ribbonW = Math.max(6, Math.round((28 - i * 5) * cam.zoom));
         fb.drawLine(prevTx, prevTy, tx, ty, ribbonW, [255, 118, 24, Math.round(tr.alpha * 145)]);
         fb.drawLine(prevTx, prevTy, tx, ty, Math.max(3, Math.round(ribbonW * 0.45)), [255, 242, 98, Math.round(tr.alpha * 195)]);
@@ -3238,10 +3752,18 @@ export async function renderDuel(
       drawOrbitingWeapons(fb, v, sx, sy, cam, tNow);
     }
 
-    // 3. 脚底立体投影、刚体挤压拉伸形变 (Squash & Stretch) 与高阶狂暴气焰环
-    const orbR = Math.round(52 * v.bodyScale * cam.zoom);
+    // 3. 脚底立体投影、进化暴涨弹性脉冲 (Evo-Pop)、刚体挤压拉伸形变 (Squash & Stretch) 与高阶狂暴气焰环
+    const evoPop = v.statPulse > 0.02 ? 1 + Math.sin(v.statPulse * Math.PI) * 0.11 : 1;
+    const orbR = Math.round(52 * v.bodyScale * evoPop * cam.zoom);
     const isHit = v.hitFlash > 0;
     fb.fillRotatedEllipse(sx, sy + orbR * 0.72, orbR * 0.92, Math.round(18 * cam.zoom), 0, [0, 0, 0, 145]);
+
+    if (v.statPulse > 0.04 && v.alive) {
+      const ringProg = 1 - v.statPulse;
+      const evoRingR = Math.round(orbR * (1.14 + ringProg * 0.88));
+      const evoAlpha = Math.round(220 * v.statPulse);
+      fb.strokeRing(sx, sy, evoRingR, Math.max(3, Math.round(5 * v.statPulse * cam.zoom)), [255, 232, 92, evoAlpha]);
+    }
 
     // 终局高阶进化（>=4层）专属狂暴斗气外环 + 残血红光危机闪烁环
     if (v.alive && v.hp / v.maxHp <= 0.22) {
@@ -3258,7 +3780,7 @@ export async function renderDuel(
       );
     }
 
-    // 刚体物理形变：弹墙瞬间扁平挤压 (Wall Squash) 或 超高速击飞期间流线拉伸 (Velocity Stretch)
+    // 刚体物理形变：受击果冻回弹挤压 / 弹墙瞬间扁平挤压 (Wall Squash) / 超高速击飞流线拉伸 (Velocity Stretch)
     const speedMag = Math.hypot(v.vx, v.vy);
     const moveAng = Math.atan2(v.vy, v.vx);
     if (v.wallSquashT > 0) {
@@ -3266,6 +3788,11 @@ export async function renderDuel(
       const rx = Math.round(orbR * (1 + 0.24 * sq));
       const ry = Math.round(orbR * (1 - 0.18 * sq));
       fb.fillRotatedEllipse(sx, sy, rx + 4, ry + 4, v.wallOrient, [255, 240, 175, Math.round(185 * sq)]);
+    } else if (v.hitFlash > 0.04 && v.alive) {
+      const hq = clamp(v.hitFlash / 0.22, 0, 1);
+      const rx = Math.round(orbR * (1 + 0.16 * hq));
+      const ry = Math.round(orbR * (1 - 0.12 * hq));
+      fb.fillRotatedEllipse(sx, sy, rx + 4, ry + 4, moveAng + Math.PI * 0.5, [255, 248, 210, Math.round(170 * hq)]);
     } else if (speedMag > 620 && !v.latchedTo) {
       const stretch = clamp((speedMag - 620) / 550, 0.08, 0.32);
       const rx = Math.round(orbR * (1 + stretch));
@@ -3274,8 +3801,14 @@ export async function renderDuel(
     }
 
     fb.drawGlowCircle(sx, sy, Math.round(orbR * 1.38), [r, g, b, v.action === "skill" ? 110 : 65]);
-    fb.fillCircle(sx, sy, orbR, [r2, g2, b2, 215]);
-    fb.fillCircle(sx, sy, Math.round(orbR * 0.86), [18, 16, 32, 235]);
+    if (v.ballSkillKind === "slime_split") {
+      // 史莱姆本体外球呈现通透果冻质感，彻底告别暗色金属底盘
+      fb.fillCircle(sx, sy, orbR, [16, 138, 224, 218]);
+      fb.fillCircle(sx, sy - 2, Math.round(orbR * 0.88), [36, 204, 252, 210]);
+    } else {
+      fb.fillCircle(sx, sy, orbR, [r2, g2, b2, 215]);
+      fb.fillCircle(sx, sy, Math.round(orbR * 0.86), [18, 16, 32, 235]);
+    }
     fb.strokeRing(sx, sy, orbR, Math.max(4, Math.round(5 * cam.zoom)), isHit ? [255, 240, 165, 255] : [r, g, b, 255]);
     fb.strokeRing(sx, sy, Math.round(orbR * 0.90), 2, [255, 245, 220, 175]);
 
@@ -3301,16 +3834,9 @@ export async function renderDuel(
     const alphaVal = v.alive ? 1 : clamp(1 - (v.actionAge - 0.5) * 0.8, 0.25, 1);
 
     if (v.combatMode === "skillball") {
-      drawSkillBallAvatar(fb, v.ballSkillKind, sx, sy, orbR, v.facing, isHit, alphaVal, tNow, !v.alive);
+      drawSkillBallAvatar(fb, v.ballSkillKind, sx, sy, orbR, v.facing, isHit, alphaVal, tNow, !v.alive, v.color);
     } else {
-      sheet.drawFrame(fb, col, row, sx, sy + Math.round(34 * v.bodyScale * cam.zoom), {
-        scale: spriteScale,
-        flipX,
-        outlineColor: outlineCol,
-        outlinePx: 1,
-        tint: isHit ? [255, 225, 225, 0.55] : undefined,
-        alpha: alphaVal,
-      });
+      drawWeaponBallAvatar(fb, v.weaponKind, v.scaleKind, sx, sy, orbR, v.facing, isHit, alphaVal, tNow, !v.alive);
     }
   };
 
@@ -3468,7 +3994,63 @@ export async function renderDuel(
           fb.strokeRing(tx, ty, r1, Math.max(4, Math.round(8 * (1 - k * 0.4))), [cr, cg, cb, alpha]);
           fb.strokeRing(tx, ty, Math.round(r1 * 0.68), Math.max(2, Math.round(4 * (1 - k * 0.4))), [255, 248, 215, alpha]);
         }
+      } else if (fx.kind === "timeStopShatter") {
+        // 时间恢复流动瞬间：静止怀表法阵轰然崩碎 + 12道黄金时针碎片爆射！
+        if (age > 0.46) continue;
+        const k = age / 0.46;
+        const [sx, sy] = worldToScreen(fx.x, fx.y, cam, shx, shy);
+        const alpha = Math.round(255 * (1 - k));
+        const r1 = Math.round((54 + 275 * Math.pow(k, 0.72)) * cam.zoom);
+        fb.drawGlowCircle(sx, sy, Math.round(r1 * 0.92), [255, 214, 52, Math.round(alpha * 0.45)]);
+        fb.strokeRing(sx, sy, r1, Math.max(4, Math.round(9 * (1 - k * 0.45))), [255, 228, 72, alpha]);
+        fb.strokeRing(sx, sy, Math.round(r1 * 0.66), Math.max(3, Math.round(5 * (1 - k * 0.45))), [118, 252, 255, alpha]);
+        for (let i = 0; i < 12; i++) {
+          const ang = (i * Math.PI) / 6 + k * 0.25;
+          const d = (34 + 235 * Math.pow(k, 0.78)) * cam.zoom;
+          const px = sx + Math.cos(ang) * d;
+          const py = sy + Math.sin(ang) * d;
+          fb.fillRotatedRect(
+            px,
+            py,
+            Math.round(32 * (1 - k * 0.35) * cam.zoom),
+            Math.round(9 * (1 - k * 0.35) * cam.zoom),
+            ang,
+            i % 2 === 0 ? [255, 232, 86, alpha] : [175, 252, 255, alpha],
+          );
+        }
       } else if (fx.kind === "propBurst") {
+        const pk = fx.propKind ?? "";
+        // 时停叠斩剑针持续悬停钉在猎物周围，直到时间恢复流动瞬间随总伤害一并引爆！
+        if (pk === "chrono_strike") {
+          const endT = fx.tEnd ?? fx.t0 + 0.55;
+          if (tb > endT + 0.08) continue;
+          const [sx, sy] = worldToScreen(fx.x, fx.y, cam, shx, shy);
+          const [tx, ty] = worldToScreen(fx.tx ?? fx.x, fx.ty ?? fx.y, cam, shx, shy);
+          const hitIdx = fx.val ?? 1;
+          const spearAng = hitIdx * 2.51 + (fx.side === "A" ? 0.25 : -0.25);
+          const inPop = clamp(age / 0.12, 0, 1);
+          const tipDist = (56 + (1 - inPop) * 48) * cam.zoom;
+          const tailDist = (148 + (1 - inPop) * 48) * cam.zoom;
+          const x1 = sx + Math.cos(spearAng) * tailDist;
+          const y1 = sy + Math.sin(spearAng) * tailDist;
+          const x2 = sx + Math.cos(spearAng) * tipDist;
+          const y2 = sy + Math.sin(spearAng) * tipDist;
+          // 刚斩过的前 0.16s 绘制横贯猎物的黄金时空斩击残光
+          if (age < 0.16) {
+            const slashA = Math.round(245 * (1 - age / 0.16));
+            fb.drawLine(tx, ty, sx - (tx - sx) * 0.7, sy - (ty - sy) * 0.7, 10, [255, 218, 52, slashA]);
+            fb.drawLine(tx, ty, sx - (tx - sx) * 0.7, sy - (ty - sy) * 0.7, 4, [255, 255, 235, slashA]);
+          }
+          // 悬停在静止猎物四周的黄金怀表指针剑（1 -> 2 -> 3 -> 4 -> 5 逐根钉入蓄势！）
+          fb.drawGlowCircle(x2, y2, Math.round(22 * cam.zoom), [255, 212, 48, 175]);
+          fb.drawLine(x1, y1, x2, y2, Math.max(6, Math.round(9 * cam.zoom)), [255, 198, 36, 250]);
+          fb.drawLine(x1, y1, x2, y2, Math.max(3, Math.round(4 * cam.zoom)), [255, 252, 215, 255]);
+          fb.strokeRing(x1, y1, Math.round(12 * cam.zoom), 3, [255, 224, 72, 250]);
+          // 猎物外围蓄能黄金法阵环随连斩次数逐级加亮
+          fb.strokeRing(sx, sy, Math.round((76 + hitIdx * 5) * cam.zoom), 3, [255, 220, 68, 185]);
+          continue;
+        }
+
         // 召唤物 / 场地机关攻击高辨识度结果反馈：一眼看清「是哪个召唤物触发、怎么打中对手、爆出了什么效果」！
         if (age > 0.42) continue;
         const k = age / 0.42;
@@ -3476,9 +4058,53 @@ export async function renderDuel(
         const [tx, ty] = worldToScreen(fx.tx ?? fx.x, fx.ty ?? fx.y, cam, shx, shy);
         const alpha = Math.round(250 * (1 - k));
         const [cr, cg, cb] = fx.color;
-        const pk = fx.propKind ?? "";
 
-        if (pk === "voodoo_effigy") {
+        if (pk === "slime_mitosis") {
+          // 分裂史莱姆细胞有丝分裂爆发：清澈冰青果冻冲击环 + 10颗晶莹果冻水珠向四周弹射！
+          const r1 = Math.round((36 + 115 * Math.pow(k, 0.72)) * cam.zoom);
+          fb.drawGlowCircle(sx, sy, r1, [36, 224, 255, Math.round(alpha * 0.55)]);
+          fb.strokeRing(sx, sy, r1, Math.max(4, Math.round(8 * (1 - k * 0.45))), [98, 246, 255, alpha]);
+          fb.strokeRing(sx, sy, Math.round(r1 * 0.64), 3, [225, 255, 255, alpha]);
+          for (let i = 0; i < 10; i++) {
+            const ang = (i * Math.PI * 2) / 10 + k * 0.4;
+            const d = (24 + 98 * Math.pow(k, 0.75)) * cam.zoom;
+            const px = sx + Math.cos(ang) * d;
+            const py = sy + Math.sin(ang) * d;
+            fb.fillCircle(px, py, Math.max(4, Math.round(10 * (1 - k * 0.4) * cam.zoom)), [78, 238, 255, alpha]);
+            fb.fillCircle(px - 2, py - 2, Math.max(2, Math.round(4 * (1 - k * 0.4) * cam.zoom)), [255, 255, 255, alpha]);
+          }
+        } else if (pk === "snake_sever") {
+          // 斩断贪吃蛇蛇尾：翠绿金鳞向四周崩飞爆裂！
+          const r1 = Math.round((28 + 88 * Math.pow(k, 0.74)) * cam.zoom);
+          fb.drawGlowCircle(sx, sy, r1, [42, 255, 128, Math.round(alpha * 0.55)]);
+          fb.strokeRing(sx, sy, r1, 4, [255, 224, 68, alpha]);
+          for (let i = 0; i < 8; i++) {
+            const ang = (i * Math.PI) / 4 + k * 0.8;
+            const d = (18 + 78 * k) * cam.zoom;
+            fb.fillRotatedRect(
+              sx + Math.cos(ang) * d,
+              sy + Math.sin(ang) * d,
+              Math.round(18 * (1 - k * 0.35) * cam.zoom),
+              Math.round(12 * (1 - k * 0.35) * cam.zoom),
+              ang,
+              i % 2 === 0 ? [42, 245, 118, alpha] : [255, 218, 56, alpha],
+            );
+          }
+        } else if (pk === "snake_seg") {
+          // 巨蟒鳞甲弹反火花：翡翠金鳞弹床波纹
+          const r1 = Math.round((24 + 54 * k) * cam.zoom);
+          fb.strokeRing(sx, sy, r1, 4, [68, 255, 138, alpha]);
+          fb.drawLine(sx, sy, tx, ty, Math.max(3, Math.round(6 * (1 - k))), [255, 226, 78, alpha]);
+        } else if (pk === "slime_clone") {
+          // 史莱姆分身围殴果冻水花
+          const r1 = Math.round((20 + 46 * k) * cam.zoom);
+          fb.strokeRing(sx, sy, r1, 4, [96, 245, 255, alpha]);
+          for (let i = 0; i < 5; i++) {
+            const ang = (i * Math.PI * 2) / 5 + 0.3;
+            const d = (14 + 36 * k) * cam.zoom;
+            fb.fillCircle(sx + Math.cos(ang) * d, sy + Math.sin(ang) * d, Math.max(3, Math.round(5 * (1 - k * 0.4) * cam.zoom)), [165, 250, 255, alpha]);
+          }
+        } else if (pk === "voodoo_effigy") {
           // 巫毒替身偶触发瞬间（高反差爆发）：草人爆开猩红咒印光环 + 粗壮紫红双股诅咒雷霆 + 巨型银针贯穿受击者！
           fb.drawGlowCircle(sx, sy, Math.round((48 + 56 * k) * cam.zoom), [255, 36, 108, Math.round(alpha * 0.65)]);
           fb.strokeRing(sx, sy, Math.round((32 + 72 * k) * cam.zoom), 5, [255, 48, 128, alpha]);
@@ -3505,17 +4131,6 @@ export async function renderDuel(
           fb.fillCircle(pinX - (dx / dist) * 24 * cam.zoom, pinY - (dy / dist) * 24 * cam.zoom, Math.round(11 * cam.zoom), [255, 38, 88, alpha]);
           fb.strokeRing(tx, ty, Math.round((92 - 36 * k) * cam.zoom), 5, [255, 42, 108, alpha]);
           fb.strokeRing(tx, ty, Math.round((56 + 44 * k) * cam.zoom), 3, [92, 255, 168, alpha]);
-        } else if (pk === "fish_hook") {
-          // 深海垂钓王鱼钩拽击：挂钩点巨型浪花爆裂 + 金青双色绷紧收线流光拉回本体！
-          fb.drawGlowCircle(sx, sy, Math.round((38 + 56 * k) * cam.zoom), [32, 228, 255, Math.round(alpha * 0.50)]);
-          fb.strokeRing(sx, sy, Math.round((26 + 78 * k) * cam.zoom), 5, [155, 248, 255, alpha]);
-          fb.drawLine(sx, sy, tx, ty, Math.max(4, Math.round(8 * (1 - k * 0.4))), [255, 225, 78, alpha]);
-          fb.drawLine(sx, sy, tx, ty, Math.max(2, Math.round(3 * (1 - k * 0.4))), [235, 255, 255, alpha]);
-          for (let i = 0; i < 8; i++) {
-            const ang = (i * Math.PI) / 4 + 0.2;
-            const d = (24 + 62 * k) * cam.zoom;
-            fb.fillCircle(sx + Math.cos(ang) * d, sy + Math.sin(ang) * d, Math.round(6 * (1 - k * 0.4) * cam.zoom), [185, 250, 255, alpha]);
-          }
         } else if (pk === "bumper_arc" || pk === "bumper_peg") {
           // 街机弹珠王弹柱放电：弹柱大奖光环扩开 + 高压折线电弧劈向对手！
           fb.drawGlowCircle(sx, sy, Math.round((46 + 52 * k) * cam.zoom), [255, 232, 58, Math.round(alpha * 0.55)]);
@@ -3534,37 +4149,6 @@ export async function renderDuel(
             fb.drawLine(sx, sy, m1x, m1y, 6, [255, 238, 68, alpha]);
             fb.drawLine(m1x, m1y, m2x, m2y, 6, [58, 248, 255, alpha]);
             fb.drawLine(m2x, m2y, tx, ty, 6, [255, 238, 68, alpha]);
-          }
-        } else if (pk === "chili_bomb") {
-          // 外卖闪电侠辣油盲盒爆破：原地红金烈焰火球爆炸 + 10 枚飞散火浪碎片（彻底解决盒子凭空消失看不清的问题）！
-          const r1 = Math.round((28 + 96 * Math.pow(k, 0.72)) * cam.zoom);
-          fb.drawGlowCircle(sx, sy, Math.round(r1 * 1.15), [255, 78, 22, Math.round(alpha * 0.68)]);
-          fb.strokeRing(sx, sy, r1, Math.max(4, Math.round(8 * (1 - k * 0.5))), [255, 218, 58, alpha]);
-          fb.strokeRing(sx, sy, Math.round(r1 * 0.62), Math.max(3, Math.round(5 * (1 - k * 0.5))), [255, 62, 32, alpha]);
-          for (let i = 0; i < 10; i++) {
-            const ang = (i * Math.PI * 2) / 10 + k * 0.6;
-            const d = (20 + 88 * Math.pow(k, 0.75)) * cam.zoom;
-            const px = sx + Math.cos(ang) * d;
-            const py = sy + Math.sin(ang) * d;
-            fb.fillRotatedRect(
-              px,
-              py,
-              Math.round(18 * (1 - k * 0.4) * cam.zoom),
-              Math.round(8 * (1 - k * 0.4) * cam.zoom),
-              ang,
-              i % 2 === 0 ? [255, 232, 72, alpha] : [255, 68, 28, alpha],
-            );
-          }
-        } else if (pk === "milk_tea") {
-          // 珍珠奶茶回血：翠绿奶油双环 + 升腾星芒
-          const r1 = Math.round((24 + 68 * k) * cam.zoom);
-          fb.drawGlowCircle(sx, sy, r1, [82, 252, 162, Math.round(alpha * 0.48)]);
-          fb.strokeRing(sx, sy, r1, 4, [98, 255, 172, alpha]);
-          for (let i = 0; i < 6; i++) {
-            const ang = (i * Math.PI) / 3;
-            const px = sx + Math.cos(ang) * (18 + 38 * k) * cam.zoom;
-            const py = sy + Math.sin(ang) * (18 + 38 * k) * cam.zoom - 22 * k * cam.zoom;
-            fb.fillCircle(px, py, Math.round(5 * cam.zoom), [235, 255, 220, alpha]);
           }
         } else if (pk === "wall_shatter" || pk === "brick_wall") {
           // 暴走拆迁队铁球破墙 / 撞墙：橙金震波环 + 10 块红砖碎石向四周崩飞！
@@ -3674,23 +4258,6 @@ export async function renderDuel(
           const sx2 = px + Math.cos(ang) * dist;
           const sy2 = py + Math.sin(ang) * dist;
           fb.drawLine(sx1, sy1, sx2, sy2, 4, [255, 236, 118, ringAlpha]);
-        }
-
-        if (!isSkillBallMode) {
-          const popScale = easeOutBack(clamp(age / 0.14, 0, 1));
-          const textAlpha = age > 0.28 ? Math.round(255 * (1 - (age - 0.28) / 0.14)) : 255;
-          drawFit(
-            fb,
-            atlas,
-            fx.text,
-            px,
-            py + Math.round((24 + 26 * k) * cam.zoom),
-            [fx.color[0], fx.color[1], fx.color[2], textAlpha],
-            240,
-            0.46 * popScale * comboScale,
-            "center",
-            3,
-          );
         }
       } else if (fx.kind === "skillring") {
         if (age > 0.50) continue;
@@ -3825,33 +4392,128 @@ export async function renderDuel(
           fb.fillCircle(px, py, Math.max(2, Math.round(2.5 * sc * cam.zoom)), [235, 255, 245, alpha]);
         }
       } else if (fx.kind === "evoPop") {
-        // Skill-Ball 模式顶部已有全宽进化进度条实时脉冲，不再在球体头顶叠一层进化字以避免与扣血数字打架
-        if (isSkillBallMode) continue;
-        if (age > 0.68) continue;
-        const k = age / 0.68;
-        const f = byId[fx.side];
-        const [sx, sy] = worldToScreen(visX[f.id], visY[f.id], cam, shx, shy);
-        const pop = age < 0.15 ? easeOutBack(age / 0.15) : 1;
-        const alpha = age > 0.45 ? Math.round(255 * (1 - (age - 0.45) / 0.23)) : 255;
-        drawFit(
-          fb,
-          atlas,
-          fx.text,
-          sx,
-          sy - Math.round((108 + 42 * k) * cam.zoom),
-          [255, 238, 118, alpha],
-          280,
-          0.44 * pop,
-          "center",
-          3,
-        );
+        // 顶部已有全宽进化进度条实时脉冲，不再在球体头顶叠一层进化字以避免与扣血数字打架
+        continue;
       }
     }
   };
 
-  // ---------- 5. 底部留白暗角区 (Y: 1555..1920)：不显示任何文字解说字幕 ----------
-  const drawBottomCleanZone = (fb: FrameBuf, _tb: number) => {
-    fb.blendGradientRect(0, 1555, W, H - 1555, [8, 7, 16, 40], [4, 3, 10, 235], true);
+  // ---------- 5. 底部视频号安全互动条 (Y: 1568..1632)：避开视频号底部 1710+ 文案遮挡区，驱动评论站队与用户共创设计英雄 ----------
+  const drawBottomCleanZone = (fb: FrameBuf, tb: number) => {
+    fb.blendGradientRect(0, 1555, W, H - 1555, [8, 7, 16, 55], [4, 3, 10, 242], true);
+
+    const barX = 48;
+    const barY = 1568;
+    const barW = W - 96; // 984
+    const barH = 64;
+    const cx = W / 2;
+
+    if (tb < 7.2) {
+      // 阶段一 (0..7.2s)：红蓝双方胜负竞猜站队胶囊，直接拉升前7秒评论互动率
+      const fade = tb > 6.8 ? clamp((7.2 - tb) / 0.4, 0, 1) : 1;
+      fb.drawCard(barX, barY, barW, barH, {
+        bgTop: [20, 17, 38, Math.round(244 * fade)],
+        bgBottom: [12, 10, 24, Math.round(248 * fade)],
+        border: [148, 128, 235, Math.round(215 * fade)],
+        borderWidth: 2,
+        radius: 18,
+        shadowAlpha: Math.round(110 * fade),
+        shadowOffsetY: 5,
+      });
+      // 左红右蓝双阵营底衬色块
+      const halfW = Math.floor((barW - 20) / 2);
+      fb.fillRoundRect(barX + 6, barY + 6, halfW - 6, barH - 12, 13, [255, 42, 74, Math.round(62 * fade)]);
+      fb.strokeRoundRect(barX + 6, barY + 6, halfW - 6, barH - 12, 13, 2, [255, 68, 96, Math.round(195 * fade)]);
+      fb.fillRoundRect(cx + 10, barY + 6, halfW - 6, barH - 12, 13, [24, 162, 255, Math.round(62 * fade)]);
+      fb.strokeRoundRect(cx + 10, barY + 6, halfW - 6, barH - 12, 13, 2, [58, 188, 255, Math.round(195 * fade)]);
+
+      // 红蓝圆点与大号站队口令
+      fb.fillCircle(barX + 36, barY + 32, 9, [255, 58, 86, Math.round(255 * fade)]);
+      drawFit(
+        fb,
+        atlas,
+        "押红方赢扣 1",
+        barX + 6 + (halfW - 6) * 0.5 + 10,
+        barY + 14,
+        [255, 236, 240, Math.round(255 * fade)],
+        halfW - 58,
+        0.44,
+        "center",
+        3,
+        [18, 8, 16, Math.round(245 * fade)],
+      );
+
+      fb.fillCircle(cx + 38, barY + 32, 9, [48, 182, 255, Math.round(255 * fade)]);
+      drawFit(
+        fb,
+        atlas,
+        "押蓝方赢扣 2",
+        cx + 10 + (halfW - 6) * 0.5 + 10,
+        barY + 14,
+        [232, 246, 255, Math.round(255 * fade)],
+        halfW - 58,
+        0.44,
+        "center",
+        3,
+        [8, 14, 24, Math.round(245 * fade)],
+      );
+
+      // 中央金星分隔符
+      drawFit(fb, atlas, "★", cx, barY + 15, [255, 224, 88, Math.round(255 * fade)], 36, 0.42, "center", 2);
+    } else if (deathEv && tb >= deathEv.t) {
+      // 阶段三 (绝杀瞬间..结尾)：将高潮情绪直接转化为评论区扣666站队结算与点播复访！
+      const koAge = tb - deathEv.t;
+      const pop = koAge < 0.24 ? easeOutBack(clamp(koAge / 0.24, 0, 1)) : 1;
+      fb.drawCard(barX, barY, barW, barH, {
+        bgTop: [44, 28, 72, 250],
+        bgBottom: [22, 14, 42, 252],
+        border: [255, 226, 92, 255],
+        borderWidth: 3,
+        radius: 18,
+        shadowAlpha: 145,
+        shadowOffsetY: 5,
+      });
+      drawFit(
+        fb,
+        atlas,
+        "★ 押对胜方的扣 666 集合！下期想看谁评论区点播 ★",
+        cx,
+        barY + 15,
+        [255, 242, 148, 255],
+        barW - 44,
+        0.42 * pop,
+        "center",
+        3,
+        [10, 8, 22, 250],
+      );
+    } else {
+      // 阶段二 (7.2s..绝杀前)：下期点播 + 用户共创设计新英雄直接出镜胶囊！
+      const inAge = tb - 7.2;
+      const pop = inAge < 0.30 ? easeOutBack(clamp(inAge / 0.30, 0, 1)) : 1;
+      const pulseBorder = Math.round(205 + 45 * Math.sin(tb * 5.2));
+      fb.drawCard(barX, barY, barW, barH, {
+        bgTop: [28, 21, 54, 246],
+        bgBottom: [15, 12, 32, 250],
+        border: [255, 218, 82, pulseBorder],
+        borderWidth: 3,
+        radius: 18,
+        shadowAlpha: 125,
+        shadowOffsetY: 5,
+      });
+      drawFit(
+        fb,
+        atlas,
+        "★ 下期想看谁？评论区设计新英雄 · 高赞直接出镜 ★",
+        cx,
+        barY + 15,
+        [255, 238, 136, 255],
+        barW - 44,
+        0.42 * pop,
+        "center",
+        3,
+        [10, 8, 22, 248],
+      );
+    }
   };
 
   // ---------- 6. 开局高燃对战卡 (VS Intro Battle Card) ----------
@@ -3944,15 +4606,11 @@ export async function renderDuel(
         fb.strokeRing(cx, stageY - 18, pOrbR, 5, [r, g, b, Math.round(255 * fadeOut)]);
         drawSkillBallAvatar(fb, v.ballSkillKind, cx, stageY - 18, pOrbR, isLeft ? 1 : -1, false, fadeOut, tNow);
       } else {
-        drawOrbitingWeapons(fb, previewFighter, cx, stageY - 18, { zoom: 0.76 }, tNow);
-        const col = Math.floor(tNow * 10) % 4;
-        sheets[id].drawFrame(fb, col, 2, cx, stageY + 18, {
-          scale: 4.5,
-          flipX: !isLeft,
-          outlineColor: [255, 248, 210, Math.round(255 * fadeOut)],
-          outlinePx: 1,
-          alpha: fadeOut,
-        });
+        drawOrbitingWeapons(fb, previewFighter, cx, stageY - 18, { zoom: 0.78 }, tNow);
+        const pOrbR = Math.round(68);
+        fb.fillCircle(cx, stageY - 18, pOrbR, [18, 16, 32, Math.round(240 * fadeOut)]);
+        fb.strokeRing(cx, stageY - 18, pOrbR, 5, [r, g, b, Math.round(255 * fadeOut)]);
+        drawWeaponBallAvatar(fb, v.weaponKind, v.scaleKind, cx, stageY - 18, pOrbR, isLeft ? 1 : -1, false, fadeOut, tNow);
       }
 
       // 英雄主名称与流派副标题徽章
@@ -4164,12 +4822,12 @@ export async function renderDuel(
       fb.strokeRing(cx, stageY - 58, wOrbR, 6, [wr, wg, wb, 255]);
       drawSkillBallAvatar(fb, winner.ballSkillKind, cx, stageY - 58, wOrbR, 1, false, 1, tNow);
     } else {
-      sheets[winner.id].drawFrame(fb, winCol, 5, cx, stageY + 8, {
-        scale: 5.2,
-        flipX: false,
-        outlineColor: [255, 242, 165, 255],
-        outlinePx: 1,
-      });
+      const winPreview: FighterView = { ...winner, alive: true, reach: Math.min(185, winner.reach * 0.72), bodyScale: 1.08 };
+      drawOrbitingWeapons(fb, winPreview, cx, stageY - 58, { zoom: 0.92 }, tNow);
+      const wOrbR = 82;
+      fb.fillCircle(cx, stageY - 58, wOrbR, [18, 16, 32, 248]);
+      fb.strokeRing(cx, stageY - 58, wOrbR, 6, [wr, wg, wb, 255]);
+      drawWeaponBallAvatar(fb, winner.weaponKind, winner.scaleKind, cx, stageY - 58, wOrbR, 1, false, 1, tNow);
     }
 
     drawFit(fb, atlasBig, winner.name, cx, cardY + 365, [255, 255, 255, 255], 760, 1.0, "center", 4);
@@ -4223,6 +4881,11 @@ export async function renderDuel(
       2,
     );
   };
+
+  let bestCoverScore = -1;
+  let bestCoverPixels: Uint8Array | null = null;
+  let bestCoverFocusX = ARENA_W * 0.5;
+  let bestCoverFocusY = ARENA_H * 0.5;
 
   // ---------- 逐帧生成器 ----------
   async function* frameGen() {
@@ -4287,28 +4950,149 @@ export async function renderDuel(
         }
       }
 
-      const shx = isSkillBallMode ? 0 : cam.shake > 0 ? Math.round(Math.sin(tNow * 95) * cam.shake) : 0;
-      const shy = isSkillBallMode ? 0 : cam.shake > 0 ? Math.round(Math.cos(tNow * 81) * cam.shake * 0.65) : 0;
+      const shx = 0;
+      const shy = 0;
 
-      // 1. 巨型竖屏竞技场地面与霓虹护栏
-      drawGiantArena(fb, tNow, tb, cam, shx, shy);
+      // 检测当前时刻是否处于「时停钟表王 · 时间静止」黑白凝滞结界内
+      const activeTsWin = timeStopWindows.find(w => tb >= w.tStart && tb <= w.tEnd);
 
-      // 2. 双方战斗球体 + 环绕实体进化武器 + 像素精灵（若一方正钳制吸附对手，则吸附方固定在最上层作为行动主人）
-      const order: Side[] = byId.A.latchedTo
-        ? ["B", "A"]
-        : byId.B.latchedTo
-          ? ["A", "B"]
-          : visY.A <= visY.B
+      if (activeTsWin) {
+        const casterSide = activeTsWin.id;
+        const victimSide = activeTsWin.target;
+        const tsDur = Math.max(0.1, activeTsWin.tEnd - activeTsWin.tStart);
+        const tsAge = tb - activeTsWin.tStart;
+        const tsProg = clamp(tsAge / tsDur, 0, 1);
+
+        // 1) 先用凝固在 tStart 的冻结时间轴绘制竞技场地面、敌方所有分身/蛇身以及被定格的猎物本体！
+        drawGiantArena(fb, activeTsWin.tStart + INTRO_SEC, activeTsWin.tStart, cam, shx, shy);
+        drawFighterWithWeapon(fb, byId[victimSide], activeTsWin.tStart + INTRO_SEC, cam, shx, shy, 0, 0);
+
+        // 2) 高饱和皇家紫金星盘结界（保留 82% 原生鲜艳色彩，彻底废除全屏变灰暗导致的路人误判划走！）
+        const [domeCx, domeCy] = worldToScreen(activeTsWin.x, activeTsWin.y, cam, shx, shy);
+        const expandK = clamp(tsAge / 0.16, 0, 1);
+        const domeR = expandK * 1420;
+        const domeR2 = domeR * domeR;
+        const rimWidth = 46;
+        const rimInnerR = Math.max(0, domeR - rimWidth);
+        const rimInnerR2 = rimInnerR * rimInnerR;
+        const fadeOutMul = tsProg > 0.88 ? clamp((1 - tsProg) / 0.12, 0, 1) : 1;
+        const tintMix = 0.18 * fadeOutMul;
+        const pixels = fb.data;
+        const x0 = Math.max(0, AX + 7);
+        const x1 = Math.min(W, AX + AW - 7);
+        const y0 = Math.max(0, AY + 7);
+        const y1 = Math.min(H, AY + AH - 7);
+        for (let py = y0; py < y1; py++) {
+          const dy = py - domeCy;
+          const dy2 = dy * dy;
+          let rowIdx = (py * W + x0) * 4;
+          for (let px = x0; px < x1; px++, rowIdx += 4) {
+            const dx = px - domeCx;
+            const d2 = dx * dx + dy2;
+            if (d2 > domeR2) continue;
+            const r0 = pixels[rowIdx];
+            const g0 = pixels[rowIdx + 1];
+            const b0 = pixels[rowIdx + 2];
+            // 保持绿网/蛇鳞/果冻鲜亮色彩，仅叠一层深邃紫金时空微光，画面全程高亮通透！
+            let outR = r0 * (1 - tintMix) + Math.min(255, r0 * 0.92 + 24) * tintMix;
+            let outG = g0 * (1 - tintMix) + Math.min(255, g0 * 0.88 + 14) * tintMix;
+            let outB = b0 * (1 - tintMix) + Math.min(255, b0 * 1.12 + 46) * tintMix;
+            if (expandK < 1 && d2 >= rimInnerR2) {
+              const dist = Math.sqrt(d2);
+              const u = clamp((dist - rimInnerR) / rimWidth, 0, 1);
+              const bell = Math.sin(u * Math.PI) * 0.78 * (1 - expandK * 0.18);
+              const glowR = u < 0.55 ? 255 : 132;
+              const glowG = u < 0.55 ? 226 : 248;
+              const glowB = u < 0.55 ? 78 : 255;
+              outR = outR + (glowR - outR) * bell;
+              outG = outG + (glowG - outG) * bell;
+              outB = outB + (glowB - outB) * bell;
+            }
+            pixels[rowIdx] = Math.round(outR);
+            pixels[rowIdx + 1] = Math.round(outG);
+            pixels[rowIdx + 2] = Math.round(outB);
+          }
+        }
+        // 重新点亮四周左红右蓝高饱和霓虹边界框
+        fb.strokeRoundRect(AX, AY, AW, AH, 20, 5, [110, 98, 195, 235]);
+        fb.drawLine(AX + 16, AY + 2, AX + AW / 2, AY + 2, 5, [255, 42, 74, 245]);
+        fb.drawLine(AX + AW / 2, AY + 2, AX + AW - 16, AY + 2, 5, [24, 162, 255, 245]);
+        fb.drawLine(AX + 2, AY + 20, AX + 2, AY + AH - 20, 5, [255, 42, 74, 245]);
+        fb.drawLine(AX + AW - 2, AY + 20, AX + AW - 2, AY + AH - 20, 5, [24, 162, 255, 245]);
+        fb.drawLine(AX + 16, AY + AH - 2, AX + AW / 2, AY + AH - 2, 5, [255, 42, 74, 245]);
+        fb.drawLine(AX + AW / 2, AY + AH - 2, AX + AW - 16, AY + AH - 2, 5, [24, 162, 255, 245]);
+
+        // 2b) 在被定身的猎物身上直接套上高对比「琥珀金时空锁链枷锁环」，0.2秒一眼看懂谁被定住！
+        const victim = byId[victimSide];
+        const [vxScreen, vyScreen] = worldToScreen(visX[victimSide], visY[victimSide], cam, shx, shy);
+        const lockR = Math.round(68 * victim.bodyScale * cam.zoom);
+        const lockAlpha = Math.round(245 * fadeOutMul);
+        fb.drawGlowCircle(vxScreen, vyScreen, Math.round(lockR * 1.35), [255, 204, 48, Math.round(92 * fadeOutMul)]);
+        fb.strokeRing(vxScreen, vyScreen, lockR, 5, [255, 218, 64, lockAlpha]);
+        fb.strokeRing(vxScreen, vyScreen, Math.round(lockR * 1.22), 3, [120, 248, 255, Math.round(lockAlpha * 0.88)]);
+        for (let cIdx = 0; cIdx < 4; cIdx++) {
+          const ca = (cIdx * Math.PI) / 2 + Math.PI * 0.25;
+          const cx1 = vxScreen + Math.cos(ca) * (lockR * 0.82);
+          const cy1 = vyScreen + Math.sin(ca) * (lockR * 0.82);
+          const cx2 = vxScreen + Math.cos(ca) * (lockR * 1.34);
+          const cy2 = vyScreen + Math.sin(ca) * (lockR * 1.34);
+          fb.drawLine(cx1, cy1, cx2, cy2, 6, [255, 226, 82, lockAlpha]);
+          fb.fillCircle(cx2, cy2, 7, [255, 250, 205, lockAlpha]);
+        }
+
+        // 3) 场地中央浮现巨型半透明黄金古典怀表大法阵，秒针随剩余时停时间旋转一整圈倒计时！
+        const acx = Math.round(AX + AW * 0.5);
+        const acy = Math.round(AY + AH * 0.5);
+        const dialR = 340;
+        const dialAlpha = Math.round(135 * fadeOutMul);
+        fb.strokeRing(acx, acy, dialR, 4, [255, 214, 62, dialAlpha]);
+        fb.strokeRing(acx, acy, Math.round(dialR * 0.88), 2, [135, 248, 255, Math.round(dialAlpha * 0.75)]);
+        for (let h = 0; h < 12; h++) {
+          const ha = (h * Math.PI) / 6 - Math.PI * 0.5;
+          const rIn = h % 3 === 0 ? dialR * 0.78 : dialR * 0.84;
+          fb.drawLine(
+            acx + Math.cos(ha) * rIn,
+            acy + Math.sin(ha) * rIn,
+            acx + Math.cos(ha) * dialR * 0.96,
+            acy + Math.sin(ha) * dialR * 0.96,
+            h % 3 === 0 ? 6 : 3,
+            [255, 224, 82, dialAlpha],
+          );
+        }
+        const handAng = -Math.PI * 0.5 + tsProg * Math.PI * 2;
+        fb.drawLine(
+          acx,
+          acy,
+          acx + Math.cos(handAng) * dialR * 0.76,
+          acy + Math.sin(handAng) * dialR * 0.76,
+          6,
+          [255, 226, 78, Math.round(195 * fadeOutMul)],
+        );
+        fb.fillCircle(acx, acy, 12, [255, 232, 96, Math.round(210 * fadeOutMul)]);
+
+        // 4) 最后以 100% 鲜艳夺目的炽金全彩单独绘制「时停钟表王」与黄金悬停斩击剑针，形成黑白世界 vs 黄金神明极致反差！
+        drawFighterWithWeapon(fb, byId[casterSide], tNow, cam, shx, shy, 0, 0);
+      } else {
+        // 1. 巨型竖屏竞技场地面与霓虹护栏
+        drawGiantArena(fb, tNow, tb, cam, shx, shy);
+
+        // 2. 双方战斗球体 + 环绕实体进化武器 + 像素精灵（若一方正钳制吸附对手，则吸附方固定在最上层作为行动主人）
+        const order: Side[] = byId.A.latchedTo
+          ? ["B", "A"]
+          : byId.B.latchedTo
             ? ["A", "B"]
-            : ["B", "A"];
-      for (const id of order) {
-        const isTargetShake = isSkillBallMode && cam.shake > 0 && (!cam.targetSide || cam.targetSide === id);
-        const localShx = isTargetShake ? Math.round(Math.sin(tNow * 155) * cam.shake) : 0;
-        const localShy = isTargetShake ? Math.round(Math.cos(tNow * 137) * cam.shake * 0.8) : 0;
-        drawFighterWithWeapon(fb, byId[id], tNow, cam, shx, shy, localShx, localShy);
+            : visY.A <= visY.B
+              ? ["A", "B"]
+              : ["B", "A"];
+        for (const id of order) {
+          const isTargetShake = cam.shake > 0 && (!cam.targetSide || cam.targetSide === id);
+          const localShx = isTargetShake ? Math.round(Math.sin(tNow * 155) * cam.shake) : 0;
+          const localShy = isTargetShake ? Math.round(Math.cos(tNow * 137) * cam.shake * 0.8) : 0;
+          drawFighterWithWeapon(fb, byId[id], tNow, cam, shx, shy, localShx, localShy);
+        }
       }
 
-      // 3. 弹刀十字星芒火花 / 破防刀光 / 伤害跳字
+      // 3. 弹刀十字星芒火花 / 时停黄金悬停剑针 / 伤害跳字
       drawArenaFx(fb, tb, cam, shx, shy);
 
       // 4. 极简顶部 HUD（悬念标题 + 缓动血条 + Beat-Pop 武器进化徽章）
@@ -4322,12 +5106,11 @@ export async function renderDuel(
         drawVsIntro(fb, tNow);
       }
 
-      // 7. K.O. 决胜横幅（延后至 deathEv.t + 0.58s 弹出，先把最后 0.58 秒绝杀大招、爆裂碎片与败方 X_X 击飞撞墙完整呈现给观众！）
-      const deathEv = events.find(e => e.type === "death") as Extract<SimEvent, { type: "death" }> | undefined;
-      if (deathEv && tb >= deathEv.t + 0.58 && tb <= battleSec && endEv) {
+      // 7. K.O. 决胜横幅（在绝杀慢放击飞 0.22s 后即刻盖章于鲜活战场上，再停留 0.42s 利落收尾，压缩尾部划走折损！）
+      if (deathEv && tb >= deathEv.t + 0.22 && tb <= battleSec && endEv) {
         const winner = byId[endEv.winner];
-        const koAge = tb - (deathEv.t + 0.58);
-        const koScale = easeOutBack(clamp(koAge / 0.20, 0, 1));
+        const koAge = tb - (deathEv.t + 0.22);
+        const koScale = easeOutBack(clamp(koAge / 0.15, 0, 1));
         fb.drawCard(W / 2 - 340, 840, 680, 168, {
           bgTop: [36, 24, 64, 244],
           bgBottom: [18, 12, 36, 248],
@@ -4351,9 +5134,62 @@ export async function renderDuel(
         );
       }
 
-      // 7. 赛后荣誉台
-      if (tb > battleSec) {
+      if (settleSec > 0 && tb > battleSec) {
         drawVictoryCard(fb, tb, tNow);
+      }
+
+      // 8. 3:4 封面引擎 2.0：优先抓拍「视觉膨胀满级期 + 场地正中央高对比交锋帧」，主体特写放大 1.35x！
+      if (coverPath && tb >= 0.45 && tb <= duration * 0.90 && byId.A.alive && byId.B.alive && cam.flashAlpha <= 65) {
+        let score = (activeProps.A.length + activeProps.B.length) * 8.5 + activeWebs.size * 7.5;
+        score += (activeClones.A.length + activeClones.B.length + activeShurikens.A.length + activeShurikens.B.length) * 9.0;
+        const distAB = Math.hypot(byId.A.x - byId.B.x, byId.A.y - byId.B.y);
+        const midX = (byId.A.x + byId.B.x) * 0.5;
+        const midY = (byId.A.y + byId.B.y) * 0.5;
+        const offCenter = Math.hypot(midX - ARENA_W * 0.5, midY - ARENA_H * 0.5);
+        score -= offCenter * 0.20; // 强优先选择场地正中央的交锋瞬间，杜绝贴墙偏置留黑
+        const centered =
+          byId.A.x > 165 && byId.A.x < ARENA_W - 165 && byId.B.x > 165 && byId.B.x < ARENA_W - 165 &&
+          byId.A.y > 195 && byId.A.y < ARENA_H - 195 && byId.B.y > 195 && byId.B.y < ARENA_H - 195;
+        if (distAB < 360) score += 48;
+        if (distAB < 245) score += 42;
+        if (centered) score += 44;
+        if (tb >= duration * 0.42) score += 38; // 优先选取双方体型/刀长/蛇节/分身已膨胀成型的高潮帧
+        if (!isSkillBallMode) {
+          score +=
+            (byId.A.rageStacks + byId.B.rageStacks) * 10.5 +
+            (byId.A.bladeCount + byId.B.bladeCount) * 7.5 +
+            Math.max(0, byId.A.reach + byId.B.reach - 340) * 0.22;
+        } else {
+          score += (byId.A.rageStacks + byId.B.rageStacks) * 4.5;
+        }
+        if (activeTsWin) {
+          const tsP = (tb - activeTsWin.tStart) / Math.max(0.1, activeTsWin.tEnd - activeTsWin.tStart);
+          if (tsP >= 0.42 && tsP <= 0.88 && distAB < 360) score += 115;
+        }
+        for (const fx of fxList) {
+          const age = tb - fx.t0;
+          if (age >= 0.03 && age <= 0.24) {
+            if (
+              fx.kind === "seriousPunchWave" ||
+              fx.kind === "railgunBeam" ||
+              fx.kind === "frostNovaRing" ||
+              fx.kind === "timeStopShatter" ||
+              fx.kind === "ultBurst"
+            ) {
+              score += 82;
+            } else if ((fx.kind === "parrySpark" || fx.kind === "slash") && age <= 0.16) {
+              score += isSkillBallMode ? 52 : 92;
+            } else if (fx.kind === "hitBurst" && fx.big) {
+              score += isSkillBallMode ? 32 : 48;
+            }
+          }
+        }
+        if (score > bestCoverScore) {
+          bestCoverScore = score;
+          bestCoverPixels = new Uint8Array(fb.data);
+          bestCoverFocusX = clamp((byId.A.x + byId.B.x) * 0.5, 290, ARENA_W - 290);
+          bestCoverFocusY = clamp((byId.A.y + byId.B.y) * 0.5, 330, ARENA_H - 330);
+        }
       }
 
       for (const id of ["A", "B"] as Side[]) {
@@ -4364,5 +5200,118 @@ export async function renderDuel(
   }
 
   await encodeFrames(frameGen(), { width: W, height: H, fps: FPS, outPath: outMp4, audioPath: sfxWav, crf: 19 });
+
+  if (coverPath && bestCoverPixels) {
+    const coverH = 1440; // 1080×1440 (3:4 黄金比例，预留上下各108px防裁切安全区 + 1.35x 满级主体特写放大)
+    const coverFb = new FrameBuf(W, coverH);
+    coverFb.blendGradientRect(0, 0, W, coverH, [8, 7, 18, 255], [6, 5, 14, 255], true);
+
+    // 中央高张力战场特写视口 (Y: 236..1254, 高 1018px)：围绕双方交锋焦点放大 1.35x 双线性采样，双列小图一眼看清冲突！
+    const viewY0 = 236;
+    const viewH = 1018;
+    const zoomCover = 1.35;
+    const srcW = AW / zoomCover;
+    const srcH = (srcW * viewH) / W;
+    const focusSx = AX + bestCoverFocusX * SCALE_X;
+    const focusSy = AY + bestCoverFocusY * SCALE_Y;
+    const srcX0 = clamp(focusSx - srcW * 0.5, AX + 6, AX + AW - 6 - srcW);
+    const srcY0 = clamp(focusSy - srcH * 0.5, AY + 6, AY + AH - 6 - srcH);
+    const dstData = coverFb.data;
+    for (let dy = 0; dy < viewH; dy++) {
+      const sy = srcY0 + ((dy + 0.5) / viewH) * srcH;
+      const y0 = Math.floor(sy);
+      const y1 = Math.min(H - 1, y0 + 1);
+      const wy = sy - y0;
+      let dstIdx = ((viewY0 + dy) * W) * 4;
+      for (let dx = 0; dx < W; dx++, dstIdx += 4) {
+        const sx = srcX0 + ((dx + 0.5) / W) * srcW;
+        const x0 = Math.floor(sx);
+        const x1 = Math.min(W - 1, x0 + 1);
+        const wx = sx - x0;
+        const i00 = (y0 * W + x0) * 4;
+        const i10 = (y0 * W + x1) * 4;
+        const i01 = (y1 * W + x0) * 4;
+        const i11 = (y1 * W + x1) * 4;
+        const w00 = (1 - wx) * (1 - wy);
+        const w10 = wx * (1 - wy);
+        const w01 = (1 - wx) * wy;
+        const w11 = wx * wy;
+        dstData[dstIdx] = Math.round(
+          bestCoverPixels[i00] * w00 + bestCoverPixels[i10] * w10 + bestCoverPixels[i01] * w01 + bestCoverPixels[i11] * w11,
+        );
+        dstData[dstIdx + 1] = Math.round(
+          bestCoverPixels[i00 + 1] * w00 + bestCoverPixels[i10 + 1] * w10 + bestCoverPixels[i01 + 1] * w01 + bestCoverPixels[i11 + 1] * w11,
+        );
+        dstData[dstIdx + 2] = Math.round(
+          bestCoverPixels[i00 + 2] * w00 + bestCoverPixels[i10 + 2] * w10 + bestCoverPixels[i01 + 2] * w01 + bestCoverPixels[i11 + 2] * w11,
+        );
+        dstData[dstIdx + 3] = 255;
+      }
+    }
+
+    // 视口上下红蓝霓虹分割灯带
+    coverFb.drawLine(0, viewY0, W / 2, viewY0, 5, [255, 52, 84, 245]);
+    coverFb.drawLine(W / 2, viewY0, W, viewY0, 5, [36, 174, 255, 245]);
+    coverFb.drawLine(0, viewY0 + viewH, W / 2, viewY0 + viewH, 5, [255, 52, 84, 245]);
+    coverFb.drawLine(W / 2, viewY0 + viewH, W, viewY0 + viewH, 5, [36, 174, 255, 245]);
+
+    // 顶部防裁切安全区海报标题栏 (Y: 108..224，顶部留足 108px 防出血边距，视频号信息流与后台卡片绝不切头！)
+    coverFb.blendGradientRect(0, 0, W, viewY0 - 2, [8, 7, 18, 255], [14, 11, 28, 252], true);
+    coverFb.drawGlowCircle(240, 166, 260, [255, 42, 74, 88]);
+    coverFb.drawGlowCircle(W - 240, 166, 260, [24, 162, 255, 88]);
+
+    // 左红右蓝英雄大铭牌
+    coverFb.drawCard(36, 108, 438, 116, {
+      bgTop: [96, 18, 36, 248],
+      bgBottom: [28, 12, 26, 252],
+      border: [255, 68, 96, 255],
+      borderWidth: 3,
+      radius: 22,
+      shadowAlpha: 150,
+      shadowOffsetY: 6,
+    });
+    drawFit(coverFb, atlasBig, byId.A.name, 255, 116, [255, 255, 255, 255], 404, 0.58, "center", 4);
+    drawFit(coverFb, atlas, `「${byId.A.title}」`, 255, 179, [255, 228, 112, 255], 390, 0.38, "center", 2);
+
+    coverFb.drawCard(W - 36 - 438, 108, 438, 116, {
+      bgTop: [16, 62, 118, 248],
+      bgBottom: [12, 20, 42, 252],
+      border: [58, 188, 255, 255],
+      borderWidth: 3,
+      radius: 22,
+      shadowAlpha: 150,
+      shadowOffsetY: 6,
+    });
+    drawFit(coverFb, atlasBig, byId.B.name, W - 255, 116, [255, 255, 255, 255], 404, 0.58, "center", 4);
+    drawFit(coverFb, atlas, `「${byId.B.title}」`, W - 255, 179, [168, 238, 255, 255], 390, 0.38, "center", 2);
+
+    // 中央黄金 VS 徽章
+    coverFb.drawCard(W / 2 - 58, 110, 116, 112, {
+      bgTop: [255, 212, 68, 255],
+      bgBottom: [218, 112, 18, 255],
+      border: [255, 250, 215, 255],
+      borderWidth: 4,
+      radius: 26,
+      shadowAlpha: 175,
+      shadowOffsetY: 6,
+    });
+    drawFit(coverFb, atlasBig, "VS", W / 2, 129, [255, 255, 255, 255], 96, 0.64, "center", 4);
+
+    // 底部防裁切高悬念冲突金句条 (Y: 1266..1324，底部留足 116px 安全区边距！)
+    coverFb.blendGradientRect(0, viewY0 + viewH + 2, W, coverH - (viewY0 + viewH + 2), [14, 11, 28, 252], [6, 5, 14, 255], true);
+    const coverHook = hookText ?? `${byId.A.title} VS ${byId.B.title}，谁能活到最后？`;
+    coverFb.drawCard(48, 1266, W - 96, 58, {
+      bgTop: [28, 21, 54, 248],
+      bgBottom: [15, 12, 32, 252],
+      border: [255, 218, 82, 245],
+      borderWidth: 3,
+      radius: 16,
+    });
+    drawFit(coverFb, atlas, `★ ${coverHook} ★`, W / 2, 1278, [255, 238, 136, 255], W - 136, 0.41, "center", 3);
+
+    writePng(coverPath, coverFb);
+    console.log(`cover 3:4 rendered -> ${coverPath}`);
+  }
+
   console.log(`duel rendered -> ${outMp4}`);
 }

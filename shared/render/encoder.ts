@@ -20,7 +20,7 @@ export async function encodeFrames(frames: AsyncIterable<FrameBuf> | Iterable<Fr
   }
   args.push(
     "-c:v", "libx264", "-preset", "medium", "-crf", String(opts.crf ?? 24),
-    "-maxrate", "3400k", "-bufsize", "6800k",
+    "-maxrate", "2350k", "-bufsize", "4700k",
     "-pix_fmt", "yuv420p", "-movflags", "+faststart",
     opts.outPath,
   );

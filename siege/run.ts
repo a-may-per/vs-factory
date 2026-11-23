@@ -1,6 +1,6 @@
 // siege 一键流水线：窄口绝境死守 / 死角光暗手电搜房 / 断电探照灯 / 声呐潜行 / 多队迷宫汇合 → 26人交叉火网反推丧尸母巢
 // 用法:
-//   node --experimental-strip-types siege/run.ts [seed] [--mode combo|rescue|infect|multiply|bunker|scavenge|blackout|sonar|maze-infect|random] [--map canyon-bridge|twin-corridor|cross-bunker] [--duration 42] [--bgm path/to/bgm.mp3]
+//   node --experimental-strip-types siege/run.ts [seed] [--mode combo|rescue|infect|multiply|bunker|scavenge|blackout|sonar|maze-infect|random] [--map canyon-bridge|twin-corridor|cross-bunker] [--duration 42] [--optimize] [--bgm path/to/bgm.mp3]
 import { mkdirSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import {
   type SiegeMapId,
   type SiegeModeId,
 } from "./src/config.ts";
+import { findGoldenSeed } from "./src/optimizer.ts";
 import { renderSiegeVideo } from "./src/render.ts";
 
 const PROJ_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -70,18 +71,28 @@ if (modeArg === "random") {
 }
 const modeMeta = SIEGE_MODE_META[modeId];
 
+// 5. 支持 --optimize 蒙特卡洛黄金种子寻优
+let finalSeed = seed;
+if (process.argv.includes("--optimize")) {
+  const opt = findGoldenSeed(modeId, seed, 80, mapId);
+  finalSeed = opt.best.seed;
+  console.log(
+    `[0/2] Monte Carlo optimized seed=${finalSeed} (score=${opt.best.totalScore}/100, passed=${opt.passedCount}/${opt.scannedCount})`,
+  );
+}
+
 const customOut = getFlag("--out");
 const bgmPath = getFlag("--bgm");
-const mp4FileName = `siege_${verTag}_seed${seed}_${mapId}_${modeId}.mp4`;
+const mp4FileName = `siege_${verTag}_seed${finalSeed}_${mapId}_${modeId}.mp4`;
 const outMp4 = customOut ?? join(SIEGE_OUT_DIR, mp4FileName);
 
 console.log(
-  `[1/2] starting siege ${verTag} | mode=${modeMeta.name} (${modeId}) | map=${mapCfg.name} (${mapId}) | seed=${seed} | dur=${durationSec ? `${durationSec}s` : "auto(反推母巢决胜)"}${bgmPath ? ` | bgm=${bgmPath}` : " | bgm=3-Act-Phonk+ASMR"} ...`,
+  `[1/2] starting siege ${verTag} | mode=${modeMeta.name} (${modeId}) | map=${mapCfg.name} (${mapId}) | seed=${finalSeed} | dur=${durationSec ? `${durationSec}s` : "auto(反推母巢决胜)"}${bgmPath ? ` | bgm=${bgmPath}` : " | bgm=Stereo-3-Act-Phonk+ASMR"} ...`,
 );
 const stats = await renderSiegeVideo({
   mapId,
   modeId,
-  seed,
+  seed: finalSeed,
   durationSec,
   outMp4,
   hookTitle: modeMeta.hookTitle,

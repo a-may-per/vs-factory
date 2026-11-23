@@ -10,15 +10,15 @@ export interface SfxSpec {
 }
 
 const SPECS: Record<SfxKind, SfxSpec> = {
-  punch:     { dur: 0.12, freq: 220,  freqEnd: 60,   noise: 0.55, decay: 10, vol: 0.9,  slide: 4,  squareMix: 0.3 },
-  crit:      { dur: 0.20, freq: 320,  freqEnd: 50,   noise: 0.7,  decay: 8,  vol: 1.0,  slide: 5,  squareMix: 0.4 },
-  skill:     { dur: 0.24, freq: 520,  freqEnd: 135,  noise: 0.18, decay: 7,  vol: 0.85, slide: -3, squareMix: 0.65 },
-  death:     { dur: 0.55, freq: 180,  freqEnd: 30,   noise: 0.4,  decay: 4,  vol: 1.0,  slide: -4, squareMix: 0.5 },
-  "vs-slam": { dur: 0.45, freq: 140,  freqEnd: 35,   noise: 0.8,  decay: 5,  vol: 1.0,  slide: 2,  squareMix: 0.2 },
-  coin:      { dur: 0.09, freq: 900,  freqEnd: 1400, noise: 0.0,  decay: 9,  vol: 0.55, slide: -2, squareMix: 0.85 },
-  whoosh:    { dur: 0.20, freq: 420,  freqEnd: 95,   noise: 0.85, decay: 7,  vol: 0.5,  slide: 1,  squareMix: 0.0 },
-  hit:       { dur: 0.07, freq: 340,  freqEnd: 115,  noise: 0.30, decay: 13, vol: 0.55, slide: -2, squareMix: 0.35 },
-  parry:     { dur: 0.15, freq: 1240, freqEnd: 1760, noise: 0.14, decay: 8,  vol: 0.95, slide: 2,  squareMix: 0.55 },
+  punch:     { dur: 0.12, freq: 245,  freqEnd: 68,   noise: 0.20, decay: 10,  vol: 0.92, slide: 4,  squareMix: 0.24 },
+  crit:      { dur: 0.20, freq: 350,  freqEnd: 58,   noise: 0.24, decay: 8,   vol: 1.0,  slide: 5,  squareMix: 0.30 },
+  skill:     { dur: 0.24, freq: 520,  freqEnd: 135,  noise: 0.14, decay: 7,   vol: 0.85, slide: -3, squareMix: 0.55 },
+  death:     { dur: 0.55, freq: 180,  freqEnd: 30,   noise: 0.32, decay: 4,   vol: 1.0,  slide: -4, squareMix: 0.45 },
+  "vs-slam": { dur: 0.38, freq: 155,  freqEnd: 38,   noise: 0.32, decay: 5.5, vol: 1.0,  slide: 2,  squareMix: 0.18 },
+  coin:      { dur: 0.09, freq: 920,  freqEnd: 1460, noise: 0.0,  decay: 9,   vol: 0.58, slide: -2, squareMix: 0.65 },
+  whoosh:    { dur: 0.18, freq: 420,  freqEnd: 95,   noise: 0.65, decay: 7.5, vol: 0.48, slide: 1,  squareMix: 0.0 },
+  hit:       { dur: 0.075, freq: 380, freqEnd: 135,  noise: 0.12, decay: 13,  vol: 0.58, slide: -2, squareMix: 0.25 },
+  parry:     { dur: 0.15, freq: 1260, freqEnd: 1820, noise: 0.07, decay: 8,   vol: 0.96, slide: 2,  squareMix: 0.45 },
 };
 
 const SR = 44100;
@@ -42,20 +42,22 @@ export function synthSfx(kind: SfxKind, seed = 42, pitchMul = 1.0): Float32Array
   let phase2 = 0;
   for (let i = 0; i < n; i++) {
     const k = i / n;
-    // 频率滑动 + 指数衰减包络
+    // 频率滑动 + 指数衰减包络（零直流偏置 + 清脆泛音，彻底消除白噪刺耳底噪）
     const f = spec.freq * Math.pow(spec.freqEnd / spec.freq, k) * pitchMul;
     phase += (2 * Math.PI * f) / SR;
     phase2 += (2 * Math.PI * f * 2.41) / SR;
     const env = Math.exp(-spec.decay * k * 3);
-    const square = Math.sign(Math.sin(phase)) * 0.5 + 0.5;
-    const sine = (Math.sin(phase) + 1) / 2;
-    let tone = square * spec.squareMix + sine * (1 - spec.squareMix);
+    const square = Math.sign(Math.sin(phase)) * 0.72;
+    const harmonicSine =
+      Math.sin(phase) * 0.72 + Math.sin(phase * 2) * 0.20 + Math.sin(phase * 3) * 0.08;
+    let tone = square * spec.squareMix + harmonicSine * (1 - spec.squareMix);
     if (kind === "parry") {
-      // 金属刀剑交击泛音（Inharmonic metallic bell overtone）
-      const ring = Math.sin(phase) * 0.55 + Math.sin(phase2) * 0.45;
-      tone = ring;
+      // 金属刀剑/弹球清脆泛音（Inharmonic metallic bell overtone）
+      tone = Math.sin(phase) * 0.58 + Math.sin(phase2) * 0.42;
+    } else if (kind === "coin") {
+      tone = Math.sin(phase) * 0.70 + Math.sin(phase * 2) * 0.30;
     }
-    const noise = rng() * 2 - 1;
+    const noise = (rng() * 2 - 1) * Math.exp(-k * 5.5);
     const sample = tone * (1 - spec.noise) + noise * spec.noise;
     out[i] = sample * env * spec.vol;
   }

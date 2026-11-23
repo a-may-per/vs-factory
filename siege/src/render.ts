@@ -2,7 +2,7 @@
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { unlinkSync } from "node:fs";
+import { unlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import {
   ARENA_W,
@@ -11,8 +11,14 @@ import {
   WORLD_H,
   CORRIDOR_CX,
   SIEGE_MODE_META,
+  getArchZones,
+  getInteriorProps,
+  getDoorways,
+  getDeadCornerWalls,
   getCorridorBounds,
   getOuterWallSegments,
+  type InteriorPropSpec,
+  type DoorwaySpec,
   type SiegeMapId,
   type SiegeModeId,
 } from "./config.ts";
@@ -22,12 +28,12 @@ import {
   NAV_COLS,
   NAV_ROWS,
   NAV_CELL,
+  type DestructiblePropState,
   type SiegeAudioEvent,
 } from "./sim.ts";
 import { FrameBuf, type RGBA } from "../../shared/render/framebuf.ts";
 import { FontAtlas } from "../../shared/render/atlas.ts";
 import { encodeFrames } from "../../shared/render/encoder.ts";
-import { writeWav } from "../../shared/audio/sfx.ts";
 
 const PROJ_ROOT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const OUT_W = 1080;
@@ -125,12 +131,143 @@ function drawCornerBrackets(
 }
 
 /**
- * 绘制各模式专属【战术入场载具（重装防暴军用大巴 / 押运装甲大巴 / 黑鹰武装直升机 / 声呐侦察直升机）】
+ * 绘制平滑环形进度弧线 (0..1 -> 0°..360° 顺时针填充，用于商铺幸存者路障破拆与补给仓解锁进度展示)
+ */
+function drawRadialProgressArc(
+  fb: FrameBuf,
+  cx: number,
+  cy: number,
+  r: number,
+  frac: number,
+  thickness: number,
+  col: RGBA,
+): void {
+  const clamped = clamp(frac, 0, 1);
+  if (clamped <= 0.005) return;
+  const segs = Math.max(4, Math.ceil(clamped * 48));
+  const startAng = -Math.PI * 0.5;
+  const totalAng = clamped * Math.PI * 2;
+  let prevX = cx + Math.cos(startAng) * r;
+  let prevY = cy + Math.sin(startAng) * r;
+  for (let s = 1; s <= segs; s++) {
+    const ang = startAng + (s / segs) * totalAng;
+    const nx = cx + Math.cos(ang) * r;
+    const ny = cy + Math.sin(ang) * r;
+    fb.drawLine(prevX, prevY, nx, ny, thickness, col);
+    prevX = nx;
+    prevY = ny;
+  }
+}
+
+/**
+ * 纯几何矢量绘制国际通用【三叶生物危害标志 ☣ (Biohazard Emblem)】（零文字直观传达“感染尸变”！）
+ */
+function drawBiohazardSymbol(
+  fb: FrameBuf,
+  cx: number,
+  cy: number,
+  rad: number,
+  rotRad: number,
+  col: RGBA,
+): void {
+  fb.strokeRing(cx, cy, rad * 0.24, 1.8, col);
+  for (let k = 0; k < 3; k++) {
+    const ang = rotRad + (k * Math.PI * 2) / 3;
+    const ox = cx + Math.cos(ang) * (rad * 0.54);
+    const oy = cy + Math.sin(ang) * (rad * 0.54);
+    fb.strokeRing(ox, oy, rad * 0.44, 2.2, col);
+    // 三叶外尖刺短线
+    fb.drawLine(
+      cx + Math.cos(ang) * (rad * 0.85),
+      cy + Math.sin(ang) * (rad * 0.85),
+      cx + Math.cos(ang) * (rad * 1.12),
+      cy + Math.sin(ang) * (rad * 1.12),
+      2.0,
+      col,
+    );
+  }
+}
+
+/**
+ * 构建支持任意平滑变焦倍率 (zoom = 1.0..2.15) 的世界空间矢量代理画布：
+ * - 所有世界坐标 (BOARD_X + wx - camX, BOARD_Y + wy - camY) 自动按 zoom 映射到 1080p 屏幕像素，保持 100% 原生 SDF 抗锯齿锐度！
+ */
+function createZoomedFrameBuf(base: FrameBuf, zoom: number): FrameBuf {
+  if (Math.abs(zoom - 1.0) < 0.002) return base;
+  const zx = (x: number) => BOARD_X + (x - BOARD_X) * zoom;
+  const zy = (y: number) => BOARD_Y + (y - BOARD_Y) * zoom;
+  const zs = (s: number) => s * zoom;
+  const proxy = {
+    w: base.w,
+    h: base.h,
+    data: base.data,
+    fillRect(x: number, y: number, w: number, h: number, c: RGBA) {
+      base.fillRect(zx(x), zy(y), zs(w), zs(h), c);
+    },
+    blendRect(x: number, y: number, w: number, h: number, c: RGBA) {
+      base.blendRect(zx(x), zy(y), zs(w), zs(h), c);
+    },
+    blendGradientRect(
+      x: number,
+      y: number,
+      w: number,
+      h: number,
+      cStart: RGBA,
+      cEnd: RGBA,
+      vertical = true,
+    ) {
+      base.blendGradientRect(zx(x), zy(y), zs(w), zs(h), cStart, cEnd, vertical);
+    },
+    fillRoundRect(x: number, y: number, w: number, h: number, radius: number, c: RGBA) {
+      base.fillRoundRect(zx(x), zy(y), zs(w), zs(h), zs(radius), c);
+    },
+    blendRoundRect(x: number, y: number, w: number, h: number, radius: number, c: RGBA) {
+      base.blendRoundRect(zx(x), zy(y), zs(w), zs(h), zs(radius), c);
+    },
+    strokeRoundRect(
+      x: number,
+      y: number,
+      w: number,
+      h: number,
+      radius: number,
+      borderW: number,
+      c: RGBA,
+    ) {
+      base.strokeRoundRect(zx(x), zy(y), zs(w), zs(h), zs(radius), zs(borderW), c);
+    },
+    fillCircle(cx: number, cy: number, r: number, c: RGBA) {
+      base.fillCircle(zx(cx), zy(cy), zs(r), c);
+    },
+    blendCircle(cx: number, cy: number, r: number, c: RGBA) {
+      base.blendCircle(zx(cx), zy(cy), zs(r), c);
+    },
+    strokeRing(cx: number, cy: number, r: number, w: number, c: RGBA) {
+      base.strokeRing(zx(cx), zy(cy), zs(r), zs(w), c);
+    },
+    drawGlowCircle(cx: number, cy: number, r: number, c: RGBA) {
+      base.drawGlowCircle(zx(cx), zy(cy), zs(r), c);
+    },
+    drawLine(x1: number, y1: number, x2: number, y2: number, w: number, c: RGBA) {
+      base.drawLine(zx(x1), zy(y1), zx(x2), zy(y2), zs(w), c);
+    },
+    drawBar(x: number, y: number, w: number, h: number, frac: number, style: Parameters<FrameBuf["drawBar"]>[5]) {
+      base.drawBar(zx(x), zy(y), zs(w), zs(h), frac, {
+        ...style,
+        radius: style.radius ? zs(style.radius) : undefined,
+      });
+    },
+  };
+  return proxy as unknown as FrameBuf;
+}
+
+/**
+ * 绘制重型压迫感【战术入场载具（八轮重装破障军用大巴 / 双发重装黑鹰武装直升机）】
+ * 配合开场 2.08x 镜头特写放大，在屏幕上呈现近 400px 翼展/车长的钢铁巨兽视觉冲击！
  */
 function renderInsertionVehicles(
   fb: FrameBuf,
   sim: SiegeSimulator,
-  atlas: FontAtlas,
+  _atlas: FontAtlas,
   ox: number,
   oy: number,
   frameIdx: number,
@@ -140,268 +277,304 @@ function renderInsertionVehicles(
     if (v.phase === "gone") continue;
     const vx = ox + v.x;
     const vy = oy + v.y;
-    if (
-      vx < BOARD_X - 110 ||
-      vx > BOARD_X + ARENA_W + 110 ||
-      vy < BOARD_Y - 110 ||
-      vy > BOARD_Y + ARENA_H + 110
-    ) {
-      continue;
-    }
 
     if (v.kind === "bus") {
       const isPrison = sim.mode === "maze-infect";
-      const bodyCol: RGBA = isPrison ? [46, 26, 62, 255] : [32, 56, 78, 255];
-      const roofCol: RGBA = isPrison ? [66, 36, 86, 255] : [48, 82, 112, 255];
-      const borderCol: RGBA = isPrison ? [245, 115, 215, 250] : [115, 225, 255, 250];
+      const bodyCol: RGBA = isPrison ? [48, 26, 66, 255] : [30, 56, 80, 255];
+      const roofCol: RGBA = isPrison ? [72, 38, 94, 255] : [48, 86, 118, 255];
+      const borderCol: RGBA = isPrison ? [245, 115, 215, 250] : [115, 228, 255, 250];
 
-      // 1. 急刹双轮胎黑色刹车印痕
-      for (const tx of [-18, 18]) {
-        fb.drawLine(vx + tx, vy + 42, vx + tx, vy + 108, 4.5, [8, 10, 16, 175]);
+      // 1. 双排加宽重型防爆轮胎橡胶刹印
+      for (const tx of [-26, 26]) {
+        fb.drawLine(vx + tx, vy + 58, vx + tx, vy + 142, 6.2, [6, 8, 14, 185]);
       }
 
-      // 2. 车身底部厚重阴影与 6 轮外凸防爆宽胎
-      fb.blendRoundRect(vx - 29, vy - 54, 58, 108, 9, [5, 8, 14, 225]);
-      for (const wyOff of [-32, 0, 32]) {
-        fb.fillRect(vx - 28, vy + wyOff - 7, 5, 14, [18, 22, 28, 255]);
-        fb.fillRect(vx + 23, vy + wyOff - 7, 5, 14, [18, 22, 28, 255]);
+      // 2. 重型底盘投影与 8 轮外凸越野防爆宽胎
+      fb.blendRoundRect(vx - 41, vy - 76, 82, 152, 11, [4, 7, 13, 230]);
+      for (const wyOff of [-46, -15, 16, 47]) {
+        fb.fillRect(vx - 40, vy + wyOff - 9, 8, 18, [16, 20, 26, 255]);
+        fb.fillRect(vx + 32, vy + wyOff - 9, 8, 18, [16, 20, 26, 255]);
+        fb.drawLine(vx - 39, vy + wyOff, vx - 33, vy + wyOff, 1.8, [75, 92, 115, 220]);
+        fb.drawLine(vx + 33, vy + wyOff, vx + 39, vy + wyOff, 1.8, [75, 92, 115, 220]);
       }
 
-      // 3. 车头重装 V 型破障撞角 (Armored Ram Bumper)
-      fb.drawLine(vx - 25, vy - 46, vx, vy - 59, 4.8, [195, 215, 235, 255]);
-      fb.drawLine(vx + 25, vy - 46, vx, vy - 59, 4.8, [195, 215, 235, 255]);
-      fb.drawLine(vx - 18, vy - 50, vx + 18, vy - 50, 3.0, [255, 195, 45, 245]);
-
-      // 4. 装甲大巴主车体与防弹百叶前挡风窗
-      fb.blendRoundRect(vx - 24, vy - 48, 48, 96, 7, bodyCol);
-      fb.strokeRoundRect(vx - 24, vy - 48, 48, 96, 7, 2.4, borderCol);
-
-      fb.blendRoundRect(vx - 19, vy - 42, 38, 15, 3, [14, 22, 34, 250]);
-      for (const ly of [-39, -35, -31]) {
-        fb.drawLine(vx - 17, vy + ly, vx + 17, vy + ly, 1.5, borderCol);
+      // 3. 巨型锯齿状液压 V 型破障铲 (Heavy Hydraulic V-Plow) + 黑黄工程警示斜纹
+      fb.drawLine(vx - 37, vy - 64, vx, vy - 88, 6.8, [205, 225, 245, 255]);
+      fb.drawLine(vx + 37, vy - 64, vx, vy - 88, 6.8, [205, 225, 245, 255]);
+      fb.drawLine(vx - 31, vy - 68, vx, vy - 81, 3.6, [255, 198, 42, 250]);
+      fb.drawLine(vx + 31, vy - 68, vx, vy - 81, 3.6, [255, 198, 42, 250]);
+      for (const toothX of [-24, -12, 0, 12, 24]) {
+        const ty0 = vy - 66 - (1 - Math.abs(toothX) / 36) * 20;
+        fb.drawLine(vx + toothX, ty0, vx + toothX, ty0 - 7, 2.8, [235, 248, 255, 255]);
       }
 
-      // 5. 两侧液压展开式突击车门与绿色出舱引导踏板
-      if (v.doorOpen > 0.05) {
-        const span = v.doorOpen * 14;
-        for (const side of [-1, 1]) {
-          const dx0 = vx + side * 24;
-          const dx1 = vx + side * (24 + span);
-          fb.drawLine(dx0, vy - 24, dx1, vy - 18, 3.6, [95, 255, 175, 245]);
-          fb.drawLine(dx0, vy - 10, dx1, vy - 18, 2.4, borderCol);
+      // 4. 70x142 重装反应装甲车体 + 两侧反应装甲块 + 防弹百叶前挡风窗
+      fb.blendRoundRect(vx - 35, vy - 70, 70, 140, 9, bodyCol);
+      fb.strokeRoundRect(vx - 35, vy - 70, 70, 140, 9, 2.8, borderCol);
+      for (const side of [-33, 28]) {
+        for (const ryOff of [-44, -12, 20]) {
+          fb.strokeRoundRect(vx + side, vy + ryOff, 5, 24, 1, 1.4, borderCol);
         }
       }
 
-      // 6. 车顶装甲舱盖、车内待命士兵头盔与车顶 360 度旋转双联重机枪塔 (Roof Twin Autocannon Turret)
-      fb.blendRoundRect(vx - 15, vy - 20, 30, 54, 4, roofCol);
-      fb.strokeRoundRect(vx - 15, vy - 20, 30, 54, 4, 1.6, borderCol);
-
-      // 车内尚未下车的士兵（透过装甲天窗可见绿色战术头盔，随开门下车逐一减少）
-      const remainingInside = Math.max(0, v.totalToDeploy - v.deployedCount);
-      for (let uIdx = 0; uIdx < remainingInside; uIdx++) {
-        const col = uIdx % 2 === 0 ? -7 : 7;
-        const row = Math.floor(uIdx / 2) * 12 + 4;
-        fb.fillCircle(vx + col, vy + row, 4.2, [45, 235, 135, 255]);
-        fb.strokeRing(vx + col, vy + row, 4.2, 1.2, [12, 32, 22, 240]);
+      fb.blendRoundRect(vx - 27, vy - 61, 54, 20, 4, [12, 20, 32, 250]);
+      for (const ly of [-57, -51, -45]) {
+        fb.drawLine(vx - 24, vy + ly, vx + 24, vy + ly, 1.8, borderCol);
       }
 
-      // 车顶旋转双联重机枪塔座與双枪管 + 开火制退焰
+      // 5. 两侧大型液压突击舱门展开
+      if (v.doorOpen > 0.05) {
+        const span = v.doorOpen * 20;
+        for (const side of [-1, 1]) {
+          const dx0 = vx + side * 35;
+          const dx1 = vx + side * (35 + span);
+          fb.drawLine(dx0, vy - 34, dx1, vy - 24, 4.4, [95, 255, 175, 250]);
+          fb.drawLine(dx0, vy - 14, dx1, vy - 24, 3.0, borderCol);
+        }
+      }
+
+      // 6. 车顶装甲舱盖、天窗内待命特战小队与 30mm 双联重机炮遥控武器站
+      fb.blendRoundRect(vx - 22, vy - 30, 44, 80, 6, roofCol);
+      fb.strokeRoundRect(vx - 22, vy - 30, 44, 80, 6, 1.8, borderCol);
+
+      const remainingInside = Math.max(0, v.totalToDeploy - v.deployedCount);
+      for (let uIdx = 0; uIdx < remainingInside; uIdx++) {
+        const col = uIdx % 2 === 0 ? -10 : 10;
+        const row = Math.floor(uIdx / 2) * 16 + 6;
+        fb.fillCircle(vx + col, vy + row, 5.4, [45, 235, 135, 255]);
+        fb.strokeRing(vx + col, vy + row, 5.4, 1.4, [12, 32, 22, 240]);
+      }
+
       const tX = vx;
-      const tY = vy - 12;
+      const tY = vy - 18;
       const tux = Math.cos(v.turretAngle);
       const tuy = Math.sin(v.turretAngle);
       const tpx = -tuy;
       const tpy = tux;
-      drawPolygonLines(fb, tX, tY, 10, 6, v.turretAngle, 2.0, borderCol, true);
-      for (const side of [-3.5, 3.5]) {
-        const bx0 = tX + tpx * side + tux * 4;
-        const by0 = tY + tpy * side + tuy * 4;
-        const bx1 = tX + tpx * side + tux * 20;
-        const by1 = tY + tpy * side + tuy * 20;
-        fb.drawLine(bx0, by0, bx1, by1, 3.4, [28, 38, 52, 255]);
-        fb.drawLine(bx0, by0, bx1, by1, 1.6, [215, 242, 255, 255]);
+      fb.fillCircle(tX, tY, 14, [20, 30, 44, 255]);
+      drawPolygonLines(fb, tX, tY, 14, 8, v.turretAngle, 2.4, borderCol, true);
+      for (const side of [-5.0, 5.0]) {
+        const bx0 = tX + tpx * side + tux * 6;
+        const by0 = tY + tpy * side + tuy * 6;
+        const bx1 = tX + tpx * side + tux * 30;
+        const by1 = tY + tpy * side + tuy * 30;
+        fb.drawLine(bx0, by0, bx1, by1, 4.4, [28, 38, 52, 255]);
+        fb.drawLine(bx0, by0, bx1, by1, 2.0, [215, 242, 255, 255]);
         if (v.muzzleFlash > 0.08) {
-          fb.drawGlowCircle(bx1 + tux * 4, by1 + tuy * 4, 14, [255, 215, 75, 210]);
-          fb.drawLine(bx1, by1, bx1 + tux * 12, by1 + tuy * 12, 2.8, [255, 248, 175, 255]);
+          fb.drawGlowCircle(bx1 + tux * 6, by1 + tuy * 6, 18, [255, 215, 75, 225]);
+          fb.drawLine(bx1, by1, bx1 + tux * 16, by1 + tuy * 16, 3.4, [255, 248, 175, 255]);
         }
       }
 
-      // 推进阶段两侧射击孔火舌
       if (v.muzzleFlash > 0.08 && v.phase === "inbound") {
         for (const side of [-1, 1]) {
-          const px0 = vx + side * 24;
-          const py0 = vy - 6;
-          fb.drawGlowCircle(px0 + side * 5, py0 - 4, 12, [255, 195, 65, 195]);
-          fb.drawLine(px0, py0, px0 + side * 10, py0 - 9, 2.4, [255, 242, 165, 250]);
+          const px0 = vx + side * 35;
+          const py0 = vy - 8;
+          fb.drawGlowCircle(px0 + side * 6, py0 - 5, 14, [255, 195, 65, 205]);
+          fb.drawLine(px0, py0, px0 + side * 14, py0 - 12, 2.8, [255, 242, 165, 250]);
         }
       }
 
       const flashLeft = frameIdx % 8 < 4;
       const leftStrobe: RGBA = flashLeft ? [255, 45, 68, 255] : [65, 215, 255, 255];
       const rightStrobe: RGBA = flashLeft ? [65, 215, 255, 255] : [255, 45, 68, 255];
-      fb.drawGlowCircle(vx - 11, vy - 24, 15, [leftStrobe[0], leftStrobe[1], leftStrobe[2], 150]);
-      fb.drawGlowCircle(vx + 11, vy - 24, 15, [rightStrobe[0], rightStrobe[1], rightStrobe[2], 150]);
-      fb.fillCircle(vx - 11, vy - 24, 3.8, leftStrobe);
-      fb.fillCircle(vx + 11, vy - 24, 3.8, rightStrobe);
+      fb.drawGlowCircle(vx - 15, vy - 36, 18, [leftStrobe[0], leftStrobe[1], leftStrobe[2], 160]);
+      fb.drawGlowCircle(vx + 15, vy - 36, 18, [rightStrobe[0], rightStrobe[1], rightStrobe[2], 160]);
+      fb.fillCircle(vx - 15, vy - 36, 4.4, leftStrobe);
+      fb.fillCircle(vx + 15, vy - 36, 4.4, rightStrobe);
 
-      // 7. 车头双远光卤素大灯与车尾红色刹车灯
-      for (const hxOff of [-15, 15]) {
-        fb.drawGlowCircle(vx + hxOff, vy - 48, 20, [255, 245, 185, 185]);
-        fb.fillCircle(vx + hxOff, vy - 48, 4.5, [255, 255, 225, 255]);
-        fb.fillCircle(vx + hxOff, vy + 47, 3.6, [255, 42, 55, 245]);
+      // 7. 车头高流明探照远光灯 + 车尾刹车灯 + 倒车撤离白色高亮倒车灯
+      for (const hxOff of [-22, 22]) {
+        fb.drawGlowCircle(vx + hxOff, vy - 70, 24, [255, 245, 185, 195]);
+        fb.fillCircle(vx + hxOff, vy - 70, 5.5, [255, 255, 225, 255]);
+        fb.fillCircle(vx + hxOff, vy + 68, 4.4, [255, 42, 55, 245]);
+        if (v.phase === "departing") {
+          fb.drawGlowCircle(vx + hxOff * 0.65, vy + 70, 16, [235, 248, 255, 195]);
+          fb.fillCircle(vx + hxOff * 0.65, vy + 70, 3.8, [255, 255, 255, 255]);
+        }
       }
     } else {
-      // 黑鹰武装直升机 / 声呐潜行直升机俯视高精度渲染（含双翼加特林机炮 + 火箭巢扫射火舌）
+      // 双发重装黑鹰武装直升机 (MH-60L DAP Gunship)：192px 巨型主旋翼直径 + 双发涡轴短舱 + 19联装九头蛇火箭巢！
       const isSonar = sim.mode === "sonar";
       const ux = Math.cos(v.angle);
       const uy = Math.sin(v.angle);
       const px = -uy;
       const py = ux;
 
-      // 1. 地面旋翼下洗气流环与双侧特战索降绳 (Fast-Ropes)
+      // 1. 双圈高速下洗气浪冲击环与特战双侧索降粗绳 (Fast-Ropes)
+      const washR = 88 + Math.sin(frameIdx * 0.48) * 6;
       fb.strokeRing(
         vx,
         vy,
-        58 + Math.sin(frameIdx * 0.45) * 5,
-        1.8,
-        isSonar ? [65, 245, 215, 115] : [255, 215, 95, 105],
+        washR,
+        2.2,
+        isSonar ? [65, 245, 215, 125] : [255, 215, 95, 115],
+      );
+      fb.strokeRing(
+        vx,
+        vy,
+        washR * 0.72,
+        1.4,
+        isSonar ? [65, 245, 215, 70] : [255, 215, 95, 65],
       );
       if (v.ropeDrop > 0.05) {
         for (const side of [-1, 1]) {
-          const rx0 = vx + px * side * 20;
-          const ry0 = vy + py * side * 20;
-          const rx1 = vx + px * side * (36 * v.ropeDrop);
-          const ry1 = vy + py * side * (36 * v.ropeDrop) + 12 * v.ropeDrop;
-          fb.drawLine(rx0, ry0, rx1, ry1, 3.2, [235, 188, 82, 240]);
-          fb.fillCircle(rx1, ry1, 4.0, [255, 230, 125, 245]);
+          const rx0 = vx + px * side * 28;
+          const ry0 = vy + py * side * 28;
+          const rx1 = vx + px * side * (52 * v.ropeDrop);
+          const ry1 = vy + py * side * (52 * v.ropeDrop) + 18 * v.ropeDrop;
+          fb.drawLine(rx0, ry0, rx1, ry1, 4.0, [235, 188, 82, 245]);
+          fb.fillCircle(rx1, ry1, 5.2, [255, 230, 125, 250]);
         }
       }
 
-      // 2. 尾梁 (Tail Boom)、水平尾翼与尾桨
-      const tailX = vx - ux * 56;
-      const tailY = vy - uy * 56;
-      fb.drawLine(vx, vy, tailX, tailY, 8.5, [24, 34, 46, 255]);
-      fb.drawLine(vx, vy, tailX, tailY, 4.2, isSonar ? [48, 125, 130, 255] : [62, 78, 96, 255]);
+      // 2. 加长装甲尾梁 (84px Tail Boom)、宽体水平尾翼与高速尾桨
+      const tailX = vx - ux * 84;
+      const tailY = vy - uy * 84;
+      fb.drawLine(vx, vy, tailX, tailY, 12.5, [22, 32, 44, 255]);
+      fb.drawLine(vx, vy, tailX, tailY, 6.2, isSonar ? [48, 130, 136, 255] : [64, 82, 102, 255]);
       fb.drawLine(
-        tailX - px * 16,
-        tailY - py * 16,
-        tailX + px * 16,
-        tailY + py * 16,
-        4.0,
-        [95, 135, 165, 250],
+        tailX - px * 26,
+        tailY - py * 26,
+        tailX + px * 26,
+        tailY + py * 26,
+        5.8,
+        [95, 140, 175, 250],
       );
-      const trLen = 11 * Math.sin(frameIdx * 0.9);
+      const trLen = 16 * Math.sin(frameIdx * 0.95);
       fb.drawLine(
-        tailX + px * 8 - ux * trLen,
-        tailY + py * 8 - uy * trLen,
-        tailX + px * 8 + ux * trLen,
-        tailY + py * 8 + uy * trLen,
-        2.6,
-        [215, 245, 255, 245],
+        tailX + px * 11 - ux * trLen,
+        tailY + py * 11 - uy * trLen,
+        tailX + px * 11 + ux * trLen,
+        tailY + py * 11 + uy * trLen,
+        3.4,
+        [220, 248, 255, 250],
       );
 
-      // 3. 两侧短翼武器挂架 (Stub Wings + Twin Gatling Miniguns & Rocket Pods)
-      const wLeftX = vx - px * 32;
-      const wLeftY = vy - py * 32;
-      const wRightX = vx + px * 32;
-      const wRightY = vy + py * 32;
-      fb.drawLine(wLeftX, wLeftY, wRightX, wRightY, 7.5, [34, 48, 64, 255]);
-      fb.drawLine(wLeftX, wLeftY, wRightX, wRightY, 2.8, [120, 185, 225, 245]);
+      // 3. 96px 宽 ESSS 重型武器挂架短翼 + 19联装火箭发射巢 + 双翼六管加特林
+      const wLeftX = vx - px * 48;
+      const wLeftY = vy - py * 48;
+      const wRightX = vx + px * 48;
+      const wRightY = vy + py * 48;
+      fb.drawLine(wLeftX, wLeftY, wRightX, wRightY, 11.0, [30, 44, 60, 255]);
+      fb.drawLine(wLeftX, wLeftY, wRightX, wRightY, 4.2, [125, 192, 232, 250]);
       for (const side of [-1, 1]) {
-        const podX = vx + px * side * 28;
-        const podY = vy + py * side * 28;
-        const tipX = podX + ux * 18;
-        const tipY = podY + uy * 18;
-        fb.drawLine(podX - ux * 6, podY - uy * 6, tipX, tipY, 4.2, [42, 56, 74, 255]);
-        fb.drawLine(podX - ux * 4, podY - uy * 4, tipX, tipY, 1.8, [210, 238, 255, 255]);
+        // 双发 T700 涡轴发动机装甲短舱
+        const engX = vx + px * side * 17 - ux * 8;
+        const engY = vy + py * side * 17 - uy * 8;
+        fb.fillCircle(engX, engY, 8.5, [34, 48, 66, 255]);
+        fb.strokeRing(engX, engY, 8.5, 1.6, [145, 205, 235, 230]);
+
+        // 外挂火箭巢与加特林枪管
+        const podX = vx + px * side * 40;
+        const podY = vy + py * side * 40;
+        const tipX = podX + ux * 26;
+        const tipY = podY + uy * 26;
+        fb.drawLine(podX - ux * 10, podY - uy * 10, tipX, tipY, 6.8, [38, 52, 70, 255]);
+        fb.drawLine(podX - ux * 8, podY - uy * 8, tipX, tipY, 2.6, [215, 242, 255, 255]);
         if (v.muzzleFlash > 0.08) {
-          fb.drawGlowCircle(tipX + ux * 5, tipY + uy * 5, 16, [255, 215, 75, 220]);
-          fb.drawLine(tipX, tipY, tipX + ux * 14, tipY + uy * 14, 3.0, [255, 248, 185, 255]);
+          fb.drawGlowCircle(tipX + ux * 7, tipY + uy * 7, 22, [255, 215, 75, 230]);
+          fb.drawLine(tipX, tipY, tipX + ux * 20, tipY + uy * 20, 4.0, [255, 248, 185, 255]);
         }
       }
-      fb.fillCircle(wLeftX, wLeftY, 4.2, [255, 48, 68, 255]);
-      fb.fillCircle(wRightX, wRightY, 4.2, [55, 255, 155, 255]);
+      fb.fillCircle(wLeftX, wLeftY, 5.5, [255, 48, 68, 255]);
+      fb.fillCircle(wRightX, wRightY, 5.5, [55, 255, 155, 255]);
 
-      // 4. 装甲机舱主体、舱内待命特战队员与前部防弹玻璃驾驶舱
-      fb.fillCircle(vx, vy, 22, [22, 32, 44, 255]);
+      // 4. 加大号装甲机腹主舱、舱内特战队员与前部防弹玻璃驾驶舱
+      fb.fillCircle(vx, vy, 31, [20, 30, 42, 255]);
       drawPolygonLines(
         fb,
         vx,
         vy,
-        21,
+        30,
         8,
         v.angle,
-        2.4,
+        3.0,
         isSonar ? [75, 245, 215, 250] : [255, 205, 75, 250],
       );
       const remainingHeli = Math.max(0, v.totalToDeploy - v.deployedCount);
       for (let uIdx = 0; uIdx < remainingHeli; uIdx++) {
         const ang = (uIdx / Math.max(1, remainingHeli)) * Math.PI * 2;
-        fb.fillCircle(vx + Math.cos(ang) * 9, vy + Math.sin(ang) * 9, 3.6, [45, 235, 135, 255]);
+        fb.fillCircle(vx + Math.cos(ang) * 13, vy + Math.sin(ang) * 13, 4.6, [45, 235, 135, 255]);
       }
-      const noseX = vx + ux * 16;
-      const noseY = vy + uy * 16;
-      fb.fillCircle(noseX, noseY, 13, [85, 215, 255, 235]);
-      fb.drawGlowCircle(noseX + ux * 6, noseY + uy * 6, 22, [255, 245, 185, 195]);
+      const noseX = vx + ux * 24;
+      const noseY = vy + uy * 24;
+      fb.fillCircle(noseX, noseY, 18, [85, 218, 255, 240]);
+      fb.drawGlowCircle(noseX + ux * 9, noseY + uy * 9, 28, [255, 245, 185, 205]);
 
-      // 5. 高速旋转四叶主旋翼 (4-Blade Main Rotor) 与气动残影环
-      const rotorR = 64;
-      fb.strokeRing(vx, vy, rotorR, 1.8, [175, 225, 255, 115]);
+      // 5. 96px 半径（192px 直径）四叶重型主旋翼 + 半透明气动残影圆盘 + 翼尖频闪灯
+      const rotorR = 96;
+      fb.blendCircle(vx, vy, rotorR, [145, 205, 245, 18]);
+      fb.strokeRing(vx, vy, rotorR, 2.4, [185, 232, 255, 135]);
+      fb.strokeRing(vx, vy, rotorR * 0.62, 1.2, [165, 215, 245, 75]);
       for (let b = 0; b < 4; b++) {
         const bAng = v.rotorAngle + (b * Math.PI) / 2;
         const bx = vx + Math.cos(bAng) * rotorR;
         const by = vy + Math.sin(bAng) * rotorR;
-        fb.drawLine(vx, vy, bx, by, 3.2, [42, 56, 74, 230]);
-        fb.drawLine(vx, vy, bx, by, 1.5, [210, 238, 255, 240]);
-        fb.fillCircle(bx, by, 3.0, [255, 230, 95, 250]);
+        // 旋翼扇叶扫掠残影线
+        const lagAng = bAng - 0.16;
+        fb.drawLine(
+          vx,
+          vy,
+          vx + Math.cos(lagAng) * (rotorR * 0.96),
+          vy + Math.sin(lagAng) * (rotorR * 0.96),
+          6.5,
+          [140, 195, 235, 55],
+        );
+        fb.drawLine(vx, vy, bx, by, 4.8, [38, 52, 70, 240]);
+        fb.drawLine(vx, vy, bx, by, 2.2, [215, 242, 255, 245]);
+        fb.fillCircle(bx, by, 4.0, [255, 232, 95, 255]);
       }
-      fb.fillCircle(vx, vy, 6.5, [195, 225, 245, 255]);
+      fb.fillCircle(vx, vy, 9.0, [195, 228, 248, 255]);
+      fb.strokeRing(vx, vy, 9.0, 2.0, [32, 48, 66, 255]);
     }
   }
 }
 
-/**
- * 绘制各模式专属室内死角防爆隔墙与转角铆钉柱 (`sim.deadCornerWalls`)
- * - scavenge: 战术冰蓝合金破门墙
- * - blackout: 核反应堆琥珀金防辐射挡板
- * - sonar: 深海荧光青声呐折流岩壁
- * - maze-infect: 生化紫红高压检疫监区隔墙
- */
+function getEffectiveCam(sim: SiegeSimulator): { camX: number; camY: number; zoom: number } {
+  const zoom = clamp(sim.camZoom || 1.0, 1.0, 2.2);
+  const viewW = ARENA_W / zoom;
+  const viewH = ARENA_H / zoom;
+  return {
+    camX: clamp(sim.camX + sim.camShakeX, 0, WORLD_W - viewW),
+    camY: clamp(sim.camY + sim.camShakeY, 0, WORLD_H - viewH),
+    zoom,
+  };
+}
+
 function renderDeadCornerWalls(fb: FrameBuf, sim: SiegeSimulator): void {
   if (sim.deadCornerWalls.length === 0) return;
-  const camX = Math.round(sim.camX);
-  const camY = Math.round(sim.camY);
+  const { camX, camY, zoom } = getEffectiveCam(sim);
+  const viewW = ARENA_W / zoom;
+  const viewH = ARENA_H / zoom;
   const ox = BOARD_X - camX;
   const oy = BOARD_Y - camY;
 
-  const bodyCol: RGBA =
-    sim.mode === "scavenge"
-      ? [24, 46, 68, 255]
-      : sim.mode === "blackout"
-        ? [48, 36, 18, 255]
-        : sim.mode === "sonar"
-          ? [14, 44, 48, 255]
-          : [48, 18, 54, 255];
-
-  const stripeCol: RGBA =
-    sim.mode === "scavenge"
-      ? [65, 215, 255, 235]
-      : sim.mode === "blackout"
-        ? [255, 185, 32, 235]
-        : sim.mode === "sonar"
-          ? [48, 240, 205, 235]
-          : [245, 72, 185, 235];
-
-  const borderCol: RGBA =
-    sim.mode === "scavenge"
-      ? [155, 235, 255, 245]
-      : sim.mode === "blackout"
-        ? [255, 222, 115, 245]
-        : sim.mode === "sonar"
-          ? [125, 255, 230, 245]
-          : [255, 145, 225, 245];
+  // 真实现代商业建筑/地铁/医院清水混凝土与拉丝铝合金门框墙体配色（彻底告别廉价卡通斜纹条！）
+  const coreCol: RGBA = [36, 42, 52, 255];
+  const mortarCol: RGBA = [54, 63, 76, 255];
+  const trimCol: RGBA =
+    sim.mode === "blackout"
+      ? [148, 136, 112, 235]
+      : sim.mode === "sonar"
+        ? [112, 146, 152, 235]
+        : sim.mode === "maze-infect"
+          ? [142, 118, 152, 235]
+          : [118, 142, 166, 235];
 
   for (const w of sim.deadCornerWalls) {
+    const wMinX = Math.min(w.x1, w.x2) - 12;
+    const wMaxX = Math.max(w.x1, w.x2) + 12;
+    const wMinY = Math.min(w.y1, w.y2) - 12;
+    const wMaxY = Math.max(w.y1, w.y2) + 12;
+    if (
+      wMaxX < camX - 24 ||
+      wMinX > camX + viewW + 24 ||
+      wMaxY < camY - 24 ||
+      wMinY > camY + viewH + 24
+    ) {
+      continue;
+    }
     const x1 = ox + w.x1;
     const y1 = oy + w.y1;
     const x2 = ox + w.x2;
@@ -410,114 +583,176 @@ function renderDeadCornerWalls(fb: FrameBuf, sim: SiegeSimulator): void {
     const maxX = Math.max(x1, x2) + 8;
     const minY = Math.min(y1, y2) - 8;
     const maxY = Math.max(y1, y2) + 8;
-    if (
-      maxX < BOARD_X - 24 ||
-      minX > BOARD_X + ARENA_W + 24 ||
-      maxY < BOARD_Y - 24 ||
-      minY > BOARD_Y + ARENA_H + 24
-    ) {
-      continue;
-    }
     const rw = maxX - minX;
     const rh = maxY - minY;
 
-    // 墙根深色投影与重甲钢梁主体
-    fb.blendRoundRect(minX - 3, minY - 3, rw + 6, rh + 6, 4, [6, 8, 14, 220]);
-    fb.blendRoundRect(minX, minY, rw, rh, 3, bodyCol);
+    // 2.5D 斜向落地阴影 + 现浇混凝土墙芯 + 内墙石膏粉刷线 + 商铺铝合金玻璃门窗框细节
+    fb.blendRoundRect(minX + 4, minY + 6, rw + 4, rh + 4, 2, [3, 5, 9, 185]);
+    fb.fillRoundRect(minX, minY, rw, rh, 2, coreCol);
+    fb.strokeRoundRect(minX + 2, minY + 2, Math.max(2, rw - 4), Math.max(2, rh - 4), 1, 1.2, mortarCol);
+    fb.strokeRoundRect(minX, minY, rw, rh, 2, 1.4, trimCol);
 
-    // 墙体表面高辨识度警示斜纹
-    const isHoriz = rw >= rh;
-    if (isHoriz) {
-      for (let sx = minX + 10; sx < maxX - 10; sx += 18) {
-        fb.drawLine(sx, minY + 3, sx + 7, maxY - 3, 3.2, stripeCol);
-      }
-    } else {
-      for (let sy = minY + 10; sy < maxY - 10; sy += 18) {
-        fb.drawLine(minX + 3, sy, maxX - 3, sy + 7, 3.2, stripeCol);
+    // 横向长商铺隔墙嵌入半碎钢化玻璃橱窗与铝型材竖梃（打破单调水泥条感！）
+    const isHoriz = rw > rh * 2.2;
+    if (isHoriz && rw >= 110) {
+      for (let gx = minX + 26; gx < maxX - 34; gx += 46) {
+        fb.fillRect(gx, minY + 4, 28, Math.max(3, rh - 8), [22, 34, 46, 235]);
+        fb.drawLine(gx + 3, minY + 6, gx + 14, maxY - 6, 1.4, [155, 205, 235, 165]);
+        fb.drawLine(gx + 19, minY + 6, gx + 25, minY + 10, 1.2, [195, 235, 250, 145]);
       }
     }
 
-    // 双层合金切边高光线
-    fb.strokeRoundRect(minX, minY, rw, rh, 3, 2.0, borderCol);
-    fb.drawLine(x1, y1, x2, y2, 1.6, stripeCol);
-
-    // 墙体两端八角防爆铆钉柱
+    // 墙端承重门垛与包角立柱
     for (const [px, py] of [
       [x1, y1],
       [x2, y2],
     ]) {
-      fb.fillCircle(px, py, 9.5, bodyCol);
-      drawPolygonLines(fb, px, py, 9.0, 8, Math.PI / 8, 1.8, borderCol);
-      fb.fillCircle(px, py, 3.2, stripeCol);
+      fb.fillRoundRect(px - 8, py - 8, 16, 16, 2, [46, 53, 64, 255]);
+      fb.strokeRoundRect(px - 8, py - 8, 16, 16, 2, 1.4, trimCol);
     }
   }
 }
 
 /**
- * 2D 射线遮挡光影迷雾 (2D Raycast Light & Shadow Fog-of-War) + 体积手电/探照灯光锥 + 死角暗处红眼闪烁
- * - 射线遮挡检测在 1800x3000 大世界坐标系中精确计算，再通过镜头偏移 (camX, camY) 投射到当前 984x1520 视野窗口！
+ * 真实体积感【自然战争迷雾引擎 (Gaussian-Blurred Natural Fog of War)】：
+ * 1) 零辅助线/零三角线框：全部光锥与周身视野经射线墙体阻挡后，执行双向分离 5-Tap 高斯柔化，过渡如真实夜色雾气般丝滑；
+ * 2) 三态迷雾记忆：当前视线照亮区 (100% 清晰暖冷光感) -> 已探索记忆迷雾区 (24% 低饱和石板蓝) -> 未探索未知黑雾区 (3.5% 深暗夜雾)；
+ * 3) 建筑轮廓与任务点“若隐若现”：未见区域内的店铺墙壁仅透出 ~13% 朦胧建筑剪影，未照亮救援点仅浮现微弱呼吸求救波纹！
  */
 function applyDeadCornerRaycastLighting(
-  fb: FrameBuf,
+  rawFb: FrameBuf,
+  wfb: FrameBuf,
   sim: SiegeSimulator,
-  atlas: FontAtlas,
   frameIdx: number,
 ): void {
-  if (!sim.isDarkMode) return;
-  const camX = Math.round(sim.camX);
-  const camY = Math.round(sim.camY);
+  const { camX, camY, zoom } = getEffectiveCam(sim);
+  const viewW = ARENA_W / zoom;
+  const viewH = ARENA_H / zoom;
   const ox = BOARD_X - camX;
   const oy = BOARD_Y - camY;
   const tSec = sim.tick / SIM_HZ;
 
-  const CELL = 4;
+  // 0. 对 50x84 探索网格做一次超轻量 3x3 平滑，配合双线性插值彻底消除记忆迷雾 36px 锯齿方块！
+  const smoothExplored = new Float32Array(NAV_COLS * NAV_ROWS);
+  for (let nr = 0; nr < NAV_ROWS; nr++) {
+    const r0 = Math.max(0, nr - 1) * NAV_COLS;
+    const r1 = nr * NAV_COLS;
+    const r2 = Math.min(NAV_ROWS - 1, nr + 1) * NAV_COLS;
+    for (let nc = 0; nc < NAV_COLS; nc++) {
+      const c0 = Math.max(0, nc - 1);
+      const c2 = Math.min(NAV_COLS - 1, nc + 1);
+      smoothExplored[r1 + nc] =
+        (sim.exploredGrid[r0 + c0] + sim.exploredGrid[r0 + nc] * 2 + sim.exploredGrid[r0 + c2] +
+          sim.exploredGrid[r1 + c0] * 2 + sim.exploredGrid[r1 + nc] * 4 + sim.exploredGrid[r1 + c2] * 2 +
+          sim.exploredGrid[r2 + c0] + sim.exploredGrid[r2 + nc] * 2 + sim.exploredGrid[r2 + c2]) *
+        0.0625;
+    }
+  }
+  const sampleExplored = (wx: number, wy: number): number => {
+    const cf = wx / NAV_CELL - 0.5;
+    const rf = wy / NAV_CELL - 0.5;
+    const c0 = clamp(Math.floor(cf), 0, NAV_COLS - 1);
+    const c1 = Math.min(NAV_COLS - 1, c0 + 1);
+    const r0 = clamp(Math.floor(rf), 0, NAV_ROWS - 1);
+    const r1 = Math.min(NAV_ROWS - 1, r0 + 1);
+    const fc = clamp(cf - c0, 0, 1);
+    const fr = clamp(rf - r0, 0, 1);
+    const top = smoothExplored[r0 * NAV_COLS + c0] * (1 - fc) + smoothExplored[r0 * NAV_COLS + c1] * fc;
+    const bot = smoothExplored[r1 * NAV_COLS + c0] * (1 - fc) + smoothExplored[r1 * NAV_COLS + c1] * fc;
+    return top * (1 - fr) + bot * fr;
+  };
+
+  // 【差异化多模式照明体系】：
+  // 1) scavenge (自然天窗采光商场) & maze-infect (玻璃幕墙航站楼) & 通电阶段 blackout (0~11.5s 荧光灯地铁站)：
+  //    保持通透明亮的真实室内光线，仅对尚未进入的封闭侧室施加 0.80 柔和室内阴影（并在 10.3~11.5s 地铁站变电短路时呈现高压电弧爆闪！）
+  if (!sim.isDarkMode) {
+    const raw = rawFb.data;
+    const isFlickeringMetro = sim.mode === "blackout" && sim.metroPowerLevel < 0.995;
+    const powerScale = sim.mode === "blackout" ? clamp(0.16 + sim.metroPowerLevel * 0.84, 0.16, 1.0) : 1.0;
+
+    for (let ay = 0; ay < ARENA_H; ay++) {
+      const screenY = BOARD_Y + ay;
+      const worldY = camY + ay / zoom;
+      for (let ax = 0; ax < ARENA_W; ax++) {
+        const worldX = camX + ax / zoom;
+        const expFrac = sampleExplored(worldX, worldY);
+        const roomShade = 0.80 + 0.20 * expFrac;
+        const vis = roomShade * powerScale;
+        if (vis >= 0.995 && !isFlickeringMetro) continue;
+
+        const idx = (screenY * OUT_W + (BOARD_X + ax)) * 4;
+        const arcTintB = isFlickeringMetro && sim.metroPowerLevel > 0.4 ? 14 : 0;
+        raw[idx] = clamp((raw[idx] * vis) | 0, 0, 255);
+        raw[idx + 1] = clamp((raw[idx + 1] * vis + arcTintB * 0.5) | 0, 0, 255);
+        raw[idx + 2] = clamp((raw[idx + 2] * (vis * (1.03 - 0.03 * expFrac)) + arcTintB) | 0, 0, 255);
+      }
+    }
+    return;
+  }
+
+  const CELL = 6;
   const GW = Math.ceil(ARENA_W / CELL);
   const GH = Math.ceil(ARENA_H / CELL);
   const lightGrid = new Float32Array(GW * GH);
-  const coneGrid = new Float32Array(GW * GH);
-  const tintGrid = new Uint8Array(GW * GH); // 0: 默认手电, 1: 探照灯暖黄, 2: 声呐青绿
+  const warmGrid = new Float32Array(GW * GH);
+  const archMask = new Uint8Array(GW * GH);
 
-  // 基础环境底光：断电过载期 (blackoutActive) 极暗 (0.12)，常规死角期 (0.20)，终局总攻红色应急灯亮起后逐步提升至 0.56
-  const lateFlood = tSec >= 24.5 ? clamp((tSec - 24.5) / 4.0, 0, 1) * 0.36 : 0;
-  const baseAmbient = (sim.blackoutActive ? 0.12 : 0.20) + lateFlood;
-  lightGrid.fill(baseAmbient);
+  // 1. 预标记屏幕视野内的建筑墙体边缘网格（用于在未见黑雾中呈现“若隐若现的建筑轮廓”！）
+  const markWallSeg = (wx1: number, wy1: number, wx2: number, wy2: number) => {
+    const sx1 = (wx1 - camX) * zoom;
+    const sy1 = (wy1 - camY) * zoom;
+    const sx2 = (wx2 - camX) * zoom;
+    const sy2 = (wy2 - camY) * zoom;
+    const len = Math.hypot(sx2 - sx1, sy2 - sy1);
+    const steps = Math.max(1, Math.ceil(len / (CELL * 0.75)));
+    const padCells = Math.max(1, Math.round((8 * zoom) / CELL));
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      const gx0 = Math.floor((sx1 + (sx2 - sx1) * t) / CELL);
+      const gy0 = Math.floor((sy1 + (sy2 - sy1) * t) / CELL);
+      if (gx0 < -2 || gx0 >= GW + 2 || gy0 < -2 || gy0 >= GH + 2) continue;
+      for (let dy = -padCells; dy <= padCells; dy++) {
+        const yy = gy0 + dy;
+        if (yy < 0 || yy >= GH) continue;
+        for (let dx = -padCells; dx <= padCells; dx++) {
+          const xx = gx0 + dx;
+          if (xx >= 0 && xx < GW) {
+            archMask[yy * GW + xx] = 1;
+          }
+        }
+      }
+    }
+  };
+  for (const w of sim.deadCornerWalls) markWallSeg(w.x1, w.y1, w.x2, w.y2);
+  for (const w of sim.outerWalls) markWallSeg(w.x1, w.y1, w.x2, w.y2);
 
-  // 1. 为每个手电筒/旋转探照灯预计算 36 条 2D 射线墙体阻挡距离 (Ray-Wall Shadow Map)
-  const RAY_COUNT = 36;
-  const coneShadowMaps: Float32Array[] = [];
-
+  // 2. 投射全部广角柔光手电与探照灯（余弦钟形柔和衰减，严禁硬边与线框！）
+  const RAY_COUNT = 48;
   for (let ci = 0; ci < sim.lightCones.length; ci++) {
     const c = sim.lightCones[ci];
     const dists = new Float32Array(RAY_COUNT);
     for (let rIdx = 0; rIdx < RAY_COUNT; rIdx++) {
       const frac = rIdx / (RAY_COUNT - 1);
       const rayAng = c.angle - c.halfFov + frac * (c.halfFov * 2);
-      dists[rIdx] = sim.castRayToWalls(
-        c.x,
-        c.y,
-        Math.cos(rayAng),
-        Math.sin(rayAng),
-        c.range,
-      );
+      dists[rIdx] = sim.castRayToWalls(c.x, c.y, Math.cos(rayAng), Math.sin(rayAng), c.range);
     }
-    coneShadowMaps.push(dists);
 
-    // 将该射线裁剪后的光锥光强转换到镜头局部坐标 (cxLocal, cyLocal) 后写入 4x4 视口光照网格
-    const cxLocal = c.x - camX;
-    const cyLocal = c.y - camY;
-    const minGX = Math.max(0, Math.floor((cxLocal - c.range) / CELL));
-    const maxGX = Math.min(GW - 1, Math.ceil((cxLocal + c.range) / CELL));
-    const minGY = Math.max(0, Math.floor((cyLocal - c.range) / CELL));
-    const maxGY = Math.min(GH - 1, Math.ceil((cyLocal + c.range) / CELL));
+    const cxLocal = (c.x - camX) * zoom;
+    const cyLocal = (c.y - camY) * zoom;
+    const rangeScr = c.range * zoom;
+    const minGX = Math.max(0, Math.floor((cxLocal - rangeScr) / CELL));
+    const maxGX = Math.min(GW - 1, Math.ceil((cxLocal + rangeScr) / CELL));
+    const minGY = Math.max(0, Math.floor((cyLocal - rangeScr) / CELL));
+    const maxGY = Math.min(GH - 1, Math.ceil((cyLocal + rangeScr) / CELL));
 
     for (let gy = minGY; gy <= maxGY; gy++) {
-      const py = gy * CELL + 2;
+      const py = gy * CELL + CELL * 0.5;
       const dy = py - cyLocal;
       for (let gx = minGX; gx <= maxGX; gx++) {
-        const px = gx * CELL + 2;
+        const px = gx * CELL + CELL * 0.5;
         const dx = px - cxLocal;
-        const dist = Math.hypot(dx, dy);
-        if (dist > c.range) continue;
+        const distScr = Math.hypot(dx, dy);
+        if (distScr > rangeScr) continue;
 
         let da = Math.atan2(dy, dx) - c.angle;
         while (da > Math.PI) da -= Math.PI * 2;
@@ -525,255 +760,292 @@ function applyDeadCornerRaycastLighting(
         if (Math.abs(da) > c.halfFov) continue;
 
         const u = ((da + c.halfFov) / (2 * c.halfFov)) * (RAY_COUNT - 1);
-        const idx0 = Math.max(0, Math.min(RAY_COUNT - 1, Math.floor(u)));
+        const idx0 = Math.max(0, Math.min(RAY_COUNT - 1, u | 0));
         const idx1 = Math.min(RAY_COUNT - 1, idx0 + 1);
         const f = u - idx0;
-        const wallDist = dists[idx0] * (1 - f) + dists[idx1] * f;
+        const wallDistScr = (dists[idx0] * (1 - f) + dists[idx1] * f) * zoom;
 
-        // 射线被死角墙挡住的后方区域保持在阴影中！
-        if (dist <= wallDist + 8) {
-          const distAtten = 1 - (dist / c.range) * 0.72;
-          const angRatio = Math.abs(da) / c.halfFov;
-          const angAtten = 1 - angRatio * angRatio * 0.45;
-          const beam = distAtten * angAtten * c.intensity;
-          const val = clamp(baseAmbient + beam * 0.95, 0, 1.15);
+        // 墙体表面留 10px 柔光漫反射，墙后则严格被阻挡在迷雾中！
+        if (distScr <= wallDistScr + 10 * zoom) {
+          const penumbra =
+            distScr > wallDistScr
+              ? Math.max(0, 1 - (distScr - wallDistScr) / (10 * zoom))
+              : 1.0;
+          const normD = distScr / rangeScr;
+          const distFalloff = Math.pow(1 - normD, 1.35);
+          const angBell = Math.pow(0.5 + 0.5 * Math.cos((Math.PI * Math.abs(da)) / c.halfFov), 1.45);
+          const energy = distFalloff * angBell * penumbra * c.intensity;
           const cellIdx = gy * GW + gx;
-          if (val > lightGrid[cellIdx]) {
-            lightGrid[cellIdx] = val;
-            tintGrid[cellIdx] = c.kind === "spotlight" ? 1 : sim.mode === "sonar" ? 2 : 0;
+          // 多名队员柔和叠加照明（软饱和曲线 1 - exp(-sum) 自然融合，绝无生硬拼接缝！）
+          lightGrid[cellIdx] = Math.min(1.25, lightGrid[cellIdx] + energy * 0.72);
+          if (c.kind === "spotlight") {
+            warmGrid[cellIdx] = Math.min(1.0, warmGrid[cellIdx] + energy * 0.8);
           }
-          coneGrid[cellIdx] = Math.min(1.35, coneGrid[cellIdx] + beam * 0.55);
         }
       }
     }
   }
 
-  // 2. 叠加人类士兵近身夜视光环 + 枪口爆闪 + 战术节点应急信标 + 声呐脉冲环
-  const addRadialLight = (worldX: number, worldY: number, rad: number, peak: number, tint = 0) => {
-    const cx = worldX - camX;
-    const cy = worldY - camY;
-    const minGX = Math.max(0, Math.floor((cx - rad) / CELL));
-    const maxGX = Math.min(GW - 1, Math.ceil((cx + rad) / CELL));
-    const minGY = Math.max(0, Math.floor((cy - rad) / CELL));
-    const maxGY = Math.min(GH - 1, Math.ceil((cy + rad) / CELL));
+  // 3. 叠加受墙体严格遮挡 (24向射线检测) 的士兵近身 360° 微光感知圈（防止光线穿墙泄入隔壁暗室！）
+  const AURA_RAYS = 24;
+  const auraDists = new Float32Array(AURA_RAYS);
+  for (let gi = 0; gi < sim.greens.length; gi++) {
+    const g = sim.greens[gi];
+    const auraWorldR = g.muzzleFlash > 0.2 ? 135 : 105;
+    for (let rIdx = 0; rIdx < AURA_RAYS; rIdx++) {
+      const ang = (rIdx * Math.PI * 2) / AURA_RAYS;
+      auraDists[rIdx] = sim.castRayToWalls(g.x, g.y, Math.cos(ang), Math.sin(ang), auraWorldR);
+    }
+    const cx = (g.x - camX) * zoom;
+    const cy = (g.y - camY) * zoom;
+    const rScr = auraWorldR * zoom;
+    const minGX = Math.max(0, Math.floor((cx - rScr) / CELL));
+    const maxGX = Math.min(GW - 1, Math.ceil((cx + rScr) / CELL));
+    const minGY = Math.max(0, Math.floor((cy - rScr) / CELL));
+    const maxGY = Math.min(GH - 1, Math.ceil((cy + rScr) / CELL));
     for (let gy = minGY; gy <= maxGY; gy++) {
-      const py = gy * CELL + 2;
-      const dy = py - cy;
+      const dy = gy * CELL + CELL * 0.5 - cy;
       for (let gx = minGX; gx <= maxGX; gx++) {
-        const px = gx * CELL + 2;
-        const d = Math.hypot(px - cx, dy);
-        if (d <= rad) {
-          const v = baseAmbient + (1 - d / rad) * peak;
+        const dx = gx * CELL + CELL * 0.5 - cx;
+        const d = Math.hypot(dx, dy);
+        if (d > rScr) continue;
+        let ang = Math.atan2(dy, dx);
+        if (ang < 0) ang += Math.PI * 2;
+        const u = (ang / (Math.PI * 2)) * AURA_RAYS;
+        const i0 = u % AURA_RAYS | 0;
+        const i1 = (i0 + 1) % AURA_RAYS;
+        const frac = u - Math.floor(u);
+        const wDistScr = (auraDists[i0] * (1 - frac) + auraDists[i1] * frac) * zoom;
+        if (d <= wDistScr + 9 * zoom) {
+          const fall = Math.pow(1 - d / rScr, 1.5) * (g.muzzleFlash > 0.2 ? 0.85 : 0.62);
           const cellIdx = gy * GW + gx;
-          if (v > lightGrid[cellIdx]) {
-            lightGrid[cellIdx] = Math.min(1.15, v);
-            if (tint > 0) tintGrid[cellIdx] = tint;
+          if (fall > lightGrid[cellIdx]) {
+            lightGrid[cellIdx] = fall;
+          } else {
+            lightGrid[cellIdx] = Math.min(1.25, lightGrid[cellIdx] + fall * 0.35);
           }
+        }
+      }
+    }
+  }
+
+  // 载具周身环境光与母巢暗红生物微光
+  const addSoftPointLight = (wx: number, wy: number, rad: number, peak: number, warm = 0) => {
+    const cx = (wx - camX) * zoom;
+    const cy = (wy - camY) * zoom;
+    const rScr = rad * zoom;
+    const minGX = Math.max(0, Math.floor((cx - rScr) / CELL));
+    const maxGX = Math.min(GW - 1, Math.ceil((cx + rScr) / CELL));
+    const minGY = Math.max(0, Math.floor((cy - rScr) / CELL));
+    const maxGY = Math.min(GH - 1, Math.ceil((cy + rScr) / CELL));
+    for (let gy = minGY; gy <= maxGY; gy++) {
+      const dy = gy * CELL + CELL * 0.5 - cy;
+      for (let gx = minGX; gx <= maxGX; gx++) {
+        const dx = gx * CELL + CELL * 0.5 - cx;
+        const d = Math.hypot(dx, dy);
+        if (d <= rScr) {
+          const v = Math.pow(1 - d / rScr, 1.6) * peak;
+          const idx = gy * GW + gx;
+          lightGrid[idx] = Math.min(1.25, lightGrid[idx] + v);
+          if (warm > 0) warmGrid[idx] = Math.min(1.0, warmGrid[idx] + v * warm);
         }
       }
     }
   };
-
-  for (const g of sim.greens) {
-    addRadialLight(g.x, g.y, g.muzzleFlash > 0.2 ? 102 : 70, g.muzzleFlash > 0.2 ? 0.88 : 0.68);
-  }
   for (const v of sim.vehicles) {
     if (v.phase !== "gone") {
-      addRadialLight(v.x, v.y, 118, 0.86, 1);
+      addSoftPointLight(v.x, v.y, 240, 1.04, 0.55);
+      addSoftPointLight(v.x, v.y - 115, 215, 0.88, 0.48);
     }
   }
   for (const n of sim.nodes) {
-    if (!n.broken) {
-      addRadialLight(n.x, n.y, 76, 0.74, 1);
+    if (n.broken) continue;
+    let revealed = (n.breachProgress ?? 0) > 0.005;
+    if (!revealed) {
+      for (let gi = 0; gi < sim.greens.length; gi++) {
+        const g = sim.greens[gi];
+        if (Math.hypot(g.x - n.x, g.y - n.y) <= 295 && sim.hasLineOfSight(g.x, g.y, n.x, n.y)) {
+          revealed = true;
+          break;
+        }
+      }
+    }
+    if (revealed) {
+      // 小队靠近照亮铁笼时，铁笼旁应急求救信号棒散发自然暖光池，照亮铁笼与周边货架/病床陈设！
+      addSoftPointLight(n.x, n.y, 125, 0.78, 0.35);
     }
   }
   if (sim.hive.alive) {
-    addRadialLight(sim.hive.x, sim.hive.y, 130, 0.68);
+    addSoftPointLight(sim.hive.x, sim.hive.y, 165, 0.78, 0.2);
   }
   for (const r of sim.rings) {
     if (r.kind === "sonar" || r.kind === "noise") {
       const p = 1 - r.ttl / r.maxTtl;
       const ringR = 14 + p * r.maxR;
-      addRadialLight(r.x, r.y, Math.min(240, ringR + 30), 0.60 * (1 - p), 2);
+      addSoftPointLight(r.x, r.y, Math.min(240, ringR + 28), 0.48 * (1 - p), 0);
     }
   }
 
-  // 3. 将 2D 射线阴影迷雾应用到当前视口内的战场地面像素（按大世界纵坐标 camY + ay 精确采样外墙轮廓）
-  const raw = fb.data;
+  // 4. 对光照场执行双遍 5-Tap 可分离高斯平滑模糊 ([1, 4, 6, 4, 1] / 16)，彻底消除锯齿格与生硬光斑边界！
+  const tmpBlur = new Float32Array(GW * GH);
+  const blurredLight = new Float32Array(GW * GH);
+  for (let pass = 0; pass < 2; pass++) {
+    const src = pass === 0 ? lightGrid : blurredLight;
+    for (let gy = 0; gy < GH; gy++) {
+      const row = gy * GW;
+      for (let gx = 0; gx < GW; gx++) {
+        const c0 = src[row + Math.max(0, gx - 2)];
+        const c1 = src[row + Math.max(0, gx - 1)];
+        const c2 = src[row + gx];
+        const c3 = src[row + Math.min(GW - 1, gx + 1)];
+        const c4 = src[row + Math.min(GW - 1, gx + 2)];
+        tmpBlur[row + gx] = (c0 + c1 * 4 + c2 * 6 + c3 * 4 + c4) * 0.0625;
+      }
+    }
+    for (let gy = 0; gy < GH; gy++) {
+      const r0 = Math.max(0, gy - 2) * GW;
+      const r1 = Math.max(0, gy - 1) * GW;
+      const r2 = gy * GW;
+      const r3 = Math.min(GH - 1, gy + 1) * GW;
+      const r4 = Math.min(GH - 1, gy + 2) * GW;
+      for (let gx = 0; gx < GW; gx++) {
+        blurredLight[r2 + gx] =
+          (tmpBlur[r0 + gx] +
+            tmpBlur[r1 + gx] * 4 +
+            tmpBlur[r2 + gx] * 6 +
+            tmpBlur[r3 + gx] * 4 +
+            tmpBlur[r4 + gx]) *
+          0.0625;
+      }
+    }
+  }
+
+  // 5. 全视口自然战争迷雾合成（仅用于 sonar 深层隔离医院 与 断电后的 blackout 地铁站！）
+  const lateFlood =
+    sim.mode === "blackout"
+      ? sim.metroPowerLevel
+      : tSec >= 31.5
+        ? clamp((tSec - 31.5) / 4.5, 0, 1) * 0.3
+        : 0;
+  const raw = rawFb.data;
+  const fogR = sim.mode === "sonar" ? 5 : 8;
+  const fogG = sim.mode === "sonar" ? 13 : 9;
+  const fogB = sim.mode === "sonar" ? 19 : 15;
+  const emergencyRedBoost = sim.mode === "blackout" && sim.metroPowerLevel > 0.05 ? sim.metroPowerLevel * 22 : 0;
+
   for (let ay = 0; ay < ARENA_H; ay++) {
     const screenY = BOARD_Y + ay;
-    const worldY = camY + ay;
-    const gy = Math.min(GH - 1, ay >> 2);
-    const bnd = getCorridorBounds(worldY, sim.mode);
-    const leftEdge = Math.max(0, Math.floor(bnd.left - camX));
-    const rightEdge = Math.min(ARENA_W - 1, Math.ceil(bnd.right - camX));
+    const worldY = camY + ay / zoom;
+    const navR = clamp((worldY / NAV_CELL) | 0, 0, NAV_ROWS - 1) * NAV_COLS;
 
-    for (let ax = leftEdge; ax <= rightEdge; ax++) {
-      const gx = Math.min(GW - 1, ax >> 2);
-      const cellIdx = gy * GW + gx;
-      const light = lightGrid[cellIdx];
-      const cone = coneGrid[cellIdx];
-      const tint = tintGrid[cellIdx];
+    const gyF = ay / CELL - 0.5;
+    const gy0 = clamp(Math.floor(gyF), 0, GH - 1);
+    const gy1 = Math.min(GH - 1, gy0 + 1);
+    const fy = clamp(gyF - gy0, 0, 1);
+    const row0 = gy0 * GW;
+    const row1 = gy1 * GW;
+
+    for (let ax = 0; ax < ARENA_W; ax++) {
+      const gxF = ax / CELL - 0.5;
+      const gx0 = clamp(Math.floor(gxF), 0, GW - 1);
+      const gx1 = Math.min(GW - 1, gx0 + 1);
+      const fx = clamp(gxF - gx0, 0, 1);
+
+      // 双线性插值采样高斯模糊后的光照强度，丝滑无颗粒！
+      const lTop = blurredLight[row0 + gx0] * (1 - fx) + blurredLight[row0 + gx1] * fx;
+      const lBot = blurredLight[row1 + gx0] * (1 - fx) + blurredLight[row1 + gx1] * fx;
+      const rawL = lTop * (1 - fy) + lBot * fy;
+      const litVis = 1 - Math.exp(-rawL * 1.65);
+
+      const worldX = camX + ax / zoom;
+      const expFrac = sampleExplored(worldX, worldY);
+      const isWallEdge = archMask[row0 + gx0] > 0;
+
+      // 未探索区底光极低 (0.035)，但未见建筑墙体边缘透出 0.14 的“若隐若现”朦胧轮廓；已探索区平滑过渡至 0.22~0.24 记忆迷雾
+      const unexpVis = isWallEdge
+        ? (sim.mode === "blackout" ? 0.14 : 0.145)
+        : (sim.mode === "blackout" ? 0.032 : 0.038);
+      const expVis = sim.mode === "blackout" ? 0.21 : 0.24;
+      const baseFogVis = unexpVis + (expVis - unexpVis) * expFrac;
+      const vis = clamp(Math.max(baseFogVis + lateFlood, litVis), 0, 1.05);
+
       const idx = (screenY * OUT_W + (BOARD_X + ax)) * 4;
+      const srcR = raw[idx];
+      const srcG = raw[idx + 1];
+      const srcB = raw[idx + 2];
 
-      // 先对未照亮死角区域做阴影压暗
-      let r = raw[idx] * Math.min(1.05, light);
-      let g = raw[idx + 1] * Math.min(1.06, light * 1.03);
-      let b = raw[idx + 2] * Math.min(1.10, light * 1.12);
+      const lum = srcR * 0.299 + srcG * 0.587 + srcB * 0.114;
+      const satMix = clamp((vis - 0.08) / 0.55, 0.22, 1.0);
+      const colR = lum * (1 - satMix) + srcR * satMix;
+      const colG = lum * (1 - satMix) + srcG * satMix;
+      const colB = lum * 1.08 * (1 - satMix) + srcB * satMix;
 
-      // 叠加手电筒/旋转探照灯的地面体积光束照度（被死角隔墙截断处立刻形成锐利明暗边界！）
-      if (cone > 0.01) {
-        if (tint === 1) {
-          // 旋转工业探照灯：高对比暖金琥珀光束
-          r += cone * 52;
-          g += cone * 38;
-          b += cone * 12;
-        } else if (tint === 2) {
-          // S弯声呐手电：深海荧光青绿光束
-          r += cone * 10;
-          g += cone * 44;
-          b += cone * 38;
-        } else if (sim.mode === "maze-infect") {
-          // 三道监区生化紫白战术光束
-          r += cone * 34;
-          g += cone * 26;
-          b += cone * 48;
-        } else {
-          // CQB 搜房冷青白战术枪灯
-          r += cone * 22;
-          g += cone * 38;
-          b += cone * 50;
-        }
-      } else if (tint === 2 && light > baseAmbient + 0.05) {
-        // 声呐超声波扫描环：翡翠青色雷达脉冲微光
-        const sBoost = light - baseAmbient;
-        g += sBoost * 28;
-        b += sBoost * 34;
-      }
+      const warm = warmGrid[row0 + gx0];
+      const bloom = Math.max(0, rawL - 0.55) * 18;
+      const outR = fogR * (1 - Math.min(1, vis)) + colR * vis + bloom * (warm > 0.1 ? 1.3 : 0.7) + emergencyRedBoost;
+      const outG = fogG * (1 - Math.min(1, vis)) + colG * vis + bloom * 0.95;
+      const outB = fogB * (1 - Math.min(1, vis)) + colB * vis + bloom * (warm > 0.1 ? 0.45 : 1.15);
 
-      raw[idx] = clamp(Math.round(r), 0, 255);
-      raw[idx + 1] = clamp(Math.round(g), 0, 255);
-      raw[idx + 2] = clamp(Math.round(b), 0, 255);
+      raw[idx] = clamp(outR | 0, 0, 255);
+      raw[idx + 1] = clamp(outG | 0, 0, 255);
+      raw[idx + 2] = clamp(outB | 0, 0, 255);
     }
   }
 
-  // 4. 绘制被死角墙体物理切割的体积光锥边界线与扇形光线束 (Volumetric Raycast Light Beams)
-  for (let ci = 0; ci < sim.lightCones.length; ci++) {
-    const c = sim.lightCones[ci];
-    const dists = coneShadowMaps[ci];
-    const sx = ox + c.x;
-    const sy = oy + c.y;
-    const isSpot = c.kind === "spotlight";
-    const rayCol: RGBA = isSpot
-      ? [255, 224, 110, 44]
-      : sim.mode === "sonar"
-        ? [75, 250, 215, 30]
-        : sim.mode === "maze-infect"
-          ? [225, 165, 255, 30]
-          : [135, 240, 255, 28];
-    const edgeCol: RGBA = isSpot
-      ? [255, 235, 130, 128]
-      : sim.mode === "sonar"
-        ? [95, 255, 225, 84]
-        : sim.mode === "maze-infect"
-          ? [240, 175, 255, 82]
-          : [155, 245, 255, 78];
-
-    let prevEndX = sx;
-    let prevEndY = sy;
-    for (let rIdx = 0; rIdx < RAY_COUNT; rIdx++) {
-      const frac = rIdx / (RAY_COUNT - 1);
-      const rayAng = c.angle - c.halfFov + frac * (c.halfFov * 2);
-      const d = dists[rIdx];
-      const ex = sx + Math.cos(rayAng) * d;
-      const ey = sy + Math.sin(rayAng) * d;
-
-      // 两侧边缘射线 + 内部稀疏体积光束线
-      if (rIdx === 0 || rIdx === RAY_COUNT - 1) {
-        fb.drawLine(sx, sy, ex, ey, isSpot ? 2.2 : 1.4, edgeCol);
-      } else if (rIdx % 5 === 0) {
-        fb.drawLine(sx, sy, ex, ey, isSpot ? 1.8 : 1.1, rayCol);
-      }
-
-      // 光锥前端被墙体切割的折线轮廓
-      if (rIdx > 0) {
-        fb.drawLine(prevEndX, prevEndY, ex, ey, isSpot ? 2.0 : 1.2, edgeCol);
-      }
-      prevEndX = ex;
-      prevEndY = ey;
-    }
-
-    // 探照灯灯塔光源本体渲染
-    if (isSpot) {
-      fb.drawGlowCircle(sx, sy, 28, [255, 220, 95, 165]);
-      fb.fillCircle(sx, sy, 12, [42, 32, 18, 255]);
-      drawPolygonLines(fb, sx, sy, 12, 6, frameIdx * 0.03, 2.2, [255, 225, 95, 255]);
-      fb.fillCircle(sx, sy, 6.0, [255, 250, 210, 255]);
+  // 6. 在迷雾层之上：对【尚未被照亮的任务救援点】仅绘制若隐若现的低透明度呼吸求救微光波纹（照亮后才显现完整路障与进度环！）
+  for (const n of sim.nodes) {
+    if (n.broken) continue;
+    const gx = clamp(Math.floor(((n.x - camX) * zoom) / CELL), 0, GW - 1);
+    const gy = clamp(Math.floor(((n.y - camY) * zoom) / CELL), 0, GH - 1);
+    const localL = blurredLight[gy * GW + gx];
+    if (localL < 0.38) {
+      const nx = ox + n.x;
+      const ny = oy + n.y;
+      const pulse = (frameIdx * 0.045) % 1.0;
+      const alpha = Math.round((1 - pulse) * 52 * clamp(1 - localL * 2, 0.2, 1));
+      const hintCol: RGBA =
+        n.kind === "rescue_cage" ? [85, 240, 165, alpha] : [255, 210, 95, alpha];
+      wfb.strokeRing(nx, ny, 16 + pulse * 34, 1.8, hintCol);
+      wfb.drawGlowCircle(nx, ny, 18, [hintCol[0], hintCol[1], hintCol[2], 32]);
     }
   }
 
-  // 5. 若为 blackout 断电期间，在 4 座熄灭的工业探照灯塔基座上闪烁红色故障警示光环
-  if (sim.mode === "blackout" && sim.blackoutActive) {
-    for (const [tx, ty] of [
-      [520, 2130],
-      [1280, 2130],
-      [520, 1050],
-      [1280, 1050],
-    ]) {
-      const sx = ox + tx;
-      const sy = oy + ty;
-      fb.fillCircle(sx, sy, 12, [38, 16, 20, 255]);
-      drawPolygonLines(fb, sx, sy, 12, 6, 0, 2.0, [255, 65, 75, 235]);
-      if (frameIdx % 6 < 3) {
-        fb.drawGlowCircle(sx, sy, 24, [255, 45, 65, 155]);
-      }
-    }
-  }
-
-  // 6. 重绘室内死角防爆墙高光轮廓（确保墙体在阴影/光锥交界处棱角分明）
-  renderDeadCornerWalls(fb, sim);
-
-  // 7. 在黑暗死角阴影中绘制【丧尸腥红幽光双眼 (`暗处红眼闪烁`)】与声呐蛰伏脉冲框！
+  // 7. 声呐潜行模式下：青色超声波扫过墙后暗室蛰伏尸潮时，在迷雾上点亮清晰的「青色声呐穿墙回波靶环」！
   for (let i = 0; i < sim.reds.length; i++) {
     const r = sim.reds[i];
-    const rx = ox + r.x;
-    const ry = oy + r.y;
-    if (rx < BOARD_X - 20 || rx > BOARD_X + ARENA_W + 20 || ry < BOARD_Y - 20 || ry > BOARD_Y + ARENA_H + 20) {
+    if (r.x < camX - 20 || r.x > camX + viewW + 20 || r.y < camY - 20 || r.y > camY + viewH + 20) {
       continue;
     }
-    const gx = clamp(Math.floor((r.x - camX) / CELL), 0, GW - 1);
-    const gy = clamp(Math.floor((r.y - camY) / CELL), 0, GH - 1);
-    const light = lightGrid[gy * GW + gx];
+    const gx = clamp(Math.floor(((r.x - camX) * zoom) / CELL), 0, GW - 1);
+    const gy = clamp(Math.floor(((r.y - camY) * zoom) / CELL), 0, GH - 1);
+    const localL = blurredLight[gy * GW + gx];
+    const pingTicks = r.sonarPingTicks ?? 0;
 
-    // 声呐模式下处于蛰伏状态 (dormant) 或位于死角阴影中 (light < 0.62) 的丧尸：亮起嗜血红眼！
-    if (r.dormant || light < 0.62) {
+    if (sim.mode === "sonar" && pingTicks > 0 && localL < 0.45) {
+      const rx = ox + r.x;
+      const ry = oy + r.y;
+      const pingFrac = clamp(pingTicks / 46, 0, 1);
+      const pingAlpha = Math.round(pingFrac * 225);
+      wfb.drawGlowCircle(rx, ry, r.r + 7, [45, 245, 220, Math.round(pingAlpha * 0.42)]);
+      wfb.strokeRing(rx, ry, r.r + 2.8 + (1 - pingFrac) * 4, 1.5, [75, 255, 232, pingAlpha]);
+      wfb.fillCircle(rx, ry, Math.max(2.4, r.r * 0.45), [185, 255, 245, pingAlpha]);
+      continue;
+    }
+
+    if ((localL >= 0.05 && localL < 0.42) || (sim.mode === "sonar" && r.dormant)) {
+      const rx = ox + r.x;
+      const ry = oy + r.y;
       const moveAng = Math.atan2(r.vy || 1, r.vx || 0);
       const px = -Math.sin(moveAng);
       const py = Math.cos(moveAng);
-      const eyeSpread = Math.max(2.2, r.r * 0.36);
-      const eyeForward = r.r * 0.25;
-      const ex1 = rx + Math.cos(moveAng) * eyeForward - px * eyeSpread;
-      const ey1 = ry + Math.sin(moveAng) * eyeForward - py * eyeSpread;
-      const ex2 = rx + Math.cos(moveAng) * eyeForward + px * eyeSpread;
-      const ey2 = ry + Math.sin(moveAng) * eyeForward + py * eyeSpread;
-
-      const flicker = 0.65 + 0.35 * Math.sin(frameIdx * 0.28 + r.id * 1.7);
-      const eyeAlpha = Math.round(clamp(flicker * (r.dormant ? 195 : 245), 90, 250));
-      const eyeCol: RGBA =
-        r.kind === "infected_elite"
-          ? [255, 65, 195, eyeAlpha]
-          : r.kind === "carrier"
-            ? [85, 255, 165, eyeAlpha]
-            : [255, 38, 62, eyeAlpha];
-
-      // 蛰伏丧尸轮廓暗环
-      if (r.dormant) {
-        fb.strokeRing(rx, ry, r.r * 0.9, 1.2, [120, 24, 42, 110]);
-      }
-
-      const eyeR = r.kind === "boss" ? 3.2 : r.kind === "infected_elite" ? 2.4 : 1.7;
-      fb.fillCircle(ex1, ey1, eyeR, eyeCol);
-      fb.fillCircle(ex2, ey2, eyeR, eyeCol);
+      const eyeSpread = Math.max(2.0, r.r * 0.34);
+      const ex1 = rx + Math.cos(moveAng) * 2 - px * eyeSpread;
+      const ey1 = ry + Math.sin(moveAng) * 2 - py * eyeSpread;
+      const ex2 = rx + Math.cos(moveAng) * 2 + px * eyeSpread;
+      const ey2 = ry + Math.sin(moveAng) * 2 + py * eyeSpread;
+      const eyeAlpha = Math.round(clamp((0.5 + 0.5 * Math.sin(frameIdx * 0.25 + r.id)) * 155, 45, 165));
+      wfb.fillCircle(ex1, ey1, 1.6, [255, 45, 65, eyeAlpha]);
+      wfb.fillCircle(ex2, ey2, 1.6, [255, 45, 65, eyeAlpha]);
     }
   }
 }
@@ -853,7 +1125,7 @@ function renderGlobalMinimapAndTelemetry(
     if (n.broken) continue;
     const nx = mapX + (n.x / WORLD_W) * mapW;
     const ny = mapY + (n.y / WORLD_H) * mapH;
-    fb.fillCircle(nx, ny, 3.6, [255, 225, 75, 255]);
+    fb.fillCircle(nx, ny, 2.3, [115, 255, 175, 240]);
   }
   for (let i = 0; i < sim.reds.length; i += 2) {
     const r = sim.reds[i];
@@ -871,11 +1143,12 @@ function renderGlobalMinimapAndTelemetry(
     fb.fillCircle(gx, gy, 2.2, [65, 255, 155, 255]);
   }
 
-  // 5. 绘制【实时镜头视野跟随白框 (Camera Follow Viewport Box)】
+  // 5. 绘制【实时动态变焦镜头视野跟随白框 (Zoomed Camera Follow Viewport Box)】
+  const zoom = clamp(sim.camZoom || 1.0, 1.0, 2.2);
   const vx = mapX + (sim.camX / WORLD_W) * mapW;
   const vy = mapY + (sim.camY / WORLD_H) * mapH;
-  const vw = (ARENA_W / WORLD_W) * mapW;
-  const vh = (ARENA_H / WORLD_H) * mapH;
+  const vw = ((ARENA_W / zoom) / WORLD_W) * mapW;
+  const vh = ((ARENA_H / zoom) / WORLD_H) * mapH;
   fb.blendRoundRect(vx, vy, vw, vh, 2, [255, 255, 255, 28]);
   fb.strokeRoundRect(vx, vy, vw, vh, 2, 1.8, [255, 255, 255, 245]);
   drawCornerBrackets(
@@ -890,15 +1163,607 @@ function renderGlobalMinimapAndTelemetry(
   );
 }
 
+function hash2i(x: number, y: number): number {
+  let h = (x * 374761393 + y * 668265263) | 0;
+  h = ((h ^ (h >>> 13)) * 1274126177) | 0;
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+}
+
 /**
- * 构建 1800 x 3000 超大科学战术世界地图 (`buildWorldBackground`)：
- * - scavenge: 西翼/东翼折角实验大楼（3座带 130px 真实门洞的封闭侧室 `1号军火密室`、`2号基因密室`、`3号重装密室`）
- * - blackout: 双八角地下核反应堆设施（南区1号反应堆 + 中央防爆气闸 + 北区2号反应堆 + 2座中央矩形防爆反应核 + 4座工业探照灯基座）
- * - sonar: 大跨度 S 型蜿蜒深渊洞穴（横跨 x=485..1315 的三段大S弯 + 同心声呐扫描距离环 + 荧光导航轨线）
- * - maze-infect: 三通道生化隔离监区（下层被两道 1100px 竖墙分隔为 A/B/C 三条平行监区走廊 + 中央检疫汇合广场 + 上层生化隔离区）
+ * 在大世界底图上绘制高细节真实世界室内家具陈设（带斜投影阴影、材质立体倒角与末日凌乱细节）
  */
-function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8ClampedArray {
-  const fb = new FrameBuf(WORLD_W, WORLD_H, [8, 10, 15, 255]);
+function renderInteriorPropIntoWorld(fb: FrameBuf, p: InteriorPropSpec): void {
+  const { x, y, w, h, kind } = p;
+  const variant = p.variant ?? 0;
+  const rot = p.rot ?? 0;
+
+  // 通用地面环境光遮蔽阴影
+  fb.blendRoundRect(x + 4, y + 6, w + 2, h + 2, 4, [3, 5, 10, 165]);
+
+  if (kind === "shelf_aisle") {
+    // 超市/药店重型双面金属货架 + 彩色商品盒罐排列 + 散落在地上的掉落商品
+    fb.fillRoundRect(x, y, w, h, 3, [42, 48, 58, 255]);
+    fb.strokeRoundRect(x, y, w, h, 3, 1.5, [108, 120, 136, 240]);
+    const isVert = h >= w;
+    if (isVert) {
+      fb.drawLine(x + w * 0.5, y + 3, x + w * 0.5, y + h - 3, 2.0, [78, 88, 102, 235]);
+      const palette: RGBA[] = [
+        [195, 68, 58, 235],
+        [62, 148, 205, 235],
+        [215, 168, 52, 235],
+        [68, 175, 112, 235],
+        [185, 195, 208, 235],
+      ];
+      for (let sy = y + 8; sy < y + h - 10; sy += 13) {
+        const cL = palette[Math.floor(hash2i(x, sy) * palette.length)];
+        const cR = palette[Math.floor(hash2i(x + 19, sy) * palette.length)];
+        fb.fillRect(x + 4, sy, Math.max(4, w * 0.5 - 7), 8, cL);
+        fb.fillRect(x + w * 0.5 + 3, sy, Math.max(4, w * 0.5 - 7), 8, cR);
+      }
+      // 散落在货架脚边的掉落罐头与包装盒
+      for (let k = 0; k < 4; k++) {
+        const side = k % 2 === 0 ? -7 : w + 4;
+        const dy = y + 18 + k * ((h - 32) / 3.5);
+        const col = palette[(k + variant) % palette.length];
+        fb.fillRect(x + side, dy, 5, 5, col);
+      }
+    } else {
+      fb.drawLine(x + 3, y + h * 0.5, x + w - 3, y + h * 0.5, 2.0, [78, 88, 102, 235]);
+      for (let sx = x + 8; sx < x + w - 10; sx += 13) {
+        const col: RGBA = ((sx >> 3) + variant) % 2 === 0 ? [75, 165, 195, 230] : [205, 145, 58, 230];
+        fb.fillRect(sx, y + 4, 8, Math.max(4, h * 0.5 - 6), col);
+        fb.fillRect(sx, y + h * 0.5 + 2, 8, Math.max(4, h * 0.5 - 6), [168, 182, 196, 225]);
+      }
+    }
+    return;
+  }
+
+  if (kind === "checkout") {
+    // 收银台传送带 / 导医接待台 / 后厨不锈钢操作台
+    const baseCol: RGBA =
+      variant === 2 ? [68, 76, 86, 255] : variant === 1 ? [48, 62, 76, 255] : [58, 48, 40, 255];
+    fb.fillRoundRect(x, y, w, h, 4, baseCol);
+    fb.strokeRoundRect(x, y, w, h, 4, 1.6, [132, 146, 162, 235]);
+    if (h > w) {
+      // 黑色橡胶收银传送带 + 扫码收银机屏幕
+      fb.fillRect(x + 5, y + 6, Math.max(8, w - 10), Math.max(12, h * 0.58), [22, 25, 30, 250]);
+      fb.fillRect(x + 7, y + h * 0.7, Math.max(8, w - 14), 11, [145, 168, 188, 240]);
+      fb.fillCircle(x + w * 0.5, y + h * 0.75, 2.5, [95, 235, 185, 245]);
+    } else {
+      fb.fillRect(x + 8, y + 6, Math.max(12, w - 16), Math.max(6, h - 12), [36, 44, 54, 235]);
+      for (let sx = x + 22; sx < x + w - 20; sx += 36) {
+        fb.fillRect(sx, y + 8, 16, 10, [135, 185, 215, 235]);
+      }
+    }
+    return;
+  }
+
+  if (kind === "round_table") {
+    // 餐饮圆桌 + 四周 4 把椅子（含被撞歪/拉出的末日凌乱椅位）+ 桌面餐盘水杯
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const tr = Math.min(w, h) * 0.36;
+    for (let ci = 0; ci < 4; ci++) {
+      const cAng = rot + (ci * Math.PI) / 2 + (ci === 1 ? 0.32 : ci === 3 ? -0.24 : 0);
+      const dist = tr + (ci === 2 ? 11 : 6.5);
+      const chX = cx + Math.cos(cAng) * dist;
+      const chY = cy + Math.sin(cAng) * dist;
+      fb.fillCircle(chX + 2, chY + 2, 6.2, [4, 6, 10, 150]);
+      fb.fillCircle(chX, chY, 5.8, variant === 0 ? [92, 52, 42, 245] : [48, 68, 88, 245]);
+      fb.strokeRing(chX, chY, 5.8, 1.2, [138, 148, 162, 215]);
+    }
+    fb.fillCircle(cx + 3, cy + 4, tr + 1, [4, 6, 10, 165]);
+    fb.fillCircle(cx, cy, tr, variant === 0 ? [84, 62, 44, 255] : [68, 76, 88, 255]);
+    fb.strokeRing(cx, cy, tr, 1.5, [148, 136, 122, 230]);
+    // 桌面遗留白色餐盘与水杯
+    fb.fillCircle(cx - 5, cy - 3, 3.6, [205, 212, 220, 225]);
+    fb.fillCircle(cx + 6, cy + 4, 2.4, [145, 195, 225, 225]);
+    return;
+  }
+
+  if (kind === "booth_table") {
+    // 餐厅双排软包卡座沙发 + 实木餐桌
+    const benchCol: RGBA = variant === 0 ? [96, 36, 46, 250] : [38, 58, 84, 250];
+    fb.fillRoundRect(x, y, 18, h, 3, benchCol);
+    fb.fillRoundRect(x + w - 18, y, 18, h, 3, benchCol);
+    fb.strokeRoundRect(x, y, 18, h, 3, 1.2, [145, 95, 105, 210]);
+    fb.strokeRoundRect(x + w - 18, y, 18, h, 3, 1.2, [145, 95, 105, 210]);
+    fb.fillRoundRect(x + 21, y + 4, w - 42, h - 8, 2, [82, 60, 42, 255]);
+    fb.strokeRoundRect(x + 21, y + 4, w - 42, h - 8, 2, 1.3, [142, 118, 92, 230]);
+    return;
+  }
+
+  if (kind === "clothes_rack") {
+    // 服装店/免税店圆形展示岛与彩色挂衣架
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const r = Math.min(w, h) * 0.42;
+    fb.fillCircle(cx, cy, r, [34, 40, 50, 250]);
+    fb.strokeRing(cx, cy, r, 2.0, [165, 178, 195, 235]);
+    const cols: RGBA[] = [
+      [185, 62, 78, 235],
+      [65, 138, 195, 235],
+      [205, 172, 72, 235],
+      [88, 165, 128, 235],
+    ];
+    for (let i = 0; i < 10; i++) {
+      const a = (i * Math.PI * 2) / 10;
+      fb.drawLine(
+        cx + Math.cos(a) * (r * 0.35),
+        cy + Math.sin(a) * (r * 0.35),
+        cx + Math.cos(a) * (r * 0.88),
+        cy + Math.sin(a) * (r * 0.88),
+        3.6,
+        cols[(i + variant) % cols.length],
+      );
+    }
+    fb.fillCircle(cx, cy, r * 0.28, [190, 202, 215, 245]);
+    return;
+  }
+
+  if (kind === "planter") {
+    // 商场/航站楼石材坐凳花坛 + 室内棕榈阔叶绿植
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const r = Math.min(w, h) * 0.46;
+    fb.fillRoundRect(x, y, w, h, 8, [64, 70, 80, 255]);
+    fb.strokeRoundRect(x, y, w, h, 8, 2.0, [122, 132, 146, 235]);
+    fb.fillRoundRect(x + 7, y + 7, w - 14, h - 14, 5, [32, 26, 20, 255]);
+    for (let f = 0; f < 9; f++) {
+      const a = (f * Math.PI * 2) / 9 + variant * 0.4;
+      const len = r * (0.68 + (f % 2) * 0.22);
+      fb.drawLine(
+        cx,
+        cy,
+        cx + Math.cos(a) * len,
+        cy + Math.sin(a) * len,
+        4.4,
+        f % 2 === 0 ? [36, 118, 68, 245] : [54, 148, 84, 245],
+      );
+    }
+    fb.fillCircle(cx, cy, 6, [68, 168, 96, 250]);
+    return;
+  }
+
+  if (kind === "vending") {
+    // 自动售货机 / 地铁自动售票机（带发光橱窗微光）
+    fb.fillRoundRect(x, y, w, h, 3, [36, 46, 62, 255]);
+    fb.strokeRoundRect(x, y, w, h, 3, 1.5, [125, 168, 205, 240]);
+    const glowCol: RGBA =
+      variant === 1 ? [75, 205, 245, 215] : variant === 2 ? [245, 175, 65, 215] : [95, 235, 175, 215];
+    fb.fillRect(x + 4, y + 4, Math.max(6, w - 8), Math.max(6, h - 8), glowCol);
+    fb.drawGlowCircle(x + w * 0.5, y + h * 0.5, Math.max(w, h) * 0.55, [glowCol[0], glowCol[1], glowCol[2], 55]);
+    return;
+  }
+
+  if (kind === "cart_clutter") {
+    // 散落的手推购物车、拉杆行李箱与倾倒纸箱
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const ux = Math.cos(rot);
+    const uy = Math.sin(rot);
+    const px = -uy;
+    const py = ux;
+    // 金属网框手推车
+    fb.drawLine(cx - ux * 14 - px * 9, cy - uy * 14 - py * 9, cx + ux * 14 - px * 9, cy + uy * 14 - py * 9, 2.0, [155, 170, 188, 230]);
+    fb.drawLine(cx - ux * 14 + px * 9, cy - uy * 14 + py * 9, cx + ux * 14 + px * 9, cy + uy * 14 + py * 9, 2.0, [155, 170, 188, 230]);
+    fb.drawLine(cx + ux * 14 - px * 9, cy + uy * 14 - py * 9, cx + ux * 14 + px * 9, cy + uy * 14 + py * 9, 2.0, [155, 170, 188, 230]);
+    fb.drawLine(cx - ux * 16 - px * 10, cy - uy * 16 - py * 10, cx - ux * 16 + px * 10, cy - uy * 16 + py * 10, 2.6, [215, 68, 58, 240]);
+    // 旁侧倾倒瓦楞纸箱与行李箱
+    fb.fillRoundRect(cx + 10, cy - 6, 15, 13, 2, [118, 92, 58, 240]);
+    fb.strokeRoundRect(cx + 10, cy - 6, 15, 13, 2, 1.2, [158, 128, 86, 225]);
+    fb.fillRoundRect(cx - 22, cy + 6, 14, 10, 2, [48, 72, 108, 240]);
+    return;
+  }
+
+  if (kind === "subway_train") {
+    // 真实不锈钢地铁列车车厢（带车顶波纹钢板、3组空调机组、车头双风挡与轻微脱轨偏角）
+    const cx = x + w * 0.5;
+    const cy = y + h * 0.5;
+    const ux = Math.cos(rot);
+    const uy = Math.sin(rot);
+    const hw = w * 0.46;
+    const hh = h * 0.48;
+    // 沿着旋转车体中轴绘制高密度实心车体
+    for (let t = -hh; t <= hh; t += 3) {
+      const bx = cx - uy * t;
+      const by = cy + ux * t;
+      fb.drawLine(bx - ux * hw, by - uy * hw, bx + ux * hw, by + uy * hw, 4.5, [62, 72, 84, 255]);
+    }
+    // 车体蓝色/橙色地铁线路腰线与不锈钢顶盖肋条
+    const stripeCol: RGBA = variant === 0 ? [48, 138, 215, 240] : [225, 142, 42, 240];
+    fb.drawLine(cx - ux * (hw - 2) + uy * hh, cy - uy * (hw - 2) - ux * hh, cx - ux * (hw - 2) - uy * hh, cy - uy * (hw - 2) + ux * hh, 3.0, stripeCol);
+    fb.drawLine(cx + ux * (hw - 2) + uy * hh, cy + uy * (hw - 2) - ux * hh, cx + ux * (hw - 2) - uy * hh, cy + uy * (hw - 2) + ux * hh, 3.0, stripeCol);
+    for (const acOff of [-hh * 0.58, 0, hh * 0.58]) {
+      const ax = cx - uy * acOff;
+      const ay = cy + ux * acOff;
+      fb.fillRoundRect(ax - 18, ay - 20, 36, 40, 4, [88, 98, 112, 255]);
+      fb.strokeRoundRect(ax - 18, ay - 20, 36, 40, 4, 1.5, [138, 150, 166, 235]);
+      fb.fillCircle(ax, ay - 8, 6.5, [38, 44, 54, 245]);
+      fb.fillCircle(ax, ay + 8, 6.5, [38, 44, 54, 245]);
+    }
+    // 驾驶室深色前风挡玻璃
+    const cabY = cy - ux * (hh - 14);
+    const cabX = cx + uy * (hh - 14);
+    fb.fillRoundRect(cabX - 24, cabY - 8, 48, 14, 3, [18, 26, 36, 250]);
+    return;
+  }
+
+  if (kind === "turnstile_row") {
+    // 地铁检票不锈钢三辊闸机阵列（含红叉/绿箭通行指示灯）
+    const gates = Math.max(3, Math.floor(w / 38));
+    const step = w / gates;
+    for (let g = 0; g < gates; g++) {
+      const gx = x + g * step;
+      fb.fillRoundRect(gx, y, 13, h, 3, [86, 98, 114, 255]);
+      fb.strokeRoundRect(gx, y, 13, h, 3, 1.2, [152, 168, 185, 235]);
+      const openGate = (g + variant) % 3 === 1;
+      fb.fillCircle(gx + 6.5, y + 6, 2.4, openGate ? [65, 245, 145, 250] : [255, 65, 75, 250]);
+      if (!openGate) {
+        fb.drawLine(gx + 13, y + h * 0.5, gx + step - 2, y + h * 0.5, 2.2, [185, 72, 82, 215]);
+      }
+    }
+    return;
+  }
+
+  if (kind === "transformer") {
+    // 高压变电柜 / 太平间不锈钢冷柜阵列（散热鳍片 + 铜母线排）
+    fb.fillRoundRect(x, y, w, h, 4, [44, 52, 62, 255]);
+    fb.strokeRoundRect(x, y, w, h, 4, 1.8, [118, 132, 148, 240]);
+    if (h >= w) {
+      for (let sy = y + 10; sy < y + h - 8; sy += 12) {
+        fb.drawLine(x + 5, sy, x + w - 5, sy, 2.0, [74, 86, 100, 230]);
+      }
+      fb.fillRect(x + w * 0.35, y + 12, w * 0.3, h - 24, [158, 112, 56, 225]);
+    } else {
+      for (let sx = x + 12; sx < x + w - 10; sx += 14) {
+        fb.drawLine(sx, y + 5, sx, y + h - 5, 2.0, [74, 86, 100, 230]);
+      }
+    }
+    return;
+  }
+
+  if (kind === "hospital_bed") {
+    // 医院急诊病床（白床垫 + 枕头 + 蓝白被单/血迹 + 输液架 + 弧形隐私蓝布帘）
+    fb.fillRoundRect(x, y, w, h, 4, [168, 178, 190, 250]);
+    fb.strokeRoundRect(x, y, w, h, 4, 1.8, [92, 108, 126, 245]);
+    const headLeft = (rot ?? 0) < 1.0;
+    const pilX = headLeft ? x + 6 : x + w - 24;
+    fb.fillRoundRect(pilX, y + 7, 18, h - 14, 3, [225, 232, 240, 255]);
+    const sheetX = headLeft ? x + 28 : x + 6;
+    fb.fillRoundRect(sheetX, y + 4, w - 34, h - 8, 3, [78, 136, 178, 245]);
+    if (variant === 1) {
+      // 病床残留暗红血迹
+      fb.blendCircle(x + w * 0.52, y + h * 0.48, 12, [135, 22, 34, 195]);
+    }
+    // 旁侧不锈钢输液架与蓝色隐私隔帘轨
+    const ivX = headLeft ? x + 12 : x + w - 12;
+    fb.fillCircle(ivX, y - 7, 4.5, [185, 215, 235, 240]);
+    fb.drawLine(x, y + h + 5, x + w * 0.78, y + h + 5, 2.4, [62, 125, 168, 215]);
+    return;
+  }
+
+  if (kind === "surgical_set") {
+    // 手术室无菌绿布手术台 + 双悬臂圆形无影灯 + 器械盘
+    fb.fillRoundRect(x + 12, y + 16, w - 24, h - 32, 5, [38, 118, 98, 255]);
+    fb.strokeRoundRect(x + 12, y + 16, w - 24, h - 32, 5, 1.8, [125, 205, 185, 240]);
+    // 双悬臂无影灯头
+    for (const [lx, ly] of [
+      [x + w * 0.36, y + 10],
+      [x + w * 0.68, y + h - 10],
+    ]) {
+      fb.drawLine(x + w * 0.5, y + h * 0.5, lx, ly, 2.2, [165, 180, 196, 235]);
+      fb.fillCircle(lx, ly, 10.5, [195, 235, 245, 245]);
+      fb.strokeRing(lx, ly, 10.5, 1.6, [85, 145, 168, 240]);
+      fb.fillCircle(lx, ly, 4.2, [245, 255, 255, 255]);
+    }
+    fb.fillRoundRect(x + w - 8, y + 20, 16, 26, 2, [155, 170, 186, 245]);
+    return;
+  }
+
+  if (kind === "mri_scanner") {
+    // 核磁共振 (MRI) 圆筒形超导磁体机壳 + 滑轨检查床
+    fb.fillRoundRect(x, y, 76, h, 14, [188, 202, 215, 255]);
+    fb.strokeRoundRect(x, y, 76, h, 14, 2.2, [82, 138, 168, 245]);
+    fb.fillCircle(x + 38, y + h * 0.5, 24, [24, 34, 46, 255]);
+    fb.strokeRing(x + 38, y + h * 0.5, 24, 2.4, [75, 195, 215, 240]);
+    // 延伸出的滑轨检查床
+    fb.fillRoundRect(x + 42, y + h * 0.5 - 15, w - 42, 30, 4, [145, 165, 182, 255]);
+    fb.strokeRoundRect(x + 42, y + h * 0.5 - 15, w - 42, 30, 4, 1.5, [90, 112, 132, 240]);
+    return;
+  }
+
+  if (kind === "seat_row") {
+    // 机场/医院不锈钢横梁联排候诊座椅
+    const isVert = h > w;
+    const count = Math.max(3, Math.floor((isVert ? h : w) / 24));
+    if (isVert) {
+      fb.drawLine(x + w * 0.5, y + 4, x + w * 0.5, y + h - 4, 3.0, [120, 132, 148, 235]);
+      for (let i = 0; i < count; i++) {
+        const sy = y + 4 + i * ((h - 8) / count);
+        fb.fillRoundRect(x + 3, sy, w - 6, 18, 3, [46, 78, 118, 250]);
+        fb.strokeRoundRect(x + 3, sy, w - 6, 18, 3, 1.2, [95, 135, 178, 225]);
+      }
+    } else {
+      fb.drawLine(x + 4, y + h * 0.5, x + w - 4, y + h * 0.5, 3.0, [120, 132, 148, 235]);
+      for (let i = 0; i < count; i++) {
+        const sx = x + 4 + i * ((w - 8) / count);
+        fb.fillRoundRect(sx, y + 3, 19, h - 6, 3, [46, 78, 118, 250]);
+        fb.strokeRoundRect(sx, y + 3, 19, h - 6, 3, 1.2, [95, 135, 178, 225]);
+      }
+    }
+    return;
+  }
+
+  if (kind === "sofa_l") {
+    // 头等舱 VIP 行政酒廊真皮转角沙发 + 实木茶几
+    const leather: RGBA = variant === 0 ? [86, 52, 36, 255] : [58, 44, 56, 255];
+    fb.fillRoundRect(x, y, 28, h, 5, leather);
+    fb.fillRoundRect(x, y, w, 28, 5, leather);
+    fb.strokeRoundRect(x, y, 28, h, 5, 1.4, [138, 96, 72, 230]);
+    fb.strokeRoundRect(x, y, w, 28, 5, 1.4, [138, 96, 72, 230]);
+    fb.fillRoundRect(x + 38, y + 38, w - 44, h - 44, 3, [112, 82, 52, 255]);
+    fb.strokeRoundRect(x + 38, y + 38, w - 44, h - 44, 3, 1.3, [168, 132, 94, 235]);
+    return;
+  }
+
+  if (kind === "xray_checkpoint") {
+    // 航站楼安检通道：滚筒行李传送带 + 铅帘X光扫描主机 + 旁边金属安检门框
+    fb.fillRoundRect(x + 8, y, w - 16, h, 3, [46, 54, 66, 255]);
+    fb.strokeRoundRect(x + 8, y, w - 16, h, 3, 1.5, [122, 138, 156, 235]);
+    for (let ry = y + 10; ry < y + h - 10; ry += 10) {
+      fb.drawLine(x + 12, ry, x + w - 12, ry, 1.6, [88, 102, 118, 220]);
+    }
+    // 中段巨型 X 光扫描铅箱主体与侧置安检员屏幕
+    fb.fillRoundRect(x, y + h * 0.3, w, h * 0.38, 4, [76, 88, 104, 255]);
+    fb.strokeRoundRect(x, y + h * 0.3, w, h * 0.38, 4, 2.0, [158, 175, 195, 245]);
+    fb.fillRect(x + w - 14, y + h * 0.42, 11, 18, [85, 215, 245, 240]);
+    return;
+  }
+
+  if (kind === "glass_window") {
+    // 钢化玻璃橱窗隔断 / 观察窗（铝合金窗框 + 半透冰青钢化玻璃 + 斜向高光反光条）
+    fb.fillRoundRect(x, y, w, h, 2, [42, 68, 88, 195]);
+    fb.strokeRoundRect(x, y, w, h, 2, 1.8, [148, 172, 195, 240]);
+    const isHoriz = w >= h;
+    if (isHoriz) {
+      for (let gx = x + 16; gx < x + w - 18; gx += 28) {
+        fb.drawLine(gx, y + 3, gx + 10, y + h - 3, 1.5, [195, 242, 255, 190]);
+        fb.drawLine(gx + 14, y + 2, gx + 14, y + h - 2, 1.2, [118, 145, 168, 215]);
+      }
+    } else {
+      for (let gy = y + 16; gy < y + h - 18; gy += 28) {
+        fb.drawLine(x + 3, gy, x + w - 3, gy + 10, 1.5, [195, 242, 255, 190]);
+        fb.drawLine(x + 2, gy + 14, x + w - 2, gy + 14, 1.2, [118, 145, 168, 215]);
+      }
+    }
+    return;
+  }
+
+  if (kind === "cinema_seats") {
+    // 巨幕影厅 / 候机指廊成排剧院座椅阵列
+    const seatCol: RGBA = variant === 0 ? [98, 30, 42, 245] : [86, 32, 48, 245];
+    for (let sy = y + 6; sy < y + h - 12; sy += 22) {
+      for (let sx = x + 6; sx < x + w - 14; sx += 20) {
+        fb.fillRoundRect(sx, sy, 15, 14, 3, seatCol);
+        fb.strokeRoundRect(sx, sy, 15, 14, 3, 1.0, [145, 62, 74, 210]);
+      }
+    }
+  }
+}
+
+/**
+ * 绘制被子弹/泰坦/爆炸彻底轰碎后的【地面坍塌家具残骸与碎玻璃碴】
+ * （破碎后不再阻挡移动，但永久保留逼真木板断茬、倾泻罐头、弯曲钢架与反光玻璃碎片！）
+ */
+function renderWreckedProp(fb: FrameBuf, p: DestructiblePropState, ox: number, oy: number): void {
+  const x = ox + p.x;
+  const y = oy + p.y;
+  const { w, h, kind, material } = p;
+  const cx = x + w * 0.5;
+  const cy = y + h * 0.5;
+
+  if (kind === "glass_window" || material === "glass") {
+    // 碎裂铝合金空窗框 + 满地晶莹反光玻璃碴
+    fb.strokeRoundRect(x, y, w, h, 2, 1.3, [78, 92, 108, 165]);
+    for (let k = 0; k < 14; k++) {
+      const ha = hash2i(p.id * 13 + k, 7);
+      const hb = hash2i(p.id * 29 + k, 19);
+      const sx = x - 8 + ha * (w + 16);
+      const sy = y - 10 + hb * (h + 20);
+      const ang = (ha * 6.28) + k;
+      fb.drawLine(
+        sx,
+        sy,
+        sx + Math.cos(ang) * 6.5,
+        sy + Math.sin(ang) * 6.5,
+        1.6,
+        k % 2 === 0 ? [175, 235, 255, 195] : [115, 195, 232, 165],
+      );
+    }
+    return;
+  }
+
+  // 坍塌暗色焦痕底影
+  fb.blendRoundRect(x - 2, y - 2, w + 4, h + 4, 5, [10, 12, 18, 155]);
+
+  if (kind === "shelf_aisle" || kind === "vending") {
+    // 扭曲倾倒的货架钢梁 + 散落一地的彩色商品盒罐
+    fb.drawLine(x + 4, y + 6, x + w - 4, y + h - 6, 3.0, [64, 74, 88, 215]);
+    fb.drawLine(x + w - 5, y + 8, x + 5, y + h - 8, 2.4, [82, 94, 110, 195]);
+    const cols: RGBA[] = [
+      [205, 65, 55, 215],
+      [62, 152, 215, 215],
+      [215, 172, 48, 215],
+      [68, 178, 112, 215],
+    ];
+    for (let k = 0; k < 12; k++) {
+      const sx = x - 6 + hash2i(p.id + k * 7, 3) * (w + 12);
+      const sy = y - 6 + hash2i(p.id + k * 11, 9) * (h + 12);
+      fb.fillRect(sx, sy, 5, 4, cols[k % cols.length]);
+    }
+    return;
+  }
+
+  if (material === "wood") {
+    // 劈裂成数截的实木桌面断板 + 翻倒椅圈与碎瓷片
+    for (let k = 0; k < 6; k++) {
+      const ha = hash2i(p.id * 17 + k, 5);
+      const hb = hash2i(p.id * 31 + k, 11);
+      const sx = x + ha * w * 0.85;
+      const sy = y + hb * h * 0.85;
+      const ang = (ha - 0.5) * 3.1;
+      const len = 14 + hb * 10;
+      fb.drawLine(
+        sx - Math.cos(ang) * len * 0.5,
+        sy - Math.sin(ang) * len * 0.5,
+        sx + Math.cos(ang) * len * 0.5,
+        sy + Math.sin(ang) * len * 0.5,
+        3.6,
+        k % 2 === 0 ? [96, 68, 44, 225] : [74, 52, 34, 215],
+      );
+    }
+    fb.fillCircle(cx + 6, cy - 4, 2.5, [205, 215, 225, 195]);
+    return;
+  }
+
+  // 金属/织物/绿植花坛破碎残骸（弯曲钢管、撕裂坐垫海绵或散落棕榈断叶）
+  for (let k = 0; k < 7; k++) {
+    const ha = hash2i(p.id * 19 + k, 13);
+    const hb = hash2i(p.id * 41 + k, 23);
+    const sx = x + ha * w;
+    const sy = y + hb * h;
+    const ang = ha * 6.28;
+    const col: RGBA =
+      material === "stone"
+        ? k % 2 === 0
+          ? [46, 138, 72, 215]
+          : [92, 98, 108, 215]
+        : material === "fabric"
+          ? k % 2 === 0
+            ? [168, 185, 205, 205]
+            : [64, 108, 148, 205]
+          : [98, 110, 126, 215];
+    fb.drawLine(sx, sy, sx + Math.cos(ang) * 11, sy + Math.sin(ang) * 11, 2.8, col);
+  }
+}
+
+/**
+ * 实时绘制视野内所有动态可破坏家具（完好态带受击震颤/渐进裂纹/高光闪白；破碎态化为满地逼真残骸！）
+ */
+function renderDynamicInteriorProps(fb: FrameBuf, sim: SiegeSimulator): void {
+  const { camX, camY, zoom } = getEffectiveCam(sim);
+  const viewW = ARENA_W / zoom;
+  const viewH = ARENA_H / zoom;
+  const ox = BOARD_X - camX;
+  const oy = BOARD_Y - camY;
+
+  for (let i = 0; i < sim.props.length; i++) {
+    const p = sim.props[i];
+    if (
+      p.x + p.w < camX - 36 ||
+      p.x > camX + viewW + 36 ||
+      p.y + p.h < camY - 36 ||
+      p.y > camY + viewH + 36
+    ) {
+      continue;
+    }
+
+    if (!p.intact) {
+      renderWreckedProp(fb, p, ox, oy);
+      continue;
+    }
+
+    const drawX = ox + p.x + p.shakeX;
+    const drawY = oy + p.y + p.shakeY;
+    renderInteriorPropIntoWorld(fb, {
+      ...p,
+      x: drawX,
+      y: drawY,
+    });
+
+    // 渐进受损裂纹细节：当耐久低于 68% 时浮现清晰弹孔与结构裂痕！
+    const hpRatio = p.hp / Math.max(1, p.maxHp);
+    if (!p.indestructible && hpRatio < 0.68) {
+      const cx = drawX + p.w * 0.5;
+      const cy = drawY + p.h * 0.5;
+      const crackCol: RGBA =
+        p.material === "glass" ? [215, 250, 255, 235] : [22, 18, 16, 225];
+      fb.drawLine(cx - p.w * 0.28, cy - p.h * 0.22, cx + p.w * 0.12, cy + p.h * 0.26, 1.6, crackCol);
+      fb.drawLine(cx + p.w * 0.24, cy - p.h * 0.18, cx - p.w * 0.08, cy + p.h * 0.15, 1.4, crackCol);
+    }
+
+    // 受击瞬间高亮闪白反馈
+    if (p.hitFlash > 0.2) {
+      const flashA = Math.round(p.hitFlash * 115);
+      fb.blendRoundRect(drawX, drawY, p.w, p.h, 3, [255, 245, 215, flashA]);
+    }
+  }
+}
+
+/**
+ * 在每一处房间出入口绘制真实建筑【金属门槛踏板 + 90° 地面扫掠开门弧线 + 推开的玻璃门/防火门扇】
+ */
+function renderDoorwayIntoWorld(fb: FrameBuf, d: DoorwaySpec): void {
+  const ux = Math.cos(d.wallAngle);
+  const uy = Math.sin(d.wallAngle);
+  const nx = -uy * d.openSign;
+  const ny = ux * d.openSign;
+
+  // 1. 地面拉丝不锈钢门槛踏板
+  const ex = d.hx + ux * d.width;
+  const ey = d.hy + uy * d.width;
+  fb.drawLine(d.hx, d.hy, ex, ey, 6.0, [52, 60, 72, 235]);
+  fb.drawLine(d.hx, d.hy, ex, ey, 1.6, [118, 132, 148, 210]);
+
+  const drawLeaf = (hingeX: number, hingeY: number, dirAlong: 1 | -1, leafLen: number, openRad: number) => {
+    // 地面开门虚线圆弧轨迹（建筑平面图精髓质感！）
+    const steps = 10;
+    for (let s = 0; s < steps; s += 2) {
+      const a0 = (s / steps) * openRad;
+      const a1 = ((s + 1) / steps) * openRad;
+      const p0x = hingeX + (ux * dirAlong * Math.cos(a0) + nx * Math.sin(a0)) * leafLen;
+      const p0y = hingeY + (uy * dirAlong * Math.cos(a0) + ny * Math.sin(a0)) * leafLen;
+      const p1x = hingeX + (ux * dirAlong * Math.cos(a1) + nx * Math.sin(a1)) * leafLen;
+      const p1y = hingeY + (uy * dirAlong * Math.cos(a1) + ny * Math.sin(a1)) * leafLen;
+      fb.drawLine(p0x, p0y, p1x, p1y, 1.2, [95, 112, 132, 115]);
+    }
+    // 推开的真实门扇实体与门把手
+    const tipX = hingeX + (ux * dirAlong * Math.cos(openRad) + nx * Math.sin(openRad)) * leafLen;
+    const tipY = hingeY + (uy * dirAlong * Math.cos(openRad) + ny * Math.sin(openRad)) * leafLen;
+    fb.drawLine(hingeX + 3, hingeY + 4, tipX + 3, tipY + 4, 6.5, [4, 6, 10, 155]);
+    fb.drawLine(
+      hingeX,
+      hingeY,
+      tipX,
+      tipY,
+      5.8,
+      d.glass ? [78, 128, 158, 235] : [88, 72, 56, 250],
+    );
+    fb.drawLine(
+      hingeX,
+      hingeY,
+      tipX,
+      tipY,
+      2.0,
+      d.glass ? [175, 225, 245, 230] : [148, 132, 112, 235],
+    );
+  };
+
+  if (d.doubleDoor) {
+    const leaf = Math.min(54, d.width * 0.34);
+    drawLeaf(d.hx + ux * 6, d.hy + uy * 6, 1, leaf, 1.32);
+    drawLeaf(ex - ux * 6, ey - uy * 6, -1, leaf, 1.46);
+  } else {
+    drawLeaf(d.hx + ux * 6, d.hy + uy * 6, 1, Math.min(68, d.width * 0.72), 1.38);
+  }
+}
+
+/**
+ * 构建 1800 x 3000 高真实度末日商业综合体/地铁站/三甲医院/国际航站楼世界底图 (`buildWorldBackground`)
+ */
+function buildWorldBackground(modeId: SiegeModeId, _atlas: FontAtlas): Uint8ClampedArray {
+  const fb = new FrameBuf(WORLD_W, WORLD_H, [7, 9, 14, 255]);
   const raw = fb.data;
   const outerSegments = getOuterWallSegments(modeId);
 
@@ -911,7 +1776,6 @@ function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8Clamp
 
     for (let wx = 0; wx < WORLD_W; wx++) {
       const idx = (wy * WORLD_W + wx) * 4;
-
       const distToLeft = wx - leftEdge;
       const distToRight = rightEdge - wx;
       const minEdgeDist = isTopWall
@@ -921,70 +1785,87 @@ function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8Clamp
           : Math.min(distToLeft, distToRight);
 
       if (!isTopWall && !isBottomWall && distToLeft >= 0 && distToRight >= 0) {
-        // 1. 各模式专属地板基色与功能区高亮
-        let r = 14;
-        let g = 18;
-        let b = 26;
+        // 1. 真实水磨石/花岗岩/环氧地坪基色 + 空间微噪点磨损脏迹（彻底告别塑料纯色块！）
+        const grit = Math.round((hash2i(wx >> 2, wy >> 2) - 0.5) * 5 + (hash2i(wx >> 5, wy >> 5) - 0.5) * 6);
+        let r = 24 + grit;
+        let g = 27 + grit;
+        let b = 33 + grit;
 
         if (modeId === "scavenge") {
-          // 冰蓝 CQB 室内大楼地板 + 1号军火室 / 2号基因室 / 3号重装室 专属蓝图房间地砖
-          r = 11;
-          g = 22;
-          b = 36;
-          const inRoom1 = wx <= 680 && wy >= 2110 && wy <= 2520;
-          const inRoom2 = wx >= 1120 && wy >= 1380 && wy <= 1800;
-          const inRoom3 = wx <= 680 && wy >= 720 && wy <= 1120;
-          if (inRoom1 || inRoom2 || inRoom3) {
-            r = 18;
-            g = 40;
-            b = 62;
-            if ((wx + wy) % 24 < 2) {
-              r += 8;
-              g += 18;
-              b += 26;
-            }
+          // 购物中心米灰水磨石主中庭地砖 + 双道黄铜装饰镶边
+          r = 25 + grit;
+          g = 28 + grit;
+          b = 34 + grit;
+          if (wx % 72 === 0 || wy % 72 === 0) {
+            r -= 4;
+            g -= 4;
+            b -= 5;
+          }
+          const borderDist = Math.min(Math.abs(distToLeft - 52), Math.abs(distToRight - 52));
+          if (borderDist <= 2) {
+            r += 14;
+            g += 11;
+            b += 4;
           }
         } else if (modeId === "blackout") {
-          // 琥珀金双八角地下核反应堆地板
-          r = 22;
-          g = 17;
-          b = 11;
-          const distCore1 = Math.hypot(wx - CORRIDOR_CX, wy - 2130);
-          const distCore2 = Math.hypot(wx - CORRIDOR_CX, wy - 1050);
-          if (distCore1 < 380 || distCore2 < 380) {
-            r = 28;
-            g = 21;
-            b = 12;
+          // 地铁站深灰防滑花岗岩地砖 + 站台边缘明黄盲道警示砖条！
+          r = 23 + grit;
+          g = 25 + grit;
+          b = 30 + grit;
+          if (wx % 56 === 0 || wy % 56 === 0) {
+            r -= 4;
+            g -= 4;
+            b -= 4;
           }
-          // 中央矩形反应堆防爆屏蔽核内部斜纹区
-          const inIsland1 = wx >= 760 && wx <= 1040 && wy >= 2010 && wy <= 2250;
-          const inIsland2 = wx >= 760 && wx <= 1040 && wy >= 930 && wy <= 1170;
-          if (inIsland1 || inIsland2) {
-            const stripe = ((wx + wy) >> 4) & 1;
-            r = stripe ? 44 : 26;
-            g = stripe ? 34 : 20;
-            b = 14;
+          const nearTrackEdge =
+            wy >= 1450 &&
+            wy <= 2340 &&
+            (wy < 1830 || wy > 1990) &&
+            (Math.abs(wx - 696) <= 5 || Math.abs(wx - 1004) <= 5);
+          if (nearTrackEdge && (wy % 10 < 7)) {
+            r = 165;
+            g = 132;
+            b = 28;
           }
         } else if (modeId === "sonar") {
-          // 深海翡翠青 S 型声呐洞穴地板
-          r = 7;
-          g = 22;
-          b = 25;
-          const distCenter = Math.abs(wx - bnd.cx);
-          if (distCenter < 85) {
-            g += 6;
-            b += 7;
+          // 医院水磨石走廊 + 地面急诊红/外科青/影像黄三色科室导引地标线！
+          r = 22 + grit;
+          g = 29 + grit;
+          b = 33 + grit;
+          if (wx % 60 === 0 || wy % 60 === 0) {
+            r -= 4;
+            g -= 4;
+            b -= 4;
+          }
+          if (wy >= 1460 && wy <= 2580) {
+            const dGuide = wx - (CORRIDOR_CX - 36);
+            if (dGuide >= 0 && dGuide <= 3) {
+              r = 148;
+              g = 42;
+              b = 48;
+            } else if (dGuide >= 6 && dGuide <= 9) {
+              r = 42;
+              g = 138;
+              b = 132;
+            } else if (dGuide >= 12 && dGuide <= 15) {
+              r = 158;
+              g = 128;
+              b = 42;
+            }
           }
         } else if (modeId === "maze-infect") {
-          // 生化紫红三道死角监区地板（下层 A/B/C 三条平行监区走廊交替色调）
-          const inLowerLanes = wy >= 1640 && wy <= 2760;
-          const inSideLane = inLowerLanes && (wx < 690 || wx > 1110);
-          r = inSideLane ? 29 : 21;
-          g = inSideLane ? 11 : 10;
-          b = inSideLane ? 32 : 25;
+          // 国际航站楼抛光石英地砖
+          r = 26 + grit;
+          g = 27 + grit;
+          b = 34 + grit;
+          if (wx % 64 === 0 || wy % 64 === 0) {
+            r -= 4;
+            g -= 4;
+            b -= 5;
+          }
         }
 
-        // 北部丧尸母巢核心周围 (wy < 520) 暗红生物菌毯与脉络纹理
+        // 北部丧尸母巢周围生物菌毯腐蚀渐变
         const dxHive = wx - CORRIDOR_CX;
         const dyHive = wy - 230;
         const distToHive = Math.hypot(dxHive, dyHive);
@@ -997,42 +1878,12 @@ function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8Clamp
           b = Math.round(b + creep * 7 + veinBoost * 0.3);
         }
 
-        // 墙根内侧 24px 阶梯式环境光遮蔽与内嵌排水槽线
-        if (minEdgeDist < 24) {
-          const ao = (24 - minEdgeDist) / 24;
-          r = Math.round(r * (1 - ao * 0.48));
-          g = Math.round(g * (1 - ao * 0.48));
-          b = Math.round(b * (1 - ao * 0.48));
-          if (minEdgeDist >= 18 && minEdgeDist <= 20) {
-            r += modeId === "blackout" ? 24 : modeId === "maze-infect" ? 22 : 12;
-            g += modeId === "sonar" ? 24 : modeId === "scavenge" ? 20 : 14;
-            b += modeId === "scavenge" || modeId === "maze-infect" ? 28 : 16;
-          }
-        }
-
-        // 大世界 64px 主网格线 + 16px 副网格线（随镜头移动产生极强地面空间参照感）
-        if (wx % 64 === 0 || wy % 64 === 0) {
-          r += modeId === "blackout" ? 10 : modeId === "maze-infect" ? 10 : 6;
-          g += modeId === "sonar" ? 11 : modeId === "scavenge" ? 10 : 7;
-          b += modeId === "scavenge" ? 15 : modeId === "maze-infect" ? 12 : 8;
-        } else if (wx % 16 === 0 || wy % 16 === 0) {
-          r += 2;
-          g += 3;
-          b += 4;
-        }
-
-        // 顺着当前通道中心线 bnd.cx 延伸的双轨导流槽线
-        const distToTrack = Math.abs(Math.abs(wx - Math.round(bnd.cx)) - 76);
-        if (distToTrack <= 4 && minEdgeDist > 26) {
-          if (distToTrack === 4) {
-            r += modeId === "blackout" ? 18 : 10;
-            g += modeId === "sonar" ? 18 : 14;
-            b += modeId === "scavenge" ? 22 : 16;
-          } else if (wy % 12 < 6) {
-            r -= 3;
-            g -= 3;
-            b -= 4;
-          }
+        // 外墙根部自然踢脚线环境光遮蔽阴影
+        if (minEdgeDist < 22) {
+          const ao = (22 - minEdgeDist) / 22;
+          r = Math.round(r * (1 - ao * 0.52));
+          g = Math.round(g * (1 - ao * 0.52));
+          b = Math.round(b * (1 - ao * 0.52));
         }
 
         raw[idx] = clamp(r, 0, 255);
@@ -1040,7 +1891,7 @@ function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8Clamp
         raw[idx + 2] = clamp(b, 0, 255);
         raw[idx + 3] = 255;
       } else {
-        // 2. 各模式外侧多层装甲/岩壁墙体
+        // 2. 真实建筑厚重混凝土外立面幕墙与室外暗黑沥青路面（彻底移除霓虹斜纹警告带与科幻铆钉！）
         const wallDepth = isTopWall
           ? 40 - wy
           : isBottomWall
@@ -1049,206 +1900,167 @@ function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8Clamp
               ? -distToLeft
               : -distToRight;
 
-        if (wallDepth <= 2.5) {
-          raw[idx] = modeId === "blackout" ? 255 : modeId === "maze-infect" ? 235 : 95;
-          raw[idx + 1] = modeId === "sonar" ? 245 : modeId === "scavenge" ? 215 : modeId === "blackout" ? 195 : 95;
-          raw[idx + 2] = modeId === "scavenge" ? 255 : modeId === "maze-infect" ? 245 : modeId === "sonar" ? 215 : 85;
-          raw[idx + 3] = 255;
-        } else if (wallDepth <= 6.5) {
-          raw[idx] = 14;
-          raw[idx + 1] = 16;
-          raw[idx + 2] = 22;
-          raw[idx + 3] = 255;
-        } else if (wallDepth <= 19) {
-          const stripe = ((wx + wy) >> 4) & 1;
-          if (modeId === "blackout") {
-            raw[idx] = stripe === 0 ? 235 : 46;
-            raw[idx + 1] = stripe === 0 ? 172 : 34;
-            raw[idx + 2] = stripe === 0 ? 28 : 18;
-          } else if (modeId === "scavenge") {
-            raw[idx] = stripe === 0 ? 38 : 24;
-            raw[idx + 1] = stripe === 0 ? 128 : 54;
-            raw[idx + 2] = stripe === 0 ? 185 : 82;
-          } else if (modeId === "sonar") {
-            raw[idx] = stripe === 0 ? 22 : 14;
-            raw[idx + 1] = stripe === 0 ? 135 : 58;
-            raw[idx + 2] = stripe === 0 ? 122 : 54;
-          } else if (modeId === "maze-infect") {
-            raw[idx] = stripe === 0 ? 175 : 52;
-            raw[idx + 1] = stripe === 0 ? 42 : 20;
-            raw[idx + 2] = stripe === 0 ? 148 : 58;
-          } else {
-            raw[idx] = 52;
-            raw[idx + 1] = 64;
-            raw[idx + 2] = 84;
-          }
+        if (wallDepth <= 3.0) {
+          raw[idx] = 88;
+          raw[idx + 1] = 96;
+          raw[idx + 2] = 108;
           raw[idx + 3] = 255;
         } else if (wallDepth <= 22) {
-          raw[idx] = modeId === "blackout" ? 145 : modeId === "maze-infect" ? 135 : 68;
-          raw[idx + 1] = modeId === "sonar" ? 145 : modeId === "scavenge" ? 135 : 95;
-          raw[idx + 2] = modeId === "scavenge" ? 175 : modeId === "maze-infect" ? 145 : 95;
+          // 建筑外墙钢筋混凝土墙体 + 幕墙玻璃窗格凹槽
+          const isWindowBay = !isTopWall && !isBottomWall && (wy % 140 >= 28 && wy % 140 <= 108) && wallDepth >= 8 && wallDepth <= 15;
+          if (isWindowBay) {
+            raw[idx] = 24;
+            raw[idx + 1] = 36;
+            raw[idx + 2] = 48;
+          } else {
+            const concreteGrit = Math.round((hash2i(wx >> 1, wy >> 1) - 0.5) * 6);
+            raw[idx] = 40 + concreteGrit;
+            raw[idx + 1] = 45 + concreteGrit;
+            raw[idx + 2] = 54 + concreteGrit;
+          }
           raw[idx + 3] = 255;
         } else {
-          let wr = modeId === "blackout" ? 24 : modeId === "maze-infect" ? 24 : 12;
-          let wg = modeId === "sonar" ? 24 : modeId === "scavenge" ? 22 : 16;
-          let wb = modeId === "scavenge" ? 36 : modeId === "maze-infect" ? 30 : 22;
-
-          const ribY = wy % 64;
-          const ribX = wx % 64;
-          if (ribY === 0 || ribX === 0) {
-            wr += 18;
-            wg += 22;
-            wb += 26;
-          } else if (ribY < 8) {
-            wr += 7;
-            wg += 9;
-            wb += 12;
-          } else if (((wx + wy) % 32) === 0 || ((wx - wy + 4096) % 32) === 0) {
-            wr += 4;
-            wg += 5;
-            wb += 7;
-          }
-
-          raw[idx] = clamp(wr, 0, 255);
-          raw[idx + 1] = clamp(wg, 0, 255);
-          raw[idx + 2] = clamp(wb, 0, 255);
+          // 室外深暗街区地坪
+          const extGrid = (wx % 96 === 0 || wy % 96 === 0) ? 3 : 0;
+          raw[idx] = 10 + extGrid;
+          raw[idx + 1] = 12 + extGrid;
+          raw[idx + 2] = 17 + extGrid;
           raw[idx + 3] = 255;
         }
       }
     }
   }
 
-  // 3. 在 1800 x 3000 大地图上绘制各模式专属大型地面地标、房间门洞导引线与区域文字标识
-  if (modeId === "scavenge") {
-    const rooms = [
-      { x: 274, y: 2116, w: 400, h: 398, doorX: 680, doorY: 2315, title: "1号军火密室" },
-      { x: 1126, y: 1386, w: 400, h: 408, doorX: 1120, doorY: 1590, title: "2号基因密室" },
-      { x: 274, y: 726, w: 400, h: 388, doorX: 680, doorY: 925, title: "3号重装密室" },
-    ];
-    for (const rm of rooms) {
-      fb.strokeRoundRect(rm.x, rm.y, rm.w, rm.h, 6, 2.4, [55, 195, 245, 190]);
-      drawCornerBrackets(
-        fb,
-        rm.x + rm.w * 0.5,
-        rm.y + rm.h * 0.5,
-        rm.w * 0.42,
-        rm.h * 0.42,
-        22,
-        2.4,
-        [75, 220, 255, 200],
-      );
-      // 130px 门洞破拆发光阈值线
-      fb.drawLine(rm.doorX, rm.doorY - 62, rm.doorX, rm.doorY + 62, 3.6, [95, 245, 255, 230]);
-    }
-  } else if (modeId === "blackout") {
-    // 南区1号核反应堆 (900, 2130) 与 北区2号核反应堆 (900, 1050)
-    for (const [ry] of [
-      [2130, "1号核反应堆核心"],
-      [1050, "2号核反应堆核心"],
-    ] as const) {
-      for (const rad of [165, 255, 345]) {
-        drawPolygonLines(
-          fb,
-          CORRIDOR_CX,
-          ry,
-          rad,
-          8,
-          Math.PI / 8,
-          2.6,
-          [235, 165, 35, 170],
-          rad === 165,
-          [185, 120, 25, 130],
-        );
+  // 3. 绘制非对称商铺地面材质、地铁碎石道床双铁轨、跨轨过街天桥与自动扶梯天井
+  const archZones = getArchZones(modeId);
+  for (const z of archZones) {
+    if (z.kind === "shop") {
+      for (let py = Math.max(0, z.y); py < Math.min(WORLD_H, z.y + z.h); py++) {
+        for (let px = Math.max(0, z.x); px < Math.min(WORLD_W, z.x + z.w); px++) {
+          const idx = (py * WORLD_W + px) * 4;
+          const grit = Math.round((hash2i(px >> 2, py >> 2) - 0.5) * 5);
+          let fr = 26 + grit;
+          let fg = 30 + grit;
+          let fbCol = 38 + grit;
+          if (z.floorStyle === "wood") {
+            const seam = py % 16 === 0 || (px + ((py / 16) | 0) * 41) % 88 === 0 ? -7 : 0;
+            const grain = Math.round(Math.sin(py * 0.9 + hash2i(px >> 4, py >> 4) * 3) * 2);
+            fr = 48 + seam + grain + grit;
+            fg = 35 + seam + grain + grit;
+            fbCol = 25 + seam + grit;
+          } else if (z.floorStyle === "checker") {
+            const chk = (((px >> 4) + (py >> 4)) & 1) === 0;
+            fr = (chk ? 44 : 23) + grit;
+            fg = (chk ? 45 : 26) + grit;
+            fbCol = (chk ? 50 : 32) + grit;
+          } else if (z.floorStyle === "clinical") {
+            const seam = px % 36 === 0 || py % 36 === 0 ? -5 : 0;
+            fr = 30 + seam + grit;
+            fg = 41 + seam + grit;
+            fbCol = 47 + seam + grit;
+          } else if (z.floorStyle === "tile_warm") {
+            const seam = px % 44 === 0 || py % 44 === 0 ? -5 : 0;
+            fr = 39 + seam + grit;
+            fg = 37 + seam + grit;
+            fbCol = 34 + seam + grit;
+          } else if (z.floorStyle === "carpet") {
+            const pat = ((px % 24 < 3) && (py % 24 < 3)) ? 6 : ((px + py) % 6 === 0 ? 2 : 0);
+            fr = 40 + pat + grit;
+            fg = 20 + (pat >> 1) + grit;
+            fbCol = 29 + pat + grit;
+          } else {
+            const seam = px % 48 === 0 || py % 48 === 0 ? -4 : 0;
+            fr = 28 + seam + grit;
+            fg = 33 + seam + grit;
+            fbCol = 41 + seam + grit;
+          }
+          raw[idx] = clamp(fr, 0, 255);
+          raw[idx + 1] = clamp(fg, 0, 255);
+          raw[idx + 2] = clamp(fbCol, 0, 255);
+        }
       }
-    }
-    // 4座工业旋转探照灯塔基座
-    for (const [tx, ty] of [
-      [520, 2130],
-      [1280, 2130],
-      [520, 1050],
-      [1280, 1050],
-    ]) {
-      fb.blendCircle(tx, ty, 38, [65, 45, 18, 215]);
-      drawPolygonLines(fb, tx, ty, 36, 8, Math.PI / 8, 2.4, [255, 195, 45, 225], true);
-    }
-  } else if (modeId === "sonar") {
-    // 3处大跨度S弯声呐雷达环与荧光导航轨迹线
-    for (const [scx, scy] of [
-      [560, 2220, "西1号声呐弯道"],
-      [1240, 1550, "东2号回声盲区"],
-      [560, 880, "西3号深渊弯道"],
-    ] as const) {
-      for (const rad of [85, 165, 245]) {
-        fb.strokeRing(scx, scy, rad, 1.8, [38, 195, 175, 140]);
+    } else if (z.kind === "atrium_pit") {
+      fb.fillRoundRect(z.x, z.y, z.w, z.h, 6, [9, 12, 18, 255]);
+      fb.strokeRoundRect(z.x + 4, z.y + 4, z.w - 8, z.h - 8, 5, 2.0, [58, 72, 90, 230]);
+      if (modeId === "blackout" && z.h >= 240) {
+        // 地铁下沉碎石道床 + 枕木 + 双股并行工字钢铁轨！
+        for (const trackCx of [z.x + z.w * 0.33, z.x + z.w * 0.67]) {
+          for (let ty = z.y + 12; ty < z.y + z.h - 10; ty += 14) {
+            fb.fillRect(trackCx - 24, ty, 48, 5, [46, 36, 28, 245]);
+          }
+          fb.drawLine(trackCx - 15, z.y + 6, trackCx - 15, z.y + z.h - 6, 2.4, [138, 150, 166, 240]);
+          fb.drawLine(trackCx + 15, z.y + 6, trackCx + 15, z.y + z.h - 6, 2.4, [138, 150, 166, 240]);
+        }
+      } else if (z.h >= 135) {
+        // 商场/医院/航站楼双并排跨层自动扶梯金属踏步与玻璃扶手
+        for (const escOff of [-34, 34]) {
+          const ex = z.x + z.w * 0.5 + escOff;
+          fb.fillRoundRect(ex - 17, z.y + 16, 34, z.h - 32, 3, [22, 28, 38, 255]);
+          fb.strokeRoundRect(ex - 17, z.y + 16, 34, z.h - 32, 3, 2.0, [96, 124, 152, 235]);
+          for (let sy = z.y + 22; sy < z.y + z.h - 20; sy += 8) {
+            fb.drawLine(ex - 14, sy, ex + 14, sy, 1.2, [58, 72, 92, 220]);
+          }
+        }
       }
-      fb.drawLine(scx - 250, scy, scx + 250, scy, 1.4, [38, 195, 175, 115]);
-      fb.drawLine(scx, scy - 250, scx, scy + 250, 1.4, [38, 195, 175, 115]);
-    }
-    let prevX = getCorridorBounds(320, "sonar").cx;
-    let prevY = 320;
-    for (let y = 380; y <= 2780; y += 50) {
-      const nx = getCorridorBounds(y, "sonar").cx;
-      const ny = y;
-      fb.drawLine(prevX, prevY, nx, ny, 2.8, [55, 235, 205, 170]);
-      fb.fillCircle(nx, ny, 3.8, [95, 255, 225, 200]);
-      prevX = nx;
-      prevY = ny;
-    }
-  } else if (modeId === "maze-infect") {
-    // 下层 A/B/C 三条平行监区导轨 (x = 485, 900, 1315, y = 1640..2760)
-    for (const [laneX] of [
-      [485, "A监区 · 西通道"],
-      [900, "B监区 · 中通道"],
-      [1315, "C监区 · 东通道"],
-    ] as const) {
-      fb.drawLine(laneX, 1640, laneX, 2760, 2.6, [215, 65, 185, 160]);
-      for (let ly = 1720; ly <= 2680; ly += 140) {
-        fb.drawLine(laneX - 28, ly + 16, laneX, ly, 2.4, [235, 85, 195, 190]);
-        fb.drawLine(laneX + 28, ly + 16, laneX, ly, 2.4, [235, 85, 195, 190]);
-        drawCornerBrackets(fb, laneX, ly + 32, 76, 36, 12, 1.8, [185, 55, 165, 145]);
+    } else if (z.kind === "bridge_deck") {
+      // 地铁跨轨行人过街天桥防滑钢板桥面与南北护栏
+      fb.blendRoundRect(z.x - 4, z.y + 6, z.w + 8, z.h + 8, 4, [2, 4, 8, 210]);
+      fb.fillRoundRect(z.x, z.y, z.w, z.h, 3, [42, 48, 58, 255]);
+      for (let bx = z.x + 16; bx < z.x + z.w - 12; bx += 24) {
+        fb.drawLine(bx, z.y + 6, bx, z.y + z.h - 6, 1.3, [58, 66, 78, 215]);
       }
+      fb.drawLine(z.x, z.y + 3, z.x + z.w, z.y + 3, 3.2, [135, 148, 165, 245]);
+      fb.drawLine(z.x, z.y + z.h - 3, z.x + z.w, z.y + z.h - 3, 3.2, [135, 148, 165, 245]);
+    } else if (z.kind === "pillar") {
+      fb.blendRoundRect(z.x + 4, z.y + 6, z.w + 4, z.h + 4, 3, [3, 5, 10, 195]);
+      fb.fillRoundRect(z.x, z.y, z.w, z.h, 3, [48, 55, 66, 255]);
+      fb.strokeRoundRect(z.x, z.y, z.w, z.h, 3, 1.6, [118, 132, 148, 235]);
     }
   }
 
-  // 在外墙折线段上绘制高细节矢量装甲边线
-  const wallLineCol: RGBA =
-    modeId === "blackout"
-      ? [255, 205, 75, 240]
-      : modeId === "sonar"
-        ? [75, 245, 215, 240]
-        : modeId === "maze-infect"
-          ? [245, 95, 215, 240]
-          : [135, 220, 255, 240];
+  // 4. 在地板上绘制末日真实生活杂物微细节（散落传单纸张、碎玻璃渣、干涸血迹拖痕）
+  const modeSeed = modeId.charCodeAt(0) * 31 + modeId.charCodeAt(1) * 17;
+  for (let i = 0; i < 155; i++) {
+    const ry = 280 + Math.floor(hash2i(i, modeSeed) * 2480);
+    const bnd = getCorridorBounds(ry, modeId);
+    const rx = Math.floor(bnd.left + 36 + hash2i(i + 97, modeSeed) * (bnd.right - bnd.left - 72));
+    const kindRoll = i % 5;
+    if (kindRoll <= 2) {
+      // 散落白纸/宣传单
+      fb.fillRect(rx, ry, 6, 4, [155, 162, 172, 125]);
+    } else if (kindRoll === 3) {
+      // 橱窗碎裂玻璃反光碴
+      fb.drawLine(rx, ry, rx + 5, ry + 3, 1.3, [165, 215, 240, 135]);
+      fb.drawLine(rx + 4, ry - 2, rx + 8, ry + 2, 1.1, [185, 230, 250, 120]);
+    } else {
+      // 地面陈旧暗褐血渍拖痕
+      fb.blendCircle(rx, ry, 9, [68, 16, 22, 85]);
+      fb.drawLine(rx, ry, rx + 14, ry - 8, 3.2, [58, 14, 20, 75]);
+    }
+  }
+
+  // 5. 室内家具改为在帧循环中实时动态渲染 (renderDynamicInteriorProps)，以支持受击震颤、裂纹与彻底崩碎残骸！
+
+  // 6. 为所有室内隔墙预先烘焙地面环境光遮蔽阴影，并在每处门洞绘制推开的门扇与开门弧线
+  const innerWalls = getDeadCornerWalls(modeId);
+  for (const w of innerWalls) {
+    const minX = Math.min(w.x1, w.x2) - 8;
+    const maxX = Math.max(w.x1, w.x2) + 8;
+    const minY = Math.min(w.y1, w.y2) - 8;
+    const maxY = Math.max(w.y1, w.y2) + 8;
+    fb.blendRoundRect(minX + 6, minY + 8, maxX - minX + 4, maxY - minY + 4, 3, [3, 5, 9, 135]);
+  }
+  const doorways = getDoorways(modeId);
+  for (const dw of doorways) {
+    renderDoorwayIntoWorld(fb, dw);
+  }
+
+  // 7. 外墙沉稳建筑结构轮廓线（取代刺眼的霓虹框线）
   for (const seg of outerSegments) {
-    fb.drawLine(seg.x1, seg.y1, seg.x2, seg.y2, 2.8, wallLineCol);
+    fb.drawLine(seg.x1, seg.y1, seg.x2, seg.y2, 2.2, [96, 108, 124, 220]);
   }
 
-  // 沿纵向外墙每隔 110px 绘制外凸机械装甲铆钉柱 (Buttress Pillars)
-  for (let wy = 120; wy <= 2820; wy += 110) {
-    const bnd = getCorridorBounds(wy, modeId);
-    for (const wx of [bnd.left - 10, bnd.right + 10]) {
-      fb.blendRoundRect(wx - 7, wy - 12, 14, 24, 3, [48, 58, 78, 245]);
-      fb.strokeRoundRect(wx - 7, wy - 12, 14, 24, 3, 1.5, wallLineCol);
-      fb.fillCircle(wx, wy - 6, 2.0, [225, 235, 250, 240]);
-      fb.fillCircle(wx, wy + 6, 2.0, [225, 235, 250, 240]);
-    }
-  }
-
-  // 地面横向战术防线分界线 + 向上推进 V 型导向箭头
-  for (let lineY = 520; lineY <= 2620; lineY += 300) {
-    const bnd = getCorridorBounds(lineY, modeId);
-    const halfW = bnd.halfW - 30;
-    for (let dx = -halfW; dx <= halfW - 18; dx += 32) {
-      fb.drawLine(bnd.cx + dx, lineY, bnd.cx + dx + 16, lineY, 1.6, [62, 78, 104, 175]);
-    }
-    const cx = bnd.cx;
-    for (const dy of [0, 12]) {
-      fb.drawLine(cx - 20, lineY + dy + 9, cx, lineY + dy, 2.2, wallLineCol);
-      fb.drawLine(cx + 20, lineY + dy + 9, cx, lineY + dy, 2.2, wallLineCol);
-    }
-  }
-
-  // 北部母巢核心 (900, 230) 下方 3 个尸潮孵化喷口与生物主血管线
+  // 8. 北部母巢核心 (900, 230) 下方生物主血管与孵化腔
   const hiveWorldX = CORRIDOR_CX;
   const hiveWorldY = 230;
   for (const offset of [-145, 0, 145]) {
@@ -1256,7 +2068,6 @@ function buildWorldBackground(modeId: SiegeModeId, atlas: FontAtlas): Uint8Clamp
     const vy = 320;
     fb.drawLine(hiveWorldX + offset * 0.25, hiveWorldY + 38, vx, vy, 5.2, [85, 14, 30, 195]);
     fb.drawLine(hiveWorldX + offset * 0.25, hiveWorldY + 38, vx, vy, 2.2, [175, 28, 54, 215]);
-
     fb.blendCircle(vx, vy, 24, [42, 8, 18, 225]);
     drawPolygonLines(fb, vx, vy, 23, 6, Math.PI / 6, 2.0, [165, 32, 56, 220], true, [95, 18, 34, 160]);
     fb.fillCircle(vx, vy, 9, [210, 38, 62, 215]);
@@ -1307,8 +2118,28 @@ function bakeDecalsIntoBackground(worldBgRaw: Uint8ClampedArray, sim: SiegeSimul
     } else if (d.kind === "crystals") {
       fb.blendCircle(cx, cy, d.r, [32, 75, 98, 125]);
       drawPolygonLines(fb, cx, cy, d.r * 0.9, 6, 0.3, 2.0, [95, 225, 255, 155], true);
-    } else if (d.kind === "rubble") {
-      fb.blendCircle(cx, cy, d.r * 0.7, [36, 42, 54, 150]);
+    } else if (d.kind === "scorch") {
+      // 机载破片火箭弹与重火力爆炸焦黑弹坑 + 放射状烟尘裂纹
+      fb.blendCircle(cx, cy, d.r * 1.15, [10, 8, 12, 165]);
+      fb.blendCircle(cx, cy, d.r * 0.62, [28, 16, 12, 185]);
+      fb.strokeRing(cx, cy, d.r * 0.72, 1.5, [165, 78, 28, 115]);
+      for (let s = 0; s < 7; s++) {
+        const ang = (s * Math.PI * 2) / 7 + (d.seed % 5) * 0.19;
+        fb.drawLine(
+          cx + Math.cos(ang) * (d.r * 0.35),
+          cy + Math.sin(ang) * (d.r * 0.35),
+          cx + Math.cos(ang) * (d.r * 1.48),
+          cy + Math.sin(ang) * (d.r * 1.48),
+          1.8,
+          [18, 14, 18, 145],
+        );
+      }
+    } else if (d.kind === "tire") {
+      // 重型装甲大巴加宽双排轮胎橡胶压痕
+      for (const txOff of [-26, 26]) {
+        fb.blendRoundRect(cx + txOff - 4, cy - 10, 8, 20, 2, [5, 7, 11, 145]);
+        fb.drawLine(cx + txOff - 3, cy - 4, cx + txOff + 3, cy + 3, 1.4, [28, 36, 48, 125]);
+      }
     }
   }
 
@@ -1317,22 +2148,83 @@ function bakeDecalsIntoBackground(worldBgRaw: Uint8ClampedArray, sim: SiegeSimul
 }
 
 /**
- * 将 1800x3000 大世界底图中当前 2D 镜头视野 (camX, camY, ARENA_W, ARENA_H) 高速拷贝至帧缓冲
+ * 将 1800x3000 大世界底图按任意平滑变焦倍率 (zoom = 1.0..2.15) 双线性插值高速投射至 984x1520 帧缓冲
  */
 function blitWorldToViewport(
   fb: FrameBuf,
   worldBgRaw: Uint8ClampedArray,
   camX: number,
   camY: number,
+  zoom: number,
 ): void {
-  const cx = clamp(Math.round(camX), 0, WORLD_W - ARENA_W);
-  const cy = clamp(Math.round(camY), 0, WORLD_H - ARENA_H);
   const dst = fb.data;
-  const rowBytes = ARENA_W * 4;
+  if (Math.abs(zoom - 1.0) < 0.002) {
+    const cx = clamp(Math.round(camX), 0, WORLD_W - ARENA_W);
+    const cy = clamp(Math.round(camY), 0, WORLD_H - ARENA_H);
+    const rowBytes = ARENA_W * 4;
+    for (let ay = 0; ay < ARENA_H; ay++) {
+      const srcStart = ((cy + ay) * WORLD_W + cx) * 4;
+      const dstStart = ((BOARD_Y + ay) * OUT_W + BOARD_X) * 4;
+      dst.set(worldBgRaw.subarray(srcStart, srcStart + rowBytes), dstStart);
+    }
+    return;
+  }
+
+  const invZ = 1 / zoom;
+  const x0Arr = new Int32Array(ARENA_W);
+  const x1Arr = new Int32Array(ARENA_W);
+  const fxArr = new Int32Array(ARENA_W);
+  for (let ax = 0; ax < ARENA_W; ax++) {
+    const wx = clamp(camX + ax * invZ, 0, WORLD_W - 1.001);
+    const ix = wx | 0;
+    x0Arr[ax] = ix * 4;
+    x1Arr[ax] = Math.min(WORLD_W - 1, ix + 1) * 4;
+    fxArr[ax] = ((wx - ix) * 256) | 0;
+  }
+
+  const rowStride = WORLD_W * 4;
   for (let ay = 0; ay < ARENA_H; ay++) {
-    const srcStart = ((cy + ay) * WORLD_W + cx) * 4;
-    const dstStart = ((BOARD_Y + ay) * OUT_W + BOARD_X) * 4;
-    dst.set(worldBgRaw.subarray(srcStart, srcStart + rowBytes), dstStart);
+    const wy = clamp(camY + ay * invZ, 0, WORLD_H - 1.001);
+    const iy = wy | 0;
+    const fy = ((wy - iy) * 256) | 0;
+    const invFy = 256 - fy;
+    const row0 = iy * rowStride;
+    const row1 = Math.min(WORLD_H - 1, iy + 1) * rowStride;
+    let dIdx = ((BOARD_Y + ay) * OUT_W + BOARD_X) * 4;
+
+    for (let ax = 0; ax < ARENA_W; ax++) {
+      const fx = fxArr[ax];
+      const invFx = 256 - fx;
+      const w00 = invFx * invFy;
+      const w10 = fx * invFy;
+      const w01 = invFx * fy;
+      const w11 = fx * fy;
+      const i00 = row0 + x0Arr[ax];
+      const i10 = row0 + x1Arr[ax];
+      const i01 = row1 + x0Arr[ax];
+      const i11 = row1 + x1Arr[ax];
+
+      dst[dIdx] =
+        (worldBgRaw[i00] * w00 +
+          worldBgRaw[i10] * w10 +
+          worldBgRaw[i01] * w01 +
+          worldBgRaw[i11] * w11) >>
+        16;
+      dst[dIdx + 1] =
+        (worldBgRaw[i00 + 1] * w00 +
+          worldBgRaw[i10 + 1] * w10 +
+          worldBgRaw[i01 + 1] * w01 +
+          worldBgRaw[i11 + 1] * w11) >>
+        16;
+      dst[dIdx + 2] =
+        (worldBgRaw[i00 + 2] * w00 +
+          worldBgRaw[i10 + 2] * w10 +
+          worldBgRaw[i01 + 2] * w01 +
+          worldBgRaw[i11 + 2] * w11) >>
+        16;
+      dst[dIdx + 3] = 255;
+      dIdx += 4;
+    }
   }
 }
 
@@ -1387,19 +2279,55 @@ function loadExternalBgmSamples(bgmPath: string, durationSec: number, sr = 44100
 }
 
 /**
- * 爆款攻防短视频三幕式情绪 BGM (132 BPM D-Minor Drift Phonk / Dark Synth)
- * + 解压 ASMR 级战斗音效叠层 (清脆抛壳枪声 / 丧尸爆浆气泡音 / 破笼多巴胺琶音 / 母巢核爆)
- * + 自动侧链闪避 (Sidechain Ducking)
+ * 写入 44.1kHz 16-bit 双声道立体声 WAV 文件 (True Stereo Spatial PCM)
  */
-function buildSiegeAudioTrack(
+function writeStereoWav(left: Float32Array, right: Float32Array, path: string): void {
+  const sr = 44100;
+  const n = Math.min(left.length, right.length);
+  const dataBytes = n * 4;
+  const buf = Buffer.alloc(44 + dataBytes);
+  buf.write("RIFF", 0);
+  buf.writeUInt32LE(36 + dataBytes, 4);
+  buf.write("WAVE", 8);
+  buf.write("fmt ", 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); // PCM
+  buf.writeUInt16LE(2, 22); // 2 channels (Stereo)
+  buf.writeUInt32LE(sr, 24);
+  buf.writeUInt32LE(sr * 4, 28);
+  buf.writeUInt16LE(4, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write("data", 36);
+  buf.writeUInt32LE(dataBytes, 40);
+  for (let i = 0; i < n; i++) {
+    const l = Math.max(-32768, Math.min(32767, Math.round(left[i] * 32767)));
+    const r = Math.max(-32768, Math.min(32767, Math.round(right[i] * 32767)));
+    const off = 44 + i * 4;
+    buf.writeInt16LE(l, off);
+    buf.writeInt16LE(r, off + 2);
+  }
+  writeFileSync(path, buf);
+}
+
+/**
+ * 工业级双声道空间混音母带引擎：
+ * - 132 BPM D-Minor Drift Phonk 三幕式电子乐（808 Sub-Bass 居中锚定 + Cowbell/Pad 立体声展开）
+ * - 开场载具专属物理声场（黑鹰四叶旋翼拍击涡流声 / 重装柴油 V8 轰鸣 + 气动刹车泄压声）
+ * - 基于战场 X 坐标等功率声像定位 (Equal-Power Stereo Panning) 的抛壳枪声、机载火箭呼啸爆炸、丧尸爆浆 ASMR
+ * - 自动侧链闪避 (Sidechain Ducking) + 软削波母带限制器
+ */
+function buildSiegeStereoAudioTrack(
   events: SiegeAudioEvent[],
   durationSec: number,
+  modeId: SiegeModeId,
   externalBgm?: Float32Array,
-): Float32Array {
+): { left: Float32Array; right: Float32Array } {
   const sr = 44100;
   const totalSamples = Math.ceil(durationSec * sr);
-  const bgmSamples = new Float32Array(totalSamples);
-  const sfxSamples = new Float32Array(totalSamples);
+  const bgmL = new Float32Array(totalSamples);
+  const bgmR = new Float32Array(totalSamples);
+  const sfxL = new Float32Array(totalSamples);
+  const sfxR = new Float32Array(totalSamples);
   const duckEnv = new Float32Array(totalSamples);
   duckEnv.fill(1.0);
 
@@ -1411,12 +2339,12 @@ function buildSiegeAudioTrack(
 
   // 1. 解析三幕剧情转折时间点（自动对齐破笼/倍增/反推/母巢崩塌时刻）
   const adrenalineTimes = events.filter(e => e.kind === "adrenaline").map(e => e.timeSec);
-  const act2StartSec = adrenalineTimes[0] ?? 9.2;
-  const act3StartSec = adrenalineTimes[2] ?? Math.min(durationSec * 0.58, 21.2);
+  const act2StartSec = adrenalineTimes[0] ?? 9.5;
+  const act3StartSec = adrenalineTimes[2] ?? Math.min(durationSec * 0.62, 22.8);
   const hiveBlastEv = events.find(e => e.kind === "hive-blast");
-  const hiveBlastSec = hiveBlastEv ? hiveBlastEv.timeSec : durationSec - 1.25;
+  const hiveBlastSec = hiveBlastEv ? hiveBlastEv.timeSec : durationSec + 10;
 
-  // 2. 构建侧链闪避包络 (Sidechain Ducking)：破笼/倍增/Boss击杀/母巢爆炸/减员警报时自动压低 BGM 45%~62%
+  // 2. 构建侧链闪避包络 (Sidechain Ducking)
   const applyDuck = (timeSec: number, dip: number, holdSec: number, releaseSec: number) => {
     const sIdx = Math.max(0, Math.floor(timeSec * sr));
     const holdSamples = Math.floor(holdSec * sr);
@@ -1440,28 +2368,73 @@ function buildSiegeAudioTrack(
   for (const ev of events) {
     if (ev.kind === "adrenaline") {
       applyDuck(ev.timeSec, 0.44, 0.14, 0.34);
-    } else if (ev.kind === "boss-kill") {
-      applyDuck(ev.timeSec, 0.42, 0.18, 0.42);
+    } else if (ev.kind === "boss-kill" || ev.kind === "rocket-blast") {
+      applyDuck(ev.timeSec, 0.46, 0.15, 0.36);
     } else if (ev.kind === "breach" || ev.kind === "boss-spawn") {
       applyDuck(ev.timeSec, 0.52, 0.12, 0.28);
+    } else if (ev.kind === "infect-bite") {
+      applyDuck(ev.timeSec, 0.42, 0.16, 0.36);
     } else if (ev.kind === "hive-blast") {
-      applyDuck(ev.timeSec, 0.32, 0.35, 0.65);
+      applyDuck(ev.timeSec, 0.30, 0.35, 0.65);
     }
   }
 
-  // 3. 合成或载入三幕式 BGM (132 BPM, D Minor: D - Bb - C - A)
+  // 2.5 开场载具连续物理声场层 (t = 0.0s .. 5.8s)
+  const isHeliMode = modeId === "blackout" || modeId === "sonar";
+  const vehEndSample = Math.min(totalSamples, Math.floor(5.9 * sr));
+  let rotorNoiseLp = 0;
+  for (let i = 0; i < vehEndSample; i++) {
+    const t = i / sr;
+    if (isHeliMode) {
+      // 黑鹰四叶主旋翼 18Hz 涡流拍击声 + 涡轴发动机高频哨音（悬停索降后向左侧盘旋淡出）
+      const env = t < 0.25 ? t / 0.25 : t < 4.35 ? 1.0 : Math.max(0, 1 - (t - 4.35) / 1.45);
+      const bladeMod = Math.pow(0.5 + 0.5 * Math.sin(2 * Math.PI * 18.2 * t), 2.6);
+      rotorNoiseLp += 0.065 * (rand() - rotorNoiseLp);
+      const thump = Math.sin(2 * Math.PI * 54 * t) * bladeMod * 0.45;
+      const turbine = Math.sin(2 * Math.PI * (1320 + Math.sin(t * 2.5) * 40) * t) * 0.032;
+      const heliSig = (rotorNoiseLp * bladeMod * 2.2 + thump + turbine) * env * 0.34;
+      const pan = t < 4.35 ? Math.sin(t * 3.6) * 0.25 : clamp(-(t - 4.35) * 0.55, -0.8, 0);
+      const ang = ((pan + 1) * Math.PI) * 0.25;
+      sfxL[i] += heliSig * Math.cos(ang);
+      sfxR[i] += heliSig * Math.sin(ang);
+    } else {
+      // 重装柴油大巴 V8 低吼引擎声 (0~3.2s 推进，4.95~6.6s 倒车撤离)
+      let rpmEnv = 0;
+      let rpmFreq = 56;
+      if (t < 3.2) {
+        rpmEnv = t < 0.2 ? t / 0.2 : 1.0 - (t / 3.2) * 0.25;
+        rpmFreq = 54 + (1 - t / 3.2) * 26;
+      } else if (t >= 4.95 && t < 6.6) {
+        rpmEnv = Math.sin(((t - 4.95) / 1.65) * Math.PI) * 0.55;
+        rpmFreq = 52 + (t - 4.95) * 14;
+      }
+      if (rpmEnv > 0.01) {
+        const rumble =
+          Math.tanh(
+            Math.sin(2 * Math.PI * rpmFreq * t) * 1.4 +
+              Math.sin(2 * Math.PI * rpmFreq * 2.0 * t) * 0.65 +
+              Math.sin(2 * Math.PI * rpmFreq * 0.5 * t) * 0.5,
+          ) *
+          rpmEnv *
+          0.16;
+        sfxL[i] += rumble * 0.95;
+        sfxR[i] += rumble * 0.95;
+      }
+    }
+  }
+
+  // 3. 合成或载入三幕式立体声 BGM (132 BPM, D Minor: D - Bb - C - A)
   if (externalBgm && externalBgm.length > 0) {
     const copyLen = Math.min(totalSamples, externalBgm.length);
     for (let i = 0; i < copyLen; i++) {
-      bgmSamples[i] = externalBgm[i] * 0.68;
+      bgmL[i] = externalBgm[i] * 0.68;
+      bgmR[i] = externalBgm[i] * 0.68;
     }
   } else {
     const bpm = 132;
-    const beatSec = 60 / bpm; // 0.454545s
-    const step16Sec = beatSec / 4; // 0.113636s
-    // D 小调经典暗黑史诗走向: D2 -> Bb1 -> C2 -> A1
+    const beatSec = 60 / bpm;
+    const step16Sec = beatSec / 4;
     const bassRoots = [73.42, 58.27, 65.41, 55.0];
-    // Drift Phonk 808 Cowbell 战神逆袭卡点旋律 (16分音符步进, 0表示休止)
     const phonkMelodyAct2 = [
       587.33, 0, 587.33, 698.46, 880.0, 0, 783.99, 698.46, 659.25, 0, 698.46, 0, 587.33, 0,
       523.25, 440.0,
@@ -1476,13 +2449,11 @@ function buildSiegeAudioTrack(
       const t = i / sr;
       const beatFloat = t / beatSec;
       const beatIdx = Math.floor(beatFloat);
-      const beatPhase = beatFloat - beatIdx;
-      const beatTime = beatPhase * beatSec;
+      const beatTime = (beatFloat - beatIdx) * beatSec;
 
       const step16Float = t / step16Sec;
       const step16Idx = Math.floor(step16Float);
-      const step16Phase = step16Float - step16Idx;
-      const step16Time = step16Phase * step16Sec;
+      const step16Time = (step16Float - step16Idx) * step16Sec;
 
       const barIdx = Math.floor(beatIdx / 4);
       const chordRoot = bassRoots[barIdx % 4];
@@ -1493,10 +2464,10 @@ function buildSiegeAudioTrack(
       const isAct3 = t >= act3StartSec && t < hiveBlastSec;
       const isVictory = t >= hiveBlastSec;
 
-      let sample = 0;
+      let centerMono = 0;
+      let sideStereo = 0;
 
       if (!isVictory) {
-        // (a) 808 重型底鼓 (Four-on-the-floor Kick + Act1 绝境双心跳)
         const isKickBeat =
           isAct1 ? stepInBar % 4 === 0 || stepInBar === 11 || stepInBar === 14 : stepInBar % 4 === 0;
         if (isKickBeat && step16Time < 0.18) {
@@ -1504,10 +2475,9 @@ function buildSiegeAudioTrack(
           const kFreq = 46 + 108 * Math.exp(-kt * 44);
           const kEnv = Math.exp(-kt * 16.5);
           const kClick = Math.sin(2 * Math.PI * 1650 * kt) * Math.exp(-kt * 190) * 0.22;
-          sample += (Math.tanh(Math.sin(2 * Math.PI * kFreq * kt) * 1.45) * kEnv + kClick) * 0.34;
+          centerMono += (Math.tanh(Math.sin(2 * Math.PI * kFreq * kt) * 1.45) * kEnv + kClick) * 0.34;
         }
 
-        // (b) 暗黑 Reese / 808 Sub Bass（带底鼓四分音符自动侧链抽吸感 Pumping）
         const pumpEnv = 0.22 + 0.78 * (1 - Math.exp(-beatTime * 8.5));
         const saw1 = ((t * chordRoot) % 1) * 2 - 1;
         const saw2 = ((t * chordRoot * 1.006) % 1) * 2 - 1;
@@ -1515,80 +2485,78 @@ function buildSiegeAudioTrack(
         const rawBass = subSine * 0.65 + (saw1 + saw2) * (isAct1 ? 0.16 : 0.26);
         const cutoff = isAct1 ? 0.035 : isAct2 ? 0.065 : 0.095;
         bassLp += cutoff * (rawBass - bassLp);
-        sample += Math.tanh(bassLp * 1.6) * pumpEnv * (isAct1 ? 0.24 : 0.28);
+        centerMono += Math.tanh(bassLp * 1.6) * pumpEnv * (isAct1 ? 0.24 : 0.28);
 
-        // (c) Act 1 专属：高频呼吸急促感与心跳压迫低频脉冲
         if (isAct1) {
-          // 反拍暗黑闭镲
           if (stepInBar % 4 === 2 && step16Time < 0.045) {
-            sample += rand() * Math.exp(-step16Time * 95) * 0.08;
+            sideStereo += rand() * Math.exp(-step16Time * 95) * 0.08;
           }
-          // 危急声呐暗音 (每两拍尾部微弱脉冲)
           if (stepInBar === 6 || stepInBar === 14) {
             const pEnv = Math.exp(-step16Time * 24);
-            sample += Math.sin(2 * Math.PI * 440 * step16Time) * pEnv * 0.055;
+            sideStereo += Math.sin(2 * Math.PI * 440 * step16Time) * pEnv * 0.055;
           }
         }
 
-        // (d) Act 2 & Act 3：808 Drift Phonk 牛铃主旋律 (Cowbell Lead Hook) + Trap 军鼓与滚镲
         if (isAct2 || isAct3) {
           const melTable = isAct3 ? phonkMelodyAct3 : phonkMelodyAct2;
           const noteFreq = melTable[stepInBar];
           if (noteFreq > 0 && step16Time < 0.11) {
-            // TR-808 经典双频失谐方波/正弦波复合谐振 (1 : 1.481 比例模拟金属牛铃卡点音色)
             const nt = step16Time;
             const cEnv = Math.min(1, nt / 0.0025) * Math.exp(-nt * (isAct3 ? 19 : 23));
             const osc1 = Math.sin(2 * Math.PI * noteFreq * nt);
             const osc2 = Math.sin(2 * Math.PI * noteFreq * 1.481 * nt) * 0.38;
             const subOct = isAct3 ? Math.sin(2 * Math.PI * (noteFreq * 0.5) * nt) * 0.35 : 0;
-            const cowbell = Math.tanh((osc1 + osc2 + subOct) * 1.85) * cEnv;
-            sample += cowbell * (isAct3 ? 0.17 : 0.14);
+            const cowbell = Math.tanh((osc1 + osc2 + subOct) * 1.85) * cEnv * (isAct3 ? 0.17 : 0.14);
+            centerMono += cowbell * 0.85;
+            sideStereo += cowbell * (stepInBar % 2 === 0 ? 0.32 : -0.32);
           }
 
-          // 二四拍清脆 Phonk 军鼓 / 拍手 (Snare + Clap)
           if ((stepInBar === 4 || stepInBar === 12) && step16Time < 0.12) {
             const st = step16Time;
             const sBody = Math.sin(2 * Math.PI * (195 - st * 420) * st) * Math.exp(-st * 32);
             const sNoise = rand() * Math.exp(-st * 26);
-            sample += (sBody * 0.45 + sNoise * 0.55) * 0.21;
+            centerMono += (sBody * 0.45 + sNoise * 0.55) * 0.21;
           }
 
-          // 16分音符 Trap 金属闭合踩镲 (带三连音滚镲细节)
           const hatDur = stepInBar === 7 || stepInBar === 15 ? 0.055 : 0.032;
           if (step16Time < hatDur) {
             const hAccent = stepInBar % 2 === 0 ? 0.09 : 0.055;
             const metallic =
               (rand() * 0.7 + Math.sin(2 * Math.PI * 6850 * step16Time) * 0.3) *
-              Math.exp(-step16Time * 115);
-            sample += metallic * hAccent;
+              Math.exp(-step16Time * 115) *
+              hAccent;
+            centerMono += metallic * 0.7;
+            sideStereo += metallic * (stepInBar % 4 < 2 ? 0.45 : -0.45);
           }
         }
 
-        // (e) Act 2 -> Act 3 交界处 (前 1.6s)：滚奏军鼓 (Snare Roll) + 升调合成器 Riser 蓄力推向反攻高潮
         const riserWindow = act3StartSec - t;
         if (riserWindow > 0 && riserWindow <= 1.6) {
-          const prog = 1 - riserWindow / 1.6; // 0 -> 1
+          const prog = 1 - riserWindow / 1.6;
           const riserFreq = 220 * Math.pow(2, prog * 2.0);
           const rollRate = prog < 0.5 ? step16Sec * 0.5 : step16Sec * 0.25;
           const rollPhase = (t % rollRate) / rollRate;
           const rollSnare = rand() * Math.exp(-rollPhase * 6.5) * (0.08 + prog * 0.16);
           const riserSynth = Math.sin(2 * Math.PI * riserFreq * t) * prog * 0.12;
-          sample += rollSnare + riserSynth;
+          centerMono += rollSnare + riserSynth;
         }
 
-        // (f) Act 3 专属：26人全军反推高燃五度和弦垫音 (Power Chord Supersaw Pad)
         if (isAct3) {
           const padRoot = chordRoot * 2;
           const padFifth = padRoot * 1.498;
           const padOct = padRoot * 2;
-          const padWave =
+          const padWaveL =
             Math.sin(2 * Math.PI * padRoot * t) * 0.45 +
-            Math.sin(2 * Math.PI * padFifth * t) * 0.35 +
+            Math.sin(2 * Math.PI * (padFifth * 1.003) * t) * 0.35 +
             Math.sin(2 * Math.PI * padOct * t) * 0.2;
-          sample += Math.tanh(padWave * 1.4) * pumpEnv * 0.12;
+          const padWaveR =
+            Math.sin(2 * Math.PI * (padRoot * 0.997) * t) * 0.45 +
+            Math.sin(2 * Math.PI * padFifth * t) * 0.35 +
+            Math.sin(2 * Math.PI * (padOct * 1.002) * t) * 0.2;
+          bgmL[i] += Math.tanh(padWaveL * 1.4) * pumpEnv * 0.12;
+          bgmR[i] += Math.tanh(padWaveR * 1.4) * pumpEnv * 0.12;
         }
       } else {
-        // (g) 母巢击破后的胜利史诗尾奏 (D 大三和弦皮卡第第三音辉煌余韵: D3 + A3 + D4 + F#4 + A4)
         const vt = t - hiveBlastSec;
         const vEnv = Math.min(1, vt / 0.08) * Math.exp(-vt * 1.45);
         const vChord =
@@ -1597,20 +2565,30 @@ function buildSiegeAudioTrack(
           Math.sin(2 * Math.PI * 293.66 * t) * 0.22 +
           Math.sin(2 * Math.PI * 369.99 * t) * 0.18 +
           Math.sin(2 * Math.PI * 440.0 * t) * 0.14;
-        sample += Math.tanh(vChord * 1.35) * vEnv * 0.32;
+        centerMono += Math.tanh(vChord * 1.35) * vEnv * 0.32;
+        sideStereo += Math.sin(2 * Math.PI * 587.33 * t) * vEnv * 0.08;
       }
 
-      bgmSamples[i] = sample;
+      bgmL[i] += centerMono + sideStereo;
+      bgmR[i] += centerMono - sideStereo;
     }
   }
 
-  // 4. 合成解压 ASMR 战斗音效层 (SFX Layer)
+  // 4. 合成等功率立体声定位 (Equal-Power Stereo Panning) ASMR 战斗与载具音效层
   for (const ev of events) {
     const startIdx = Math.floor(ev.timeSec * sr);
     if (startIdx < 0 || startIdx >= totalSamples) continue;
 
+    const pan = clamp(ev.pan ?? 0, -0.85, 0.85);
+    const panAng = ((pan + 1) * Math.PI) * 0.25;
+    const gainL = Math.cos(panAng);
+    const gainR = Math.sin(panAng);
+    const addStereo = (idx: number, val: number) => {
+      sfxL[idx] += val * gainL;
+      sfxR[idx] += val * gainR;
+    };
+
     if (ev.kind === "mg" || ev.kind === "heavy-mg") {
-      // 解压微瞬态枪声：低频胸腔锤击 + 机械枪机脆响 + 延迟 14ms 的黄铜弹壳清脆抛壳声
       const isHeavy = ev.kind === "heavy-mg";
       const dur = isHeavy ? 0.046 : 0.036;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
@@ -1631,13 +2609,56 @@ function buildSiegeAudioTrack(
             (Math.sin(2 * Math.PI * shellFreq * st) +
               Math.sin(2 * Math.PI * (shellFreq * 1.31) * st) * 0.6) *
             Math.exp(-st * 195) *
-            0.18;
+            0.22;
         }
-        sfxSamples[startIdx + i] +=
-          (punch * 0.56 + boltSnap * 0.42 + shellClink) * ev.gain * 0.72;
+        addStereo(startIdx + i, (punch * 0.56 + boltSnap * 0.42 + shellClink) * ev.gain * 0.74);
+      }
+    } else if (ev.kind === "rocket-launch") {
+      // 机载火箭出巢高压气流呼啸声 (Doppler Whoosh)
+      const dur = 0.18;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const env = Math.min(1, t / 0.012) * Math.exp(-t * 15);
+        const sweep = Math.sin(2 * Math.PI * (1550 - t * 4800) * t) * 0.35;
+        const hiss = rand() * 0.65;
+        addStereo(startIdx + i, (sweep + hiss) * env * ev.gain * 0.65);
+      }
+    } else if (ev.kind === "rocket-blast") {
+      // 破片火箭弹落地轰爆声
+      const dur = 0.36;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const env = Math.exp(-t * 9.2);
+        const sub = Math.tanh(Math.sin(2 * Math.PI * (52 + 95 * Math.exp(-t * 28)) * t) * 1.9);
+        const debris = rand() * Math.exp(-t * 16) * 0.75;
+        addStereo(startIdx + i, (sub * 0.65 + debris * 0.55) * env * ev.gain * 0.82);
+      }
+    } else if (ev.kind === "bus-brake") {
+      // 装甲大巴急刹气动泄压嘶鸣 + 液压重型舱门弹开声
+      const dur = 0.34;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const airHiss = rand() * Math.exp(-t * 11) * 0.52;
+        const clunk =
+          t > 0.08
+            ? Math.sin(2 * Math.PI * 135 * (t - 0.08)) * Math.exp(-(t - 0.08) * 32) * 0.65
+            : 0;
+        addStereo(startIdx + i, (airHiss + clunk) * ev.gain * 0.68);
+      }
+    } else if (ev.kind === "ram-hit") {
+      // 车头 V 型钢制撞角碾碎路障丧尸重击声
+      const dur = 0.14;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const thud = Math.sin(2 * Math.PI * (128 - t * 520) * t) * Math.exp(-t * 26);
+        const crunch = rand() * Math.exp(-t * 38) * 0.45;
+        addStereo(startIdx + i, (thud * 0.7 + crunch) * ev.gain * 0.68);
       }
     } else if (ev.kind === "kill-pop") {
-      // 爆款割草灵魂音效：丧尸爆浆气泡音 + 清脆命中 Hitmarker 滴答声
       const dur = 0.028;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
       const f0 = 580 * ev.pitch;
@@ -1648,21 +2669,18 @@ function buildSiegeAudioTrack(
         const freq = f0 + ((f1 - f0) * t) / dur;
         const bubble = Math.sin(2 * Math.PI * freq * t);
         const tick = Math.sin(2 * Math.PI * 3400 * t) * Math.exp(-t * 240) * 0.35;
-        sfxSamples[startIdx + i] += (bubble * 0.75 + tick) * env * ev.gain * 0.78;
+        addStereo(startIdx + i, (bubble * 0.75 + tick) * env * ev.gain * 0.78);
       }
     } else if (ev.kind === "adrenaline") {
-      // 破笼/倍增/筑塔高光时刻：钢化棱镜碎裂声 + 四音上行多巴胺水晶琶音 (D5 -> F5 -> A5 -> D6)
       const notes = [587.33, 698.46, 880.0, 1174.66];
       const dur = 0.52;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
       for (let i = 0; i < len; i++) {
         const t = i / sr;
-        // 初始破笼清脆碎裂瞬态
         const shatter =
           t < 0.065
             ? (rand() * 0.55 + Math.sin(2 * Math.PI * 3850 * t) * 0.45) * Math.exp(-t * 62) * 0.48
             : 0;
-        // 四音上行琶音叠加
         let chime = 0;
         for (let n = 0; n < notes.length; n++) {
           const noteStart = n * 0.055;
@@ -1677,10 +2695,9 @@ function buildSiegeAudioTrack(
               0.26;
           }
         }
-        sfxSamples[startIdx + i] += (shatter + chime) * ev.gain * 0.85;
+        addStereo(startIdx + i, (shatter + chime) * ev.gain * 0.85);
       }
     } else if (ev.kind === "breach") {
-      // 绿点一碰即碎/同化危急警报：战术双频急促蜂鸣 + 低频重击
       const dur = 0.32;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
       for (let i = 0; i < len; i++) {
@@ -1692,10 +2709,9 @@ function buildSiegeAudioTrack(
           alarmFreq > 0
             ? Math.tanh(Math.sin(2 * Math.PI * alarmFreq * t) * 1.6) * Math.exp(-(t % 0.11) * 16)
             : 0;
-        sfxSamples[startIdx + i] += (subThud * 0.58 + alarm * 0.34) * env * ev.gain * 0.72;
+        addStereo(startIdx + i, (subThud * 0.58 + alarm * 0.34) * env * ev.gain * 0.72);
       }
     } else if (ev.kind === "boss-spawn") {
-      // 暴君降临：深渊低音号角 (Braaam) 下潜震颤
       const dur = 0.46;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
       for (let i = 0; i < len; i++) {
@@ -1706,10 +2722,9 @@ function buildSiegeAudioTrack(
           Math.sin(2 * Math.PI * f * t) * 0.6 +
           Math.sin(2 * Math.PI * (f * 1.5) * t) * 0.25 +
           Math.sin(2 * Math.PI * (f * 2) * t) * 0.15;
-        sfxSamples[startIdx + i] += Math.tanh(brass * 1.8) * env * ev.gain * 0.56;
+        addStereo(startIdx + i, Math.tanh(brass * 1.8) * env * ev.gain * 0.56);
       }
     } else if (ev.kind === "boss-kill") {
-      // 暴君击毙：重甲爆裂 + 金币/晶石清脆爆散音
       const dur = 0.48;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
       for (let i = 0; i < len; i++) {
@@ -1721,10 +2736,79 @@ function buildSiegeAudioTrack(
           t > 0.05
             ? Math.sin(2 * Math.PI * 1174.66 * (t - 0.05)) * Math.exp(-(t - 0.05) * 12) * 0.32
             : 0;
-        sfxSamples[startIdx + i] += (boom * 0.62 + crackle + rewardPing) * env * ev.gain * 0.75;
+        addStereo(startIdx + i, (boom * 0.62 + crackle + rewardPing) * env * ev.gain * 0.75);
+      }
+    } else if (ev.kind === "infect-bite") {
+      // 士兵被咬感染尸变瞬间：血肉骨裂低频咬合声 + 1360Hz->980Hz 急救心电监护仪断气双音警报 + 丧尸喉音嘶吼！
+      const dur = 0.48;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const crunch =
+          Math.tanh(
+            (Math.sin(2 * Math.PI * (165 - t * 240) * t) * 0.7 + rand() * 0.65) * 2.1,
+          ) * Math.exp(-t * 22);
+        const ecgFreq = t < 0.14 ? 1360 : t < 0.34 ? 980 : 0;
+        const ecgBeep =
+          ecgFreq > 0
+            ? Math.tanh(Math.sin(2 * Math.PI * ecgFreq * t) * 1.8) * Math.exp(-(t % 0.14) * 11) * 0.42
+            : 0;
+        const snarl =
+          Math.tanh(
+            Math.sin(2 * Math.PI * (135 + Math.sin(2 * Math.PI * 34 * t) * 28) * t) * 1.9,
+          ) *
+          Math.min(1, t / 0.06) *
+          Math.exp(-t * 5.8) *
+          0.44;
+        addStereo(startIdx + i, (crunch * 0.72 + ecgBeep + snarl) * ev.gain * 0.85);
+      }
+    } else if (ev.kind === "glass-break") {
+      // 钢化玻璃橱窗爆碎声：清脆高频泛音晶簇叮当瀑布 + 玻璃崩裂瞬态白噪！
+      const dur = 0.34;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const burst = rand() * Math.exp(-t * 28) * 0.58;
+        const chime =
+          (Math.sin(2 * Math.PI * (3120 * ev.pitch) * t) * Math.exp(-t * 14) +
+            Math.sin(2 * Math.PI * (4680 * ev.pitch) * t) * Math.exp(-t * 19) * 0.8 +
+            Math.sin(2 * Math.PI * (6240 * ev.pitch) * t) * Math.exp(-t * 24) * 0.65) *
+          0.32;
+        addStereo(startIdx + i, (burst + chime) * ev.gain * 0.72);
+      }
+    } else if (ev.kind === "prop-smash") {
+      // 实木桌椅/货架/售货机轰碎声：浑厚木铁闷响冲击 + 木刺金属碎裂噼啪声！
+      const dur = 0.28;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const thud = Math.tanh(Math.sin(2 * Math.PI * (145 - t * 260) * t) * 2.0) * Math.exp(-t * 18);
+        const splinter = rand() * Math.exp(-t * 16) * (0.5 + 0.5 * Math.sin(2 * Math.PI * 820 * t)) * 0.62;
+        addStereo(startIdx + i, (thud * 0.68 + splinter) * ev.gain * 0.72);
+      }
+    } else if (ev.kind === "sonar-ping") {
+      // 深层医院超声波声呐回声定位脉冲：清澈高辨识度 1380Hz->1720Hz 水晶声学脉冲！
+      const dur = 0.26;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const env = Math.min(1, t / 0.008) * Math.exp(-t * 13.5);
+        const freq = (1380 + t * 920) * ev.pitch;
+        const ping = Math.sin(2 * Math.PI * freq * t) + Math.sin(2 * Math.PI * freq * 2 * t) * 0.22;
+        addStereo(startIdx + i, ping * env * ev.gain * 0.48);
+      }
+    } else if (ev.kind === "power-down") {
+      // 地铁站高压变电所短路拉闸断电声：电弧啪啦爆裂 + 280Hz->38Hz 变压器停机骤降轰鸣！
+      const dur = 0.72;
+      const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
+      for (let i = 0; i < len; i++) {
+        const t = i / sr;
+        const snap = t < 0.09 ? rand() * Math.exp(-t * 36) * 0.85 : 0;
+        const dropF = 36 + 240 * Math.exp(-t * 4.8);
+        const humDrop = Math.tanh(Math.sin(2 * Math.PI * dropF * t) * 2.2) * Math.exp(-t * 3.2);
+        addStereo(startIdx + i, (snap + humDrop * 0.78) * ev.gain * 0.82);
       }
     } else if (ev.kind === "hive-blast") {
-      // 终局母巢核心轰爆：超重低音核爆下潜 (Sub-Drop) + 装甲崩解冲击波
       const dur = 1.05;
       const len = Math.min(Math.floor(dur * sr), totalSamples - startIdx);
       for (let i = 0; i < len; i++) {
@@ -1736,24 +2820,30 @@ function buildSiegeAudioTrack(
         const shimmer =
           Math.sin(2 * Math.PI * 587.33 * t) * Math.exp(-t * 4.2) * 0.24 +
           Math.sin(2 * Math.PI * 880.0 * t) * Math.exp(-t * 3.8) * 0.18;
-        sfxSamples[startIdx + i] += (subBoom * 0.68 + shockwave * 0.45 + shimmer) * env * ev.gain;
+        const val = (subBoom * 0.68 + shockwave * 0.45 + shimmer) * env * ev.gain;
+        sfxL[startIdx + i] += val;
+        sfxR[startIdx + i] += val;
       }
     }
   }
 
-  // 5. 母带级混音：将 BGM 乘上侧链闪避包络后与 SFX 叠加，并经软削波限制器 (Soft Limiter) 保证响度饱满不爆音
-  const out = new Float32Array(totalSamples);
+  // 5. 双声道母带软削波限制器 (Stereo Soft-Clip Limiter)
+  const outL = new Float32Array(totalSamples);
+  const outR = new Float32Array(totalSamples);
   for (let i = 0; i < totalSamples; i++) {
-    const mixed = bgmSamples[i] * duckEnv[i] + sfxSamples[i];
-    out[i] = clamp(Math.tanh(mixed * 1.15) * 0.92, -0.94, 0.94);
+    const mL = bgmL[i] * duckEnv[i] + sfxL[i];
+    const mR = bgmR[i] * duckEnv[i] + sfxR[i];
+    outL[i] = clamp(Math.tanh(mL * 1.15) * 0.92, -0.94, 0.94);
+    outR[i] = clamp(Math.tanh(mR * 1.15) * 0.92, -0.94, 0.94);
   }
-  return out;
+  return { left: outL, right: outR };
 }
 
 export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeRenderStats> {
   const mapId = opts.mapId ?? "canyon-bridge";
   const modeId = opts.modeId ?? "combo";
-  const sim = new SiegeSimulator(opts.seed, mapId, opts.durationSec, modeId);
+  const maxDur = opts.durationSec ?? 54;
+  const sim = new SiegeSimulator(opts.seed, mapId, maxDur, modeId);
   const atlas = new FontAtlas(
     join(PROJ_ROOT, "shared/fonts/atlas64.rgba"),
     join(PROJ_ROOT, "shared/fonts/atlas64.json"),
@@ -1774,15 +2864,13 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
   const actualDurationSec = Number((totalFrames / FPS).toFixed(2));
   const tmpWav = join(tmpdir(), `siege_audio_${opts.seed}_${Date.now()}.wav`);
   const extBgm = opts.bgmPath ? loadExternalBgmSamples(opts.bgmPath, actualDurationSec) : undefined;
-  const audioSamples = buildSiegeAudioTrack(sim.audioEvents, actualDurationSec, extBgm);
-  writeWav(audioSamples, tmpWav);
+  const stereoAudio = buildSiegeStereoAudioTrack(sim.audioEvents, actualDurationSec, modeId, extBgm);
+  writeStereoWav(stereoAudio.left, stereoAudio.right, tmpWav);
 
   // 重新运行一遍完全相同种子的模拟并流式生成视频帧
-  const simRender = new SiegeSimulator(opts.seed, mapId, opts.durationSec, modeId);
+  const simRender = new SiegeSimulator(opts.seed, mapId, maxDur, modeId);
   const worldBgRaw = buildWorldBackground(modeId, atlas);
-  const fb = new FrameBuf(OUT_W, OUT_H, [8, 10, 15, 255]);
-  const modeMeta = SIEGE_MODE_META[modeId];
-  const hookTitle = opts.hookTitle ?? modeMeta.hookTitle;
+  const screenFb = new FrameBuf(OUT_W, OUT_H, [8, 10, 15, 255]);
 
   function* frameGenerator(): IterableIterator<FrameBuf> {
     for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
@@ -1791,13 +2879,37 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
         if (simRender.isFinished) break;
       }
 
+      const { camX: effCamX, camY: effCamY, zoom: effZoom } = getEffectiveCam(simRender);
       bakeDecalsIntoBackground(worldBgRaw, simRender);
-      blitWorldToViewport(fb, worldBgRaw, simRender.camX, simRender.camY);
+      blitWorldToViewport(screenFb, worldBgRaw, effCamX, effCamY, effZoom);
 
-      const ox = BOARD_X - Math.round(simRender.camX);
-      const oy = BOARD_Y - Math.round(simRender.camY);
+      const fb = createZoomedFrameBuf(screenFb, effZoom);
+      const drawWorldText = (
+        text: string,
+        wxScreen: number,
+        wyScreen: number,
+        col: RGBA,
+        scale: number,
+        align: "left" | "center" | "right",
+        style: Parameters<FontAtlas["drawStyled"]>[7],
+      ) => {
+        atlas.drawStyled(
+          screenFb,
+          text,
+          BOARD_X + (wxScreen - BOARD_X) * effZoom,
+          BOARD_Y + (wyScreen - BOARD_Y) * effZoom,
+          col,
+          scale * effZoom,
+          align,
+          style,
+        );
+      };
 
-      // 0. 若为死角光暗模式，先绘制室内 L 型死角防爆隔墙底座
+      const ox = BOARD_X - effCamX;
+      const oy = BOARD_Y - effCamY;
+
+      // 0. 先绘制动态可破坏室内家具/玻璃窗（完好实体 + 破碎坍塌残骸），再绘制混凝土隔墙底座
+      renderDynamicInteriorProps(fb, simRender);
       renderDeadCornerWalls(fb, simRender);
 
       // 1. 绘制顶部【丧尸母巢核心】（12片分节甲壳线条 + 内部放射生物血管 + 旋转锁定准星环）
@@ -1904,8 +3016,7 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
           ghostColor: [255, 255, 255, 240],
         });
 
-        atlas.drawStyled(
-          fb,
+        drawWorldText(
           `${Math.ceil(hive.hp)}`,
           hx,
           hBarY - 20,
@@ -1920,119 +3031,156 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
         drawPolygonLines(fb, hx, hy, hive.r * 0.95, 8, 0.2, 2.2, [95, 42, 48, 195], true);
       }
 
-      // 2. 绘制战场战术节点（八角钢筋囚笼 / 多切面几何棱镜晶石 / 十字装甲工事箱）
+      // 2. 绘制真实焊接钢筋铁笼 (`囚笼+1`) 与军用武器箱（绝不凭空消失：破锁前关押 1 名抓栏呼救幸存者，破锁后铁门大敞并永久遗留在房间地面上！）
       for (const n of simRender.nodes) {
-        if (n.broken) continue;
         const nx = ox + n.x;
         const ny = oy + n.y;
-        const isHit = n.hitFlash > 0.3;
+        const rot = n.rot ?? 0;
+        const ux = Math.cos(rot);
+        const uy = Math.sin(rot);
+        const px = -uy;
+        const py = ux;
+        const toW = (lx: number, ly: number): [number, number] => [
+          nx + ux * lx + px * ly,
+          ny + uy * lx + py * ly,
+        ];
+        const isHit = !n.broken && n.hitFlash > 0.3;
+        const beaconPulse = 0.5 + 0.5 * Math.sin(frameIdx * 0.22 + n.x * 0.03);
 
         if (n.kind === "rescue_cage") {
-          fb.drawGlowCircle(nx, ny, n.r * 1.55, [45, 235, 145, 85]);
-          fb.fillCircle(nx, ny, n.r + 2, [18, 26, 36, 250]);
-          drawPolygonLines(fb, nx, ny, n.r + 1, 8, Math.PI / 8, 2.4, [75, 245, 155, 240]);
+          const hw = 19;
+          const hh = 15.5;
 
-          // 笼内被困的 2 名绿兵小人（带头盔、护目镜与枪管线条）
-          for (const dx of [-7.5, 7.5]) {
-            fb.fillCircle(nx + dx, ny + 2, 6.2, [38, 215, 122, 245]);
-            fb.fillCircle(nx + dx, ny + 0.5, 3.6, [130, 255, 190, 250]);
-            fb.drawLine(nx + dx - 3, ny - 1, nx + dx + 3, ny - 1, 1.8, [220, 255, 255, 255]);
+          // 2a. 铁笼落地阴影与锈蚀铁篦底座
+          fb.blendCircle(nx + 3, ny + 4, 23, [3, 5, 10, 175]);
+          for (let ly = -hh + 2; ly <= hh - 2; ly += 4) {
+            const [ax, ay] = toW(-hw + 1, ly);
+            const [bx, by] = toW(hw - 1, ly);
+            fb.drawLine(ax, ay, bx, by, 4.4, [24, 28, 34, 245]);
+          }
+          // 地面抓痕与求救信号棒微光
+          if (!n.broken) {
+            const [fx, fy] = toW(-hw - 5, hh + 4);
+            fb.drawGlowCircle(fx, fy, 18, [255, 95, 55, Math.round(55 + 45 * beaconPulse)]);
+            fb.fillCircle(fx, fy, 2.6, [255, 165, 85, 250]);
           }
 
-          // 纵横交错的钢筋铁栏与横向锁梁线条
-          for (const bx of [-12, -4, 4, 12]) {
-            const halfChord = Math.sqrt(Math.max(4, n.r * n.r - bx * bx)) - 2;
+          // 2b. 若尚未破锁：绘制笼内 1 名真实被困幸存者（双手紧握/挥动铁栏呼救）！
+          if (!n.broken) {
+            const sway = Math.sin(frameIdx * 0.24 + n.y * 0.05) * 1.8;
+            const [sx, sy] = toW(sway, 1.5);
+            const waveAng = rot + Math.PI * 0.5 + Math.sin(frameIdx * 0.36 + n.x * 0.04) * 0.48;
+            // 伸出铁栏缝隙挥动求救的手臂与握栏手掌
             fb.drawLine(
-              nx + bx,
-              ny - halfChord,
-              nx + bx,
-              ny + halfChord,
-              2.2,
-              isHit ? [255, 245, 190, 255] : [165, 185, 215, 245],
+              sx,
+              sy,
+              sx + Math.cos(waveAng) * 14.5,
+              sy + Math.sin(waveAng) * 14.5,
+              2.3,
+              [155, 255, 205, 245],
             );
+            const [gripX, gripY] = toW(-6, hh - 1);
+            fb.fillCircle(gripX, gripY, 2.1, [215, 190, 165, 245]);
+            // 幸存者双肩战术背心与绿色头盔护目镜
+            fb.fillCircle(sx, sy, 6.8, [32, 168, 98, 250]);
+            fb.fillCircle(sx, sy - 0.8, 4.2, [125, 250, 185, 255]);
+            fb.drawLine(sx - ux * 3.2, sy - uy * 3.2 - 1.5, sx + ux * 3.2, sy + uy * 3.2 - 1.5, 1.7, [225, 255, 255, 255]);
           }
-          fb.drawLine(nx - n.r + 3, ny - 6, nx + n.r - 3, ny - 6, 2.0, [120, 142, 172, 235]);
-          fb.drawLine(nx - n.r + 3, ny + 7, nx + n.r - 3, ny + 7, 2.0, [120, 142, 172, 235]);
-          drawCornerBrackets(fb, nx, ny, n.r + 5, n.r + 5, 7, 2.0, [85, 255, 168, 225]);
+
+          // 2c. 铁笼背墙与左右两侧焊接钢筋竖栏 + 顶部防逃交叉铁栅
+          const barCol: RGBA = isHit ? [245, 232, 185, 255] : [116, 128, 142, 248];
+          const rustCol: RGBA = [96, 62, 42, 235];
+          const [cTLx, cTLy] = toW(-hw, -hh);
+          const [cTRx, cTRy] = toW(hw, -hh);
+          const [cBLx, cBLy] = toW(-hw, hh);
+          const [cBRx, cBRy] = toW(hw, hh);
+
+          // 背侧与左右外框角钢
+          fb.drawLine(cTLx, cTLy, cTRx, cTRy, 2.8, rustCol);
+          fb.drawLine(cTLx, cTLy, cTRx, cTRy, 1.6, barCol);
+          fb.drawLine(cTLx, cTLy, cBLx, cBLy, 2.8, rustCol);
+          fb.drawLine(cTLx, cTLy, cBLx, cBLy, 1.6, barCol);
+          fb.drawLine(cTRx, cTRy, cBRx, cBRy, 2.8, rustCol);
+          fb.drawLine(cTRx, cTRy, cBRx, cBRy, 1.6, barCol);
+
+          // 笼顶纵向铁条（破锁后略带半透，露出空笼内部）
+          const roofAlpha = n.broken ? 145 : 215;
+          for (const bx of [-12, -4, 4, 12]) {
+            const [r0x, r0y] = toW(bx, -hh);
+            const [r1x, r1y] = toW(bx, hh);
+            fb.drawLine(r0x, r0y, r1x, r1y, 1.4, [108, 120, 136, roofAlpha]);
+          }
+          const [m0x, m0y] = toW(-hw, 0);
+          const [m1x, m1y] = toW(hw, 0);
+          fb.drawLine(m0x, m0y, m1x, m1y, 1.3, [92, 102, 118, roofAlpha]);
+
+          // 四角重型焊接立柱墩头
+          for (const [cxp, cyp] of [
+            [cTLx, cTLy],
+            [cTRx, cTRy],
+            [cBLx, cBLy],
+            [cBRx, cBRy],
+          ]) {
+            fb.fillCircle(cxp, cyp, 3.0, [52, 58, 68, 255]);
+            fb.fillCircle(cxp, cyp, 1.6, [148, 160, 175, 245]);
+          }
+
+          // 2d. 正门铁栏门扇：未破锁时紧闭并挂有黄铜/红芯大挂锁；破锁后绕左铰链平滑向外敞开 ~110° 并掉落断锁！
+          if (!n.broken) {
+            fb.drawLine(cBLx, cBLy, cBRx, cBRy, 2.8, barCol);
+            const [lockX, lockY] = toW(7, hh + 1.5);
+            fb.fillRoundRect(lockX - 3.5, lockY - 3, 7, 7, 1.5, isHit ? [255, 250, 200, 255] : [215, 162, 42, 255]);
+            fb.fillCircle(lockX, lockY + 0.5, 1.6, [235, 48, 58, 255]);
+          } else {
+            const openRad = clamp(n.openAnim ?? 1, 0.15, 1) * 1.92;
+            const dDirX = ux * Math.cos(openRad) + px * Math.sin(openRad);
+            const dDirY = uy * Math.cos(openRad) + py * Math.sin(openRad);
+            const doorLen = hw * 1.92;
+            const tipX = cBLx + dDirX * doorLen;
+            const tipY = cBLy + dDirY * doorLen;
+            fb.drawLine(cBLx + 2, cBLy + 3, tipX + 2, tipY + 3, 3.6, [3, 5, 10, 165]);
+            fb.drawLine(cBLx, cBLy, tipX, tipY, 3.0, [132, 146, 162, 245]);
+            // 地面掉落的砸断挂锁残片
+            const [bLockX, bLockY] = toW(10, hh + 6);
+            fb.fillRect(bLockX - 2.5, bLockY - 2, 5, 4, [168, 126, 38, 215]);
+          }
         } else if (n.kind === "multiply_crystal") {
-          // 算术倍增晶石：六角几何切面棱镜 + 内部折射晶格线 + 外围四角锁定框
-          fb.drawGlowCircle(nx, ny, n.r * 1.65, [255, 205, 55, 95]);
-          fb.fillCircle(nx, ny, n.r + 2, [34, 24, 10, 250]);
-          fb.fillCircle(
-            nx,
-            ny,
-            n.r - 1,
-            isHit ? [255, 250, 205, 255] : [245, 182, 32, 250],
-          );
-          // 外部六边形棱镜轮廓与中心放射切面线
-          drawPolygonLines(
-            fb,
-            nx,
-            ny,
-            n.r,
-            6,
-            frameIdx * 0.02,
-            2.6,
-            [255, 248, 175, 255],
-            true,
-            [255, 235, 130, 230],
-          );
-          // 内部反向交错三角形折射线
-          drawPolygonLines(
-            fb,
-            nx,
-            ny,
-            n.r * 0.58,
-            6,
-            -frameIdx * 0.02 + Math.PI / 6,
-            1.8,
-            [255, 255, 225, 245],
-          );
-          drawCornerBrackets(fb, nx, ny, n.r + 5, n.r + 5, 7, 2.0, [255, 225, 85, 230]);
+          // 战术空投集结通讯站（八角装甲通讯底座 + 双鞭状天线 + 青金脉冲集结光环，激活后展开为地面基站遗迹）
+          fb.blendCircle(nx + 3, ny + 4, 24, [3, 5, 10, 175]);
+          fb.fillCircle(nx, ny, 20, n.broken ? [24, 30, 38, 245] : [36, 48, 62, 250]);
+          drawPolygonLines(fb, nx, ny, 19, 8, 0.2, 2.0, [115, 195, 225, n.broken ? 145 : 240], true);
+          if (!n.broken) {
+            fb.drawGlowCircle(nx, ny, 26, [255, 215, 75, Math.round(65 + 55 * beaconPulse)]);
+            fb.strokeRing(nx, ny, 11 + beaconPulse * 3, 2.0, [255, 225, 85, 245]);
+            fb.fillCircle(nx, ny, 5.5, isHit ? [255, 255, 235, 255] : [95, 240, 255, 255]);
+            fb.drawLine(nx - 8, ny - 6, nx - 14, ny - 22, 1.8, [165, 205, 230, 245]);
+            fb.drawLine(nx + 8, ny - 6, nx + 13, ny - 19, 1.6, [165, 205, 230, 245]);
+          } else {
+            fb.fillCircle(nx, ny, 6.5, [48, 62, 76, 235]);
+          }
         } else {
-          // 碉堡工事补给箱：对角交叉加固肋条 + 战术锁定框
-          fb.drawGlowCircle(nx, ny, n.r * 1.55, [65, 210, 255, 90]);
-          fb.blendRoundRect(
-            nx - n.r,
-            ny - n.r,
-            n.r * 2,
-            n.r * 2,
-            6,
-            isHit ? [190, 245, 255, 255] : [32, 118, 168, 250],
+          // 军规橄榄绿重武器木钢补给箱（破箱后箱盖掀翻在旁侧保留为空箱遗迹）
+          const cw = 24;
+          const ch = 17;
+          fb.blendRoundRect(nx - cw + 3, ny - ch + 4, cw * 2, ch * 2, 4, [3, 5, 10, 180]);
+          fb.fillRoundRect(
+            nx - cw,
+            ny - ch,
+            cw * 2,
+            ch * 2,
+            4,
+            n.broken ? [26, 32, 28, 245] : isHit ? [165, 195, 145, 255] : [52, 68, 48, 255],
           );
-          fb.drawLine(nx - n.r + 4, ny - n.r + 4, nx + n.r - 4, ny + n.r - 4, 2.2, [95, 215, 255, 220]);
-          fb.drawLine(nx + n.r - 4, ny - n.r + 4, nx - n.r + 4, ny + n.r - 4, 2.2, [95, 215, 255, 220]);
-          fb.strokeRoundRect(nx - n.r, ny - n.r, n.r * 2, n.r * 2, 6, 2.6, [135, 240, 255, 250]);
-          drawCornerBrackets(fb, nx, ny, n.r + 5, n.r + 5, 7, 2.0, [95, 230, 255, 225]);
+          fb.strokeRoundRect(nx - cw, ny - ch, cw * 2, ch * 2, 4, 2.0, [118, 138, 108, 240]);
+          if (!n.broken) {
+            fb.drawLine(nx - cw + 4, ny, nx + cw - 4, ny, 2.4, [88, 106, 82, 235]);
+            fb.fillRect(nx - 4, ny + ch - 3, 8, 5, [215, 168, 48, 250]);
+          } else {
+            // 掀开的军火箱顶盖斜靠在箱旁
+            fb.fillRoundRect(nx + cw + 4, ny - ch + 2, 12, ch * 1.8, 2, [58, 74, 52, 235]);
+            fb.strokeRoundRect(nx + cw + 4, ny - ch + 2, 12, ch * 1.8, 2, 1.3, [118, 138, 108, 220]);
+          }
         }
-
-        const nBarW = 66;
-        const nBarH = 6;
-        const nBarX = nx - nBarW * 0.5;
-        const nBarY = ny - n.r - 15;
-        const nFrac = clamp(n.hp / n.maxHp, 0, 1);
-        const nGhost = clamp(n.ghostHp / n.maxHp, nFrac, 1);
-
-        fb.drawBar(nBarX, nBarY, nBarW, nBarH, nFrac, {
-          radius: 3,
-          bgColor: [14, 18, 26, 230],
-          borderColor: [240, 220, 110, 220],
-          fgStart: n.kind === "rescue_cage" ? [45, 235, 145, 255] : [255, 205, 55, 255],
-          fgEnd: n.kind === "rescue_cage" ? [115, 255, 185, 255] : [255, 240, 120, 255],
-          ghostFrac: nGhost,
-          ghostColor: [255, 255, 255, 230],
-        });
-
-        atlas.drawStyled(
-          fb,
-          n.label,
-          nx,
-          nBarY - 19,
-          n.kind === "rescue_cage" ? [105, 255, 175, 255] : [255, 235, 95, 255],
-          0.30,
-          "center",
-          { outlineWidth: 2.8, outlineColor: [8, 10, 16, 245] },
-        );
       }
 
       // 3. 绘制双层几何冲击波环（含声呐超声波环 sonar 与枪口噪音惊醒波 noise）
@@ -2063,6 +3211,18 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
           1.5,
           col,
         );
+        // 接触同化瞬间绘制紫绿双色生物电弧裂纹（无需文字即可一眼看清“人类被感染突变为变异枪兵”！）
+        if (r.kind === "casualty" && p < 0.72) {
+          for (let aIdx = 0; aIdx < 5; aIdx++) {
+            const ang0 = (aIdx * Math.PI * 2) / 5 + p * 2.2;
+            const mx = ox + r.x + Math.cos(ang0 + 0.18) * (rad * 0.55);
+            const my = oy + r.y + Math.sin(ang0 + 0.18) * (rad * 0.55);
+            const ex = ox + r.x + Math.cos(ang0) * (rad * 1.05);
+            const ey = oy + r.y + Math.sin(ang0) * (rad * 1.05);
+            fb.drawLine(ox + r.x, oy + r.y, mx, my, 2.0, [95, 255, 165, alpha]);
+            fb.drawLine(mx, my, ex, ey, 1.8, [255, 65, 195, alpha]);
+          }
+        }
       }
 
       // 4. 绘制尸潮红点（带前扑利爪短线与背部甲壳纹理）、感染精英与绿光【同化母体】
@@ -2098,52 +3258,76 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
         }
 
         if (r.kind === "infected_elite") {
-          // 被丧尸杀掉后原地突变的前人类士兵（半残绿甲+紫红变异甲壳+歪斜步枪与利爪+血条）
-          fb.drawGlowCircle(rx, ry, r.r * 1.7, [235, 28, 145, 105]);
-          // 歪斜残破步枪与向下扑咬的变异利爪
-          fb.drawLine(rx + 4, ry + 2, rx + 7, ry + r.r + 9, 3.4, [48, 56, 72, 255]);
-          fb.drawLine(rx - 5, ry + 3, rx - 9, ry + r.r + 8, 2.8, [245, 45, 125, 255]);
-          fb.drawLine(rx + 6, ry + 3, rx + 10, ry + r.r + 7, 2.8, [245, 45, 125, 255]);
+          const mutTicks = r.mutatingTicks ?? 0;
+          if (mutTicks > 0) {
+            // 【等身自然尸变痉挛 (0.40s)：士兵在原体型尺度抽搐变色并弹出小巧 ☣ 感染提示，绝不膨胀成突兀小Boss！】
+            const prog = clamp(1 - mutTicks / 24, 0, 1);
+            const mx = rx + Math.sin(frameIdx * 2.8 + r.id) * 2.1;
+            const my = ry + Math.cos(frameIdx * 3.3 + r.id) * 2.1;
+            const strobeGreen = frameIdx % 4 < 2;
 
-          // 左肩残留人类绿甲 vs 右肩紫红肉瘤异变
-          fb.fillCircle(rx - r.r * 0.72, ry, 4.5, [28, 155, 88, 255]);
-          fb.fillCircle(rx + r.r * 0.72, ry, 5.0, [215, 25, 115, 255]);
+            fb.drawGlowCircle(mx, my, 17 + prog * 6, [235, 38, 115, 145]);
+            for (let tIdx = 0; tIdx < 4; tIdx++) {
+              const tAng = (tIdx * Math.PI) / 2 + frameIdx * 0.22;
+              fb.drawLine(
+                mx,
+                my,
+                mx + Math.cos(tAng) * (r.r + 6 + prog * 4),
+                my + Math.sin(tAng) * (r.r + 6 + prog * 4),
+                1.9,
+                strobeGreen ? [85, 245, 155, 220] : [235, 45, 95, 230],
+              );
+            }
+            fb.fillCircle(mx, my, r.r + 1.5, [26, 6, 16, 250]);
+            fb.fillCircle(mx, my, r.r, strobeGreen ? [52, 215, 125, 255] : [215, 34, 68, 255]);
+            drawBiohazardSymbol(
+              fb,
+              mx,
+              my - r.r - 11 - prog * 4,
+              8.5,
+              frameIdx * 0.1,
+              strobeGreen ? [115, 255, 165, 245] : [255, 75, 135, 245],
+            );
+            continue;
+          }
 
-          // 破损头盔与变异核心
-          fb.fillCircle(rx, ry, r.r + 1.8, [28, 6, 18, 255]);
+          // 尸变完成后的【普通等身感染士兵丧尸】（无Boss血条、无巨型体型、无激光步枪，仅保留歪斜残破绿头盔护肩与前扑尸爪，一眼认出是昔日队友！）
+          const moveAng = Math.atan2(r.vy || 1, r.vx || 0);
+          const mux = Math.cos(moveAng);
+          const muy = Math.sin(moveAng);
+          const mpx = -muy;
+          const mpy = mux;
+
+          for (const side of [-0.5, 0.5]) {
+            const cAng = moveAng + side;
+            fb.drawLine(
+              rx + Math.cos(cAng) * (r.r * 0.55),
+              ry + Math.sin(cAng) * (r.r * 0.55),
+              rx + Math.cos(cAng) * (r.r + 4.0),
+              ry + Math.sin(cAng) * (r.r + 4.0),
+              2.0,
+              [165, 24, 46, 240],
+            );
+          }
+          // 一侧残留的橄榄绿破损战术护肩，标识其曾是人类士兵
+          fb.fillCircle(rx - mpx * (r.r * 0.72), ry - mpy * (r.r * 0.72), 3.3, [44, 172, 98, 245]);
+          fb.fillCircle(rx, ry, r.r + 1.4, [26, 6, 14, 245]);
           fb.fillCircle(
             rx,
             ry,
             r.r,
-            r.hitFlash > 0.3 ? [255, 215, 235, 255] : [198, 22, 102, 255],
+            r.hitFlash > 0.35 ? [255, 232, 220, 255] : [196, 30, 68, 255],
           );
-          drawPolygonLines(
-            fb,
-            rx,
-            ry,
-            r.r - 1.2,
-            8,
-            frameIdx * 0.03,
-            1.8,
-            [75, 235, 145, 215],
-            true,
-            [255, 65, 155, 195],
+          // 歪斜碎裂的战术护目镜微光与丧尸红眼
+          fb.drawLine(
+            rx + mux * 2.5 - mpx * 3.2,
+            ry + muy * 2.5 - mpy * 3.2,
+            rx + mux * 3.2,
+            ry + muy * 3.2,
+            1.6,
+            [115, 235, 175, 215],
           );
-          // 碎裂染血护目镜横线
-          fb.drawLine(rx - 5, ry + 4, rx + 5, ry + 4, 2.6, [255, 240, 95, 255]);
-
-          const iBarW = 46;
-          const iBarH = 5;
-          const iBarX = rx - iBarW * 0.5;
-          const iBarY = ry - r.r - 12;
-          const iFrac = clamp(r.hp / r.maxHp, 0, 1);
-          fb.drawBar(iBarX, iBarY, iBarW, iBarH, iFrac, {
-            radius: 2,
-            bgColor: [14, 16, 24, 225],
-            borderColor: [245, 95, 185, 220],
-            fgStart: [245, 35, 135, 255],
-            fgEnd: [255, 115, 195, 255],
-          });
+          fb.fillCircle(rx + mux * 2.8 + mpx * 2.2, ry + muy * 2.8 + mpy * 2.2, 1.5, [255, 220, 85, 250]);
           continue;
         }
 
@@ -2280,8 +3464,7 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
           ghostColor: [255, 255, 255, 235],
         });
 
-        atlas.drawStyled(
-          fb,
+        drawWorldText(
           `${Math.ceil(r.hp)}`,
           rx,
           barY - 19,
@@ -2307,6 +3490,18 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
         const uy = dy / totalLen;
         const px = -uy;
         const py = ux;
+
+        if (line.corrupted) {
+          // 变异叛变枪兵发射的腐化紫绿电弧弹道！
+          const midX = (lx1 + lx2) * 0.5 + px * (((frameIdx + i) % 2 === 0 ? 1 : -1) * 6);
+          const midY = (ly1 + ly2) * 0.5 + py * (((frameIdx + i) % 2 === 0 ? 1 : -1) * 6);
+          fb.drawLine(lx1, ly1, midX, midY, 3.8, [245, 38, 185, 195]);
+          fb.drawLine(midX, midY, lx2, ly2, 3.8, [245, 38, 185, 195]);
+          fb.drawLine(lx1, ly1, midX, midY, 1.6, [125, 255, 175, 245]);
+          fb.drawLine(midX, midY, lx2, ly2, 1.6, [125, 255, 175, 245]);
+          fb.drawGlowCircle(lx2, ly2, 7.5, [255, 55, 195, 210]);
+          continue;
+        }
 
         const isCyan = line.role === "turret" || line.role === "sniper";
 
@@ -2392,13 +3587,31 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
         fb.fillCircle(lx2, ly2, 2.6, [255, 255, 245, 255]);
       }
 
-      // 7. 绘制受击粒子
+      // 7. 绘制飞溅旋转家具/玻璃碎片 (DebrisShard) 与受击粒子
+      for (let di = 0; di < simRender.debris.length; di++) {
+        const db = simRender.debris[di];
+        const alpha = clamp(Math.round((db.ttl / db.maxTtl) * db.color[3]), 0, 255);
+        const dx = ox + db.x;
+        const dy = oy + db.y;
+        const ux = Math.cos(db.rot);
+        const uy = Math.sin(db.rot);
+        const halfL = db.len * 0.5;
+        fb.drawLine(dx - ux * halfL + 2, dy - uy * halfL + 3, dx + ux * halfL + 2, dy + uy * halfL + 3, db.wid, [4, 6, 10, Math.round(alpha * 0.55)]);
+        const shardCol: RGBA = [db.color[0], db.color[1], db.color[2], alpha];
+        fb.drawLine(dx - ux * halfL, dy - uy * halfL, dx + ux * halfL, dy + uy * halfL, db.wid, shardCol);
+        if (db.shape === "glass") {
+          fb.drawLine(dx - uy * 2.5, dy + ux * 2.5, dx + ux * halfL, dy + uy * halfL, 1.3, [235, 252, 255, alpha]);
+        }
+      }
+
       for (const sp of simRender.sparks) {
         const alpha = clamp(Math.round((sp.ttl / sp.maxTtl) * 245), 0, 245);
         const sx = ox + sp.x;
         const sy = oy + sp.y;
         if (sp.kind === "blood") {
           fb.fillCircle(sx, sy, 2.6, [225, 24, 42, alpha]);
+        } else if (sp.kind === "bio") {
+          fb.fillCircle(sx, sy, 3.2, sp.ttl % 2 === 0 ? [255, 45, 195, alpha] : [95, 255, 165, alpha]);
         } else if (sp.kind === "gold") {
           fb.fillCircle(sx, sy, 3.0, [255, 235, 95, alpha]);
         } else {
@@ -2515,39 +3728,146 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
         );
       }
 
-      // 8.5 死角光暗模式：2D 射线遮挡光影迷雾 + 体积手电/探照灯光锥 + 暗处丧尸红眼闪烁
-      applyDeadCornerRaycastLighting(fb, simRender, atlas, frameIdx);
+      // 8.6 绘制高速抛射旋转黄铜弹壳与机载破片火箭弹尾焰轨迹
+      for (let i = 0; i < simRender.shells.length; i++) {
+        const sh = simRender.shells[i];
+        const sx = ox + sh.x;
+        const sy = oy + sh.y;
+        const alpha = clamp(Math.round((sh.ttl / sh.maxTtl) * 235), 0, 235);
+        const halfLen = sh.heavy ? 3.4 : 2.3;
+        const dx = Math.cos(sh.rot) * halfLen;
+        const dy = Math.sin(sh.rot) * halfLen;
+        fb.drawLine(sx - dx, sy - dy, sx + dx, sy + dy, sh.heavy ? 2.1 : 1.5, [255, 215, 82, alpha]);
+      }
+      for (let i = 0; i < simRender.rockets.length; i++) {
+        const rk = simRender.rockets[i];
+        const rx = ox + rk.x;
+        const ry = oy + rk.y;
+        const vLen = Math.hypot(rk.vx, rk.vy) || 1;
+        const ux = rk.vx / vLen;
+        const uy = rk.vy / vLen;
+        fb.drawLine(rx - ux * 34, ry - uy * 34, rx, ry, 5.2, [255, 165, 55, 110]);
+        fb.drawLine(rx - ux * 20, ry - uy * 20, rx, ry, 2.8, [255, 240, 155, 235]);
+        fb.drawGlowCircle(rx - ux * 4, ry - uy * 4, 14, [255, 195, 65, 195]);
+        fb.drawLine(rx - ux * 5, ry - uy * 5, rx + ux * 6, ry + uy * 6, 3.6, [235, 248, 255, 255]);
+      }
 
-      // 8.8 战术载具入场渲染（重装防暴军用大巴 / 押运装甲大巴 / 黑鹰武装直升机 / 声呐侦察直升机）
+      // 8.7 战术载具入场渲染
       renderInsertionVehicles(fb, simRender, atlas, ox, oy, frameIdx);
 
-      // 9. 绘制战场飘字横幅
+      // 8.8 最后统一施加【高斯柔化自然战争迷雾】（遮蔽所有未见商铺/墙后尸群/未照亮任务点，仅让未见建筑边缘与求救波纹若隐若现！）
+      applyDeadCornerRaycastLighting(screenFb, fb, simRender, frameIdx);
+
+      // 8.85 战争迷雾之上的【铁笼+1 任务反馈层】：
+      //      - 未照亮盲区内铁笼：仅透出极微弱呼吸虚影（若隐若现，去除制式化瞄准角框）；
+      //      - 照亮破锁中的铁笼：紧贴铁笼呈现精致 27px 破锁进度环与清晰 "+1" 提示！
+      for (const n of simRender.nodes) {
+        if (n.broken) continue;
+        const nx = ox + n.x;
+        const ny = oy + n.y;
+        const prog = clamp(n.breachProgress ?? 0, 0, 1);
+        let revealed = !simRender.isDarkMode || prog > 0.005;
+        if (!revealed) {
+          for (let gi = 0; gi < simRender.greens.length; gi++) {
+            const g = simRender.greens[gi];
+            if (
+              Math.hypot(g.x - n.x, g.y - n.y) <= 275 &&
+              simRender.hasLineOfSight(g.x, g.y, n.x, n.y)
+            ) {
+              revealed = true;
+              break;
+            }
+          }
+        }
+        const ringRad = n.r + 6;
+        if (revealed) {
+          if (prog > 0.008) {
+            fb.strokeRing(nx, ny, ringRad, 3.2, [10, 16, 24, 210]);
+            const arcCol: RGBA =
+              n.kind === "rescue_cage"
+                ? [85, 255, 172, 255]
+                : n.kind === "multiply_crystal"
+                  ? [255, 225, 85, 255]
+                  : [115, 235, 255, 255];
+            drawRadialProgressArc(fb, nx, ny, ringRad, 4.2, prog, arcCol);
+            const headAng = -Math.PI * 0.5 + prog * Math.PI * 2;
+            fb.drawGlowCircle(
+              nx + Math.cos(headAng) * ringRad,
+              ny + Math.sin(headAng) * ringRad,
+              6.5,
+              arcCol,
+            );
+          }
+          drawWorldText(
+            n.label,
+            nx,
+            ny - n.r - 16,
+            n.kind === "rescue_cage"
+              ? [125, 255, 188, 250]
+              : n.kind === "multiply_crystal"
+                ? [255, 228, 95, 250]
+                : [135, 240, 255, 250],
+            0.29,
+            "center",
+            { outlineWidth: 2.8, outlineColor: [8, 10, 16, 245] },
+          );
+        } else {
+          const ghostBreathe = 0.5 + 0.5 * Math.sin(frameIdx * 0.12 + n.x * 0.03 + n.y * 0.02);
+          const ghostA = Math.round(28 + 26 * ghostBreathe);
+          const ghostCol: RGBA =
+            n.kind === "rescue_cage" ? [85, 225, 155, ghostA] : [95, 210, 245, ghostA];
+          drawWorldText(
+            n.label,
+            nx,
+            ny - n.r - 14,
+            ghostCol,
+            0.25,
+            "center",
+            { outlineWidth: 1.8, outlineColor: [6, 8, 14, ghostA] },
+          );
+        }
+      }
+
+      // 9. 绘制纯算术符号飘字 (+6, ×2, +7, -1)
       for (const b of simRender.banners) {
         const alpha = clamp(Math.round((b.ttl / b.maxTtl) * 255), 0, 255);
         const col: RGBA = [b.color[0], b.color[1], b.color[2], alpha];
-        atlas.drawStyled(
-          fb,
+        drawWorldText(
           b.text,
           ox + b.x,
           oy + b.y,
           col,
-          0.33,
+          0.38,
           "center",
           { outlineWidth: 3.0, outlineColor: [8, 10, 16, Math.min(245, alpha)] },
         );
       }
 
-      // 9.5 裁剪视口外溢像素并绘制战场外框、右上角【全局战术小地图 + 实时视野跟随白框】与左上角【当前推进扇区遥测面板】
-      clipHudMarginsAndDrawArenaBorder(fb, modeId);
-      renderGlobalMinimapAndTelemetry(fb, simRender, atlas, frameIdx);
+      // 9.5 裁剪视口外溢像素并绘制战场外框、右上角【全局战术小地图 + 动态变焦视野跟随白框】
+      clipHudMarginsAndDrawArenaBorder(screenFb, modeId);
+
+      // 9.8 感染惊悚紫红全屏四周压迫渐晕脉冲 (Bio-Infection Edge Vignette Pulse)
+      if (simRender.infectionFlash > 0.02) {
+        const vigA = clamp(Math.round(simRender.infectionFlash * 155), 0, 165);
+        const vigCol: RGBA = [245, 28, 155, vigA];
+        const zeroCol: RGBA = [245, 28, 155, 0];
+        const band = 56;
+        screenFb.blendGradientRect(BOARD_X, BOARD_Y, ARENA_W, band, vigCol, zeroCol, true);
+        screenFb.blendGradientRect(BOARD_X, BOARD_Y + ARENA_H - band, ARENA_W, band, zeroCol, vigCol, true);
+        screenFb.blendGradientRect(BOARD_X, BOARD_Y, band, ARENA_H, vigCol, zeroCol, false);
+        screenFb.blendGradientRect(BOARD_X + ARENA_W - band, BOARD_Y, band, ARENA_H, zeroCol, vigCol, false);
+        screenFb.strokeRoundRect(BOARD_X + 2, BOARD_Y + 2, ARENA_W - 4, ARENA_H - 4, 4, 6, [255, 45, 175, vigA]);
+      }
+
+      renderGlobalMinimapAndTelemetry(screenFb, simRender, atlas, frameIdx);
 
       // 10. 减员危机红框脉冲
       if (simRender.alarmFlash > 0.05) {
         const a = clamp(Math.round(simRender.alarmFlash * 110), 0, 125);
-        fb.strokeRoundRect(BOARD_X, BOARD_Y, ARENA_W, ARENA_H, 4, 5, [255, 42, 58, a]);
+        screenFb.strokeRoundRect(BOARD_X, BOARD_Y, ARENA_W, ARENA_H, 4, 5, [255, 42, 58, a]);
       }
 
-      // 11. 顶部纯视觉零文字解说「红绿阵营实时战力拉锯条 + 极简数字计数 HUD」
+      // 11. 顶部纯图形符号零文字解说「红绿阵营实时战力拉锯条 + 矢量阵营徽标 + 泰坦菱形指示灯 + 数字计数 HUD」
       const barX = BOARD_X;
       const barY = 92;
       const barW = ARENA_W;
@@ -2574,8 +3894,8 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
             ? clamp(greenPower / Math.max(1, greenPower + redPower), 0.10, 0.92)
             : 1.0;
 
-      fb.blendRoundRect(barX, barY, barW, barH, 12, [22, 26, 36, 240]);
-      fb.blendRoundRect(barX, barY, barW, barH, 12, [215, 38, 58, 225]);
+      screenFb.blendRoundRect(barX, barY, barW, barH, 12, [22, 26, 36, 240]);
+      screenFb.blendRoundRect(barX, barY, barW, barH, 12, [215, 38, 58, 225]);
       const greenW = Math.round(barW * tugFrac);
       const barCol: RGBA =
         tugFrac < 0.28
@@ -2584,10 +3904,10 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
             ? [255, 195, 45, 255]
             : [42, 225, 132, 255];
       if (greenW > 0) {
-        fb.blendRoundRect(barX, barY, greenW, barH, 12, barCol);
-        fb.fillRect(barX + greenW - 2, barY - 4, 4, barH + 8, [255, 255, 255, 255]);
+        screenFb.blendRoundRect(barX, barY, greenW, barH, 12, barCol);
+        screenFb.fillRect(barX + greenW - 2, barY - 5, 4, barH + 10, [255, 255, 255, 255]);
       }
-      fb.strokeRoundRect(barX, barY, barW, barH, 12, 2, [85, 98, 128, 200]);
+      screenFb.strokeRoundRect(barX, barY, barW, barH, 12, 2, [85, 98, 128, 200]);
 
       const squadCol: RGBA =
         totalHumans === 0
@@ -2598,31 +3918,60 @@ export async function renderSiegeVideo(opts: SiegeRenderOptions): Promise<SiegeR
               ? [255, 220, 75, 255]
               : [80, 245, 155, 255];
 
-      fb.fillCircle(barX + 14, 154, 8, squadCol);
+      // 左侧矢量人类战术头盔/护目镜徽标 + 幸存兵力数字
+      const gIconX = barX + 18;
+      const gIconY = 154;
+      screenFb.fillCircle(gIconX, gIconY, 12, [14, 34, 26, 245]);
+      screenFb.fillCircle(gIconX, gIconY, 10, squadCol);
+      screenFb.drawLine(gIconX - 6, gIconY - 1, gIconX + 6, gIconY - 1, 3.0, [225, 255, 255, 255]);
       atlas.drawStyled(
-        fb,
+        screenFb,
         `${totalHumans}`,
-        barX + 32,
+        barX + 40,
         158,
         squadCol,
-        0.42,
+        0.44,
         "left",
         { outlineWidth: 2.8, outlineColor: [8, 10, 16, 240] },
       );
 
-      fb.fillCircle(barX + barW - 14, 154, 8, [245, 52, 72, 255]);
+      // 中央 4 枚泰坦 Boss 菱形进度指示灯（纯图形化提示已击杀/存活 Boss 数，零文字）
+      const pipCenterX = OUT_W * 0.5;
+      const pipY = 154;
+      for (let bIdx = 0; bIdx < simRender.totalBosses; bIdx++) {
+        const px = pipCenterX + (bIdx - (simRender.totalBosses - 1) * 0.5) * 28;
+        const killed = bIdx < simRender.bossesKilled;
+        const spawned = bIdx < simRender.bossesSpawned;
+        const pipCol: RGBA = killed
+          ? [65, 245, 155, 235]
+          : spawned
+            ? [255, 65, 85, 255]
+            : [85, 96, 118, 165];
+        if (spawned && !killed) {
+          screenFb.drawGlowCircle(px, pipY, 13, [255, 45, 65, 135]);
+        }
+        drawPolygonLines(screenFb, px, pipY, 7.5, 4, 0, 2.2, pipCol, !killed);
+      }
+
+      // 右侧矢量尸潮利爪生物徽标 + 实时丧尸总数
+      const rIconX = barX + barW - 18;
+      const rIconY = 154;
+      screenFb.fillCircle(rIconX, rIconY, 12, [36, 10, 18, 245]);
+      screenFb.fillCircle(rIconX, rIconY, 10, [245, 45, 68, 255]);
+      screenFb.fillCircle(rIconX - 3.5, rIconY - 1, 2.2, [255, 240, 110, 255]);
+      screenFb.fillCircle(rIconX + 3.5, rIconY - 1, 2.2, [255, 240, 110, 255]);
       atlas.drawStyled(
-        fb,
+        screenFb,
         `${simRender.reds.length}`,
-        barX + barW - 32,
+        barX + barW - 40,
         158,
         [255, 110, 125, 255],
-        0.42,
+        0.44,
         "right",
         { outlineWidth: 2.8, outlineColor: [8, 10, 16, 240] },
       );
 
-      yield fb;
+      yield screenFb;
     }
   }
 

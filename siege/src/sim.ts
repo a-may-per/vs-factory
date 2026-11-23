@@ -8,10 +8,14 @@ import {
   getCorridorBounds,
   getOuterWallSegments,
   getDeadCornerWalls,
+  getArchZones,
+  getInteriorProps,
   getSquadWaypoints,
+  getTacticalNodeSpecs,
   isDarkDeadCornerMode,
   SIEGE_MAPS,
   SIEGE_MODE_META,
+  type InteriorPropSpec,
   type SiegeMapId,
   type SiegeModeId,
   type SiegeMapConfig,
@@ -55,6 +59,12 @@ export interface RedDot {
   frenzyTimer?: number;
   /** 新变异枪兵破茧缓冲帧 */
   spawnGraceTicks?: number;
+  /** 拐角盲区埋伏怪标记（在小队抵近 90° 盲区拐角前潜伏在阴影墙后，切角瞬间暴起扑杀！） */
+  cornerAmbush?: boolean;
+  /** 士兵被感染瞬间原地抽搐尸变帧数 (24 ticks = 0.40s 等身自然尸变演出) */
+  mutatingTicks?: number;
+  /** 声呐超声波扫过墙后暗处丧尸时点亮的青色声呐回波余晖帧数 */
+  sonarPingTicks?: number;
 }
 
 export interface GreenUnit {
@@ -100,6 +110,8 @@ export interface TacticalNodeState extends TacticalNodeSpec {
   ghostHp: number;
   broken: boolean;
   hitFlash: number;
+  breachProgress: number;
+  openAnim: number;
 }
 
 export interface MotherHiveState {
@@ -122,9 +134,11 @@ export interface StraightFiringLine {
   y1: number;
   x2: number;
   y2: number;
-  role: GreenRole;
+  role?: GreenRole;
+  heavy?: boolean;
+  corrupted?: boolean;
   hitKind: "boss" | "hive" | "node" | "minion" | "wall";
-  buffed: boolean;
+  buffed?: boolean;
 }
 
 export interface BulletSpark {
@@ -165,11 +179,63 @@ export interface FloatingBanner {
 }
 
 export interface PersistentDecalEvent {
-  kind: "blood" | "boss_blood" | "scorch" | "crystals";
+  kind: "blood" | "boss_blood" | "scorch" | "crystals" | "tire";
   x: number;
   y: number;
   r: number;
   seed: number;
+}
+
+export interface RocketProjectile {
+  x: number;
+  y: number;
+  prevX: number;
+  prevY: number;
+  vx: number;
+  vy: number;
+  targetX: number;
+  targetY: number;
+  ttl: number;
+}
+
+export interface ShellCasing {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  rot: number;
+  vrot: number;
+  ttl: number;
+  maxTtl: number;
+  heavy: boolean;
+}
+
+export interface DestructiblePropState extends InteriorPropSpec {
+  id: number;
+  hp: number;
+  maxHp: number;
+  intact: boolean;
+  indestructible: boolean;
+  blocksBulletsFull: boolean;
+  hitFlash: number;
+  shakeX: number;
+  shakeY: number;
+  material: "glass" | "wood" | "metal" | "fabric" | "stone";
+}
+
+export interface DebrisShard {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  rot: number;
+  vrot: number;
+  len: number;
+  wid: number;
+  color: [number, number, number, number];
+  ttl: number;
+  maxTtl: number;
+  shape: "plank" | "glass" | "box";
 }
 
 export interface SiegeAudioEvent {
@@ -183,9 +249,19 @@ export interface SiegeAudioEvent {
     | "adrenaline"
     | "reload"
     | "kill-pop"
-    | "hive-blast";
+    | "hive-blast"
+    | "bus-brake"
+    | "rocket-launch"
+    | "rocket-blast"
+    | "ram-hit"
+    | "infect-bite"
+    | "glass-break"
+    | "prop-smash"
+    | "sonar-ping"
+    | "power-down";
   gain: number;
   pitch: number;
+  pan: number;
 }
 
 export interface CalloutState {
@@ -277,7 +353,9 @@ export class SiegeSimulator {
   readonly maxTicks: number;
   private readonly rng: () => number;
 
-  readonly isDarkMode: boolean;
+  get isDarkMode(): boolean {
+    return this.mode === "sonar" || (this.mode === "blackout" && this.blackoutActive);
+  }
   readonly outerWalls: WallSegment[];
   readonly deadCornerWalls: WallSegment[];
   readonly waypoints: Array<{ x: number; y: number }>;
@@ -286,11 +364,19 @@ export class SiegeSimulator {
   squadPathDist = 0;
   lightCones: LightConeSpec[] = [];
   blackoutActive = false;
+  /** 地铁站通电荧光亮度 (1.0=全亮正常供电 -> 10.4~11.6s 短路电弧频闪 -> 0.0=拉闸断电陷入自然战争迷雾) */
+  metroPowerLevel = 1.0;
   sonarAwakened = false;
+  private hiveHallEnteredSec = -1;
 
-  // 2D 动态平滑跟随镜头左上角世界坐标 (camX, camY) 与小地图已探索网格
+  // 2D 动态平滑跟随镜头左上角世界坐标 (camX, camY)、动态战术变焦倍率 (camZoom)、感染红紫警示脉冲 (infectionFlash) 与微震屏冲击量 (camTrauma)
   camX = 0;
   camY = 0;
+  camZoom = 2.05;
+  infectionFlash = 0;
+  camTrauma = 0;
+  camShakeX = 0;
+  camShakeY = 0;
   squadMoveAngle = -Math.PI * 0.5;
   readonly navBlocked = new Uint8Array(NAV_COLS * NAV_ROWS);
   readonly navDist = new Int16Array(NAV_COLS * NAV_ROWS);
@@ -302,11 +388,19 @@ export class SiegeSimulator {
   reds: RedDot[] = [];
   greens: GreenUnit[] = [];
   nodes: TacticalNodeState[] = [];
+  props: DestructiblePropState[] = [];
+  pillars: Array<{ x: number; y: number; w: number; h: number }> = [];
+  pits: Array<{ x: number; y: number; w: number; h: number }> = [];
+  debris: DebrisShard[] = [];
+  propsDestroyed = 0;
+  private navObstaclesDirty = false;
   hive: MotherHiveState;
   firingLines: StraightFiringLine[] = [];
   sparks: BulletSpark[] = [];
   rings: ShockRing[] = [];
   banners: FloatingBanner[] = [];
+  rockets: RocketProjectile[] = [];
+  shells: ShellCasing[] = [];
   pendingDecals: PersistentDecalEvent[] = [];
   audioEvents: SiegeAudioEvent[] = [];
 
@@ -361,7 +455,6 @@ export class SiegeSimulator {
     this.seed = seed;
     this.map = SIEGE_MAPS[mapId] ?? SIEGE_MAPS["canyon-bridge"];
     this.mode = modeId;
-    this.isDarkMode = isDarkDeadCornerMode(modeId);
     this.outerWalls = getOuterWallSegments(modeId);
     this.deadCornerWalls = getDeadCornerWalls(modeId);
     this.waypoints = getSquadWaypoints(modeId);
@@ -381,7 +474,8 @@ export class SiegeSimulator {
     this.rng = mulberry32(seed);
     this.totalBosses = this.map.bossWaves.length;
 
-    // 0. 构建大世界科学寻路障碍网格
+    // 0. 初始化可破坏室内家具刚体、混凝土柱网、天井坑洞与科学寻路障碍网格
+    this.initPropsAndZones();
     this.initNavObstacles();
 
     // 1. 初始化北部【丧尸母巢核心】
@@ -451,9 +545,39 @@ export class SiegeSimulator {
       }
       this.squadCenterX = 900;
       this.squadCenterY = 2850;
-    } else if (this.mode === "blackout" || this.mode === "sonar") {
-      // 黑鹰武装直升机 / 声呐潜行直升机：先从 y=2890 低空推进至 y=2560 用双翼加特林机炮+破片火箭弹扫射清空第一波前哨尸潮，再悬停索降 6 名特战队员！
-      const lzX = this.mode === "sonar" ? 885 : 900;
+    } else if (this.mode === "sonar") {
+      // 声呐潜行模式：双机编队黑鹰潜行武装直升机并排从溶洞南口低空突入扫射，随后悬停双侧索降各 3 名特战队员！
+      for (const [id, lzX, rotOff] of [
+        [1, 770, 0],
+        [2, 1030, 1.1],
+      ] as const) {
+        this.vehicles.push({
+          id,
+          kind: "helicopter",
+          x: lzX,
+          y: 2890,
+          startX: lzX,
+          startY: 2890,
+          stopX: lzX,
+          stopY: 2560,
+          angle: -Math.PI * 0.5,
+          turretAngle: -Math.PI * 0.5,
+          muzzleFlash: 0,
+          rotorAngle: rotOff,
+          doorOpen: 0,
+          ropeDrop: 0,
+          headlightsOn: true,
+          phase: "inbound",
+          subSquad: 0,
+          deployedCount: 0,
+          totalToDeploy: 3,
+        });
+      }
+      this.squadCenterX = 900;
+      this.squadCenterY = 2850;
+    } else if (this.mode === "blackout") {
+      // 重装黑鹰武装直升机：先从 y=2890 低空推进至 y=2560 用双翼加特林机炮+破片火箭弹扫射清空第一波前哨尸潮，再悬停索降 6 名特战队员！
+      const lzX = 900;
       const lzY = 2560;
       this.vehicles.push({
         id: 1,
@@ -592,22 +716,48 @@ export class SiegeSimulator {
             this.squadCenterY = v.y - 25;
           }
 
-          // 车头 V 型破障撞角物理碾压撞击判定
+          // 持久化烘焙重型装甲大巴双排加宽防爆轮胎压痕
+          if (this.tick % 3 === 0) {
+            this.pendingDecals.push({ kind: "tire", x: v.x, y: v.y + 52, r: 24, seed: v.id });
+          }
+
+          // 重型车头 V 型液压破障铲物理碾压撞击判定
+          let rammedAny = false;
           for (let ri = this.reds.length - 1; ri >= 0; ri--) {
             const r = this.reds[ri];
             if (r.kind === "boss") continue;
-            if (Math.abs(r.x - v.x) <= r.r + 34 && r.y >= v.y - 68 && r.y <= v.y + 50) {
+            if (Math.abs(r.x - v.x) <= r.r + 46 && r.y >= v.y - 90 && r.y <= v.y + 66) {
               this.rings.push({ x: r.x, y: r.y, maxR: 42, ttl: 10, maxTtl: 10, kind: "casualty" });
               this.pendingDecals.push({ kind: "blood", x: r.x, y: r.y, r: 15, seed: r.id });
               this.spawnImpactParticles(r.x, r.y, 0, -1, "blood", 5);
               this.spawnImpactParticles(r.x, r.y, 0, -1, "spark", 4);
               this.killRedDot(ri, tSec);
+              rammedAny = true;
+            }
+          }
+          if (rammedAny) {
+            this.addTrauma(0.18);
+            this.emitAudio("ram-hit", 0.55, 0.92 + ((this.tick % 5) * 0.04), v.x);
+          }
+
+          // 重型装甲大巴车头破障撞碎沿途玻璃展柜与散落手推车/行李箱！
+          for (let pi = 0; pi < this.props.length; pi++) {
+            const prop = this.props[pi];
+            if (!prop.intact || prop.indestructible) continue;
+            const cx = clamp(v.x, prop.x, prop.x + prop.w);
+            const cy = clamp(v.y - 20, prop.y, prop.y + prop.h);
+            if (Math.abs(cx - v.x) <= 46 && cy >= v.y - 92 && cy <= v.y + 62) {
+              this.damageProp(prop, 999, 0, -1);
             }
           }
 
           this.fireVehicleWeapons(v, tSec);
-        } else {
-          // 阶段 2 & 3：推进一波攻击扫平前哨尸潮后，大巴急刹停稳 (y=2560)，液压装甲门展开，车内士兵依次下车突击！
+        } else if (tSec < 4.95) {
+          // 阶段 2：推进一波攻击扫平前哨尸潮后，大巴急刹停稳 (y=2560)，液压气动刹车泄压声，装甲门展开，车内士兵依次下车突击！
+          if (this.tick === Math.round(3.2 * SIM_HZ) && v.id === 1) {
+            this.emitAudio("bus-brake", 0.72, 1.0, v.x);
+            this.addTrauma(0.16);
+          }
           v.x = v.stopX;
           v.y = v.stopY;
           v.doorOpen = clamp((tSec - 3.2) / 0.25, 0.2, 1.0);
@@ -616,7 +766,9 @@ export class SiegeSimulator {
           if (tSec < 4.25) {
             this.clearEntranceStragglers(v);
           }
-          this.fireVehicleWeapons(v, tSec);
+          if (tSec < 4.55) {
+            this.fireVehicleWeapons(v, tSec);
+          }
 
           if (this.mode === "maze-infect") {
             const targetDeployed = Math.min(
@@ -647,6 +799,16 @@ export class SiegeSimulator {
               v.deployedCount++;
             }
           }
+        } else if (tSec < 6.85) {
+          // 阶段 3：全员投送完毕，装甲车门收回，亮起倒车警示灯平稳倒车撤出后方战区，让出完整视野
+          v.phase = "departing";
+          v.doorOpen = Math.max(0, 1 - (tSec - 4.95) * 3.5);
+          const revP = clamp((tSec - 4.95) / 1.9, 0, 1);
+          v.y = v.stopY + revP * revP * 380;
+          v.turretAngle = -Math.PI * 0.5;
+        } else {
+          v.phase = "gone";
+          v.headlightsOn = false;
         }
       }
     }
@@ -731,10 +893,23 @@ export class SiegeSimulator {
 
       let bestDist = Math.min(maxRange, aimDist + 10);
       let hitRedIdx = bestIdx;
+      let hitPropIdx = -1;
       const dWall = this.castRayToWalls(mx, my, ux, uy, bestDist);
       if (dWall < bestDist) {
         bestDist = dWall;
         hitRedIdx = -1;
+      }
+
+      for (let pi = 0; pi < this.props.length; pi++) {
+        const prop = this.props[pi];
+        if (!prop.intact) continue;
+        if (!prop.blocksBulletsFull && (this.tick + mi + prop.id) % 3 !== 0) continue;
+        const tProp = this.rayRectDist(mx, my, ux, uy, bestDist, prop.x, prop.y, prop.w, prop.h);
+        if (tProp < bestDist) {
+          bestDist = tProp;
+          hitPropIdx = pi;
+          hitRedIdx = -1;
+        }
       }
 
       for (let ri = 0; ri < this.reds.length; ri++) {
@@ -751,6 +926,7 @@ export class SiegeSimulator {
           if (tHit < bestDist) {
             bestDist = tHit;
             hitRedIdx = ri;
+            hitPropIdx = -1;
           }
         }
       }
@@ -767,7 +943,13 @@ export class SiegeSimulator {
       });
       firedAny = true;
 
-      if (hitRedIdx >= 0 && this.reds[hitRedIdx]) {
+      if (mi === 0 && this.tick % 2 === 0) {
+        this.spawnShellCasing(mx, my, ux, uy, true);
+      }
+
+      if (hitPropIdx >= 0 && this.props[hitPropIdx]) {
+        this.damageProp(this.props[hitPropIdx], m.dmg * 2.8, ux, uy);
+      } else if (hitRedIdx >= 0 && this.reds[hitRedIdx]) {
         const hitR = this.reds[hitRedIdx];
         hitR.hp -= m.dmg;
         hitR.hitFlash = 1.0;
@@ -780,88 +962,361 @@ export class SiegeSimulator {
       }
     }
 
-    // 直升机在低空突进阶段 (t < 3.1s) 每隔 28 帧发射一枚机载破片火箭弹轰炸前排尸群
-    if (v.kind === "helicopter" && tSec >= 0.45 && tSec <= 3.1 && this.tick % 28 === 10) {
+    // 直升机在低空突进阶段 (t < 3.0s) 交替从左右短翼火箭巢发射可见高速破片火箭弹 (RocketProjectile)！
+    if (v.kind === "helicopter" && tSec >= 0.32 && tSec <= 2.98 && this.tick % 20 === 8) {
       let clusterIdx = -1;
       let minD = Infinity;
       for (let ri = 0; ri < this.reds.length; ri++) {
         const r = this.reds[ri];
         const d = Math.hypot(r.x - v.x, r.y - v.y);
-        if (r.y >= 2410 && d < 340 && d < minD) {
+        if (r.y >= 2390 && d > 55 && d < 345 && d < minD) {
           minD = d;
           clusterIdx = ri;
         }
       }
       if (clusterIdx >= 0) {
         const c = this.reds[clusterIdx];
-        const rx = c.x;
-        const ry = c.y;
-        this.rings.push({ x: rx, y: ry, maxR: 72, ttl: 16, maxTtl: 16, kind: "hive-kill" });
-        this.pendingDecals.push({ kind: "scorch", x: rx, y: ry, r: 22, seed: this.tick });
-        this.spawnImpactParticles(rx, ry, 0, -1, "gold", 8);
-        this.emitAudio("heavy-mg", 0.55, 0.78);
-        for (let ri = this.reds.length - 1; ri >= 0; ri--) {
-          const r = this.reds[ri];
-          if (r.kind !== "boss" && Math.hypot(r.x - rx, r.y - ry) <= 56) {
-            r.hp -= 95;
-            r.hitFlash = 1.0;
-            if (r.hp <= 0) {
-              this.killRedDot(ri, tSec);
-            }
-          }
-        }
+        const podSide = this.tick % 40 < 20 ? -1 : 1;
+        const sx = v.x + podSide * 28;
+        const sy = v.y - 10;
+        const dx = c.x - sx;
+        const dy = c.y - sy;
+        const dist = Math.hypot(dx, dy) || 1;
+        const spd = 19.5;
+        const ttl = Math.max(2, Math.min(22, Math.round(dist / spd)));
+        this.rockets.push({
+          x: sx,
+          y: sy,
+          prevX: sx,
+          prevY: sy,
+          vx: (dx / dist) * spd,
+          vy: (dy / dist) * spd,
+          targetX: c.x,
+          targetY: c.y,
+          ttl,
+        });
+        this.emitAudio("rocket-launch", 0.52, 0.95 + podSide * 0.05, sx);
       }
     }
 
     if (firedAny) {
       v.muzzleFlash = 1.0;
       if (this.tick % 4 === 0) {
-        this.emitAudio("heavy-mg", 0.28, 0.88 + this.rng() * 0.14);
+        this.emitAudio("heavy-mg", 0.30, 0.88 + this.rng() * 0.14, v.x);
       }
     }
   }
 
-  private initTacticalNodes(): void {
-    const specs: TacticalNodeSpec[] = [];
-    if (this.mode === "scavenge") {
-      specs.push(
-        { id: "n1", kind: "rescue_cage", label: "+6", subLabel: "", x: 520, y: 2315, r: 26, hp: 195, rewardValue: 6, rewardRole: "rifle" },
-        { id: "n2", kind: "multiply_crystal", label: "×2", subLabel: "", x: 1280, y: 1595, r: 26, hp: 235, rewardValue: 2 },
-        { id: "n3", kind: "rescue_cage", label: "+7", subLabel: "", x: 520, y: 925, r: 26, hp: 275, rewardValue: 7, rewardRole: "sniper" },
-      );
-    } else if (this.mode === "blackout") {
-      specs.push(
-        { id: "n1", kind: "bunker_pad", label: "+2", subLabel: "", x: 540, y: 2130, r: 26, hp: 195, rewardValue: 5, rewardRole: "turret" },
-        { id: "n2", kind: "multiply_crystal", label: "×2", subLabel: "", x: 1220, y: 1050, r: 26, hp: 235, rewardValue: 2 },
-        { id: "n3", kind: "rescue_cage", label: "+7", subLabel: "", x: 900, y: 650, r: 26, hp: 275, rewardValue: 7, rewardRole: "sniper" },
-      );
-    } else if (this.mode === "sonar") {
-      specs.push(
-        { id: "n1", kind: "rescue_cage", label: "+6", subLabel: "", x: 530, y: 2210, r: 26, hp: 195, rewardValue: 6, rewardRole: "rifle" },
-        { id: "n2", kind: "multiply_crystal", label: "×2", subLabel: "", x: 1250, y: 1540, r: 26, hp: 235, rewardValue: 2 },
-        { id: "n3", kind: "rescue_cage", label: "+7", subLabel: "", x: 540, y: 880, r: 26, hp: 275, rewardValue: 7, rewardRole: "sniper" },
-      );
-    } else if (this.mode === "maze-infect") {
-      specs.push(
-        { id: "n1", kind: "rescue_cage", label: "+6", subLabel: "", x: 640, y: 1520, r: 26, hp: 195, rewardValue: 6, rewardRole: "rifle" },
-        { id: "n2", kind: "multiply_crystal", label: "×2", subLabel: "", x: 1160, y: 1380, r: 26, hp: 235, rewardValue: 2 },
-        { id: "n3", kind: "rescue_cage", label: "+7", subLabel: "", x: 580, y: 840, r: 26, hp: 275, rewardValue: 7, rewardRole: "sniper" },
-      );
-    } else {
-      specs.push(
-        { id: "n1", kind: "rescue_cage", label: "+6", subLabel: "", x: 780, y: 2150, r: 26, hp: 260, rewardValue: 6, rewardRole: "rifle" },
-        { id: "n2", kind: "multiply_crystal", label: "×2", subLabel: "", x: 1020, y: 1480, r: 26, hp: 320, rewardValue: 2 },
-        { id: "n3", kind: "rescue_cage", label: "+7", subLabel: "", x: 780, y: 860, r: 26, hp: 380, rewardValue: 7, rewardRole: "sniper" },
-      );
+  private initPropsAndZones(): void {
+    const zones = getArchZones(this.mode);
+    this.pillars = [];
+    this.pits = [];
+    for (const z of zones) {
+      if (z.kind === "pillar") {
+        this.pillars.push({ x: z.x, y: z.y, w: z.w, h: z.h });
+      } else if (z.kind === "atrium_pit") {
+        this.pits.push({ x: z.x, y: z.y, w: z.w, h: z.h });
+      }
     }
 
-    this.nodes = specs.map(s => ({
-      ...s,
-      maxHp: s.hp,
-      ghostHp: s.hp,
-      broken: false,
-      hitFlash: 0,
-    }));
+    const rawProps = getInteriorProps(this.mode);
+    this.props = rawProps.map((p, idx) => {
+      const indestructible =
+        p.kind === "subway_train" || p.kind === "mri_scanner" || p.kind === "transformer";
+      const hp = indestructible
+        ? 999999
+        : p.kind === "glass_window"
+          ? 24
+          : p.kind === "cart_clutter"
+            ? 34
+            : p.kind === "clothes_rack"
+              ? 44
+              : p.kind === "round_table"
+                ? 56
+                : p.kind === "seat_row" || p.kind === "cinema_seats" || p.kind === "turnstile_row"
+                  ? 66
+                  : p.kind === "vending"
+                    ? 74
+                    : p.kind === "booth_table" || p.kind === "sofa_l" || p.kind === "hospital_bed"
+                      ? 80
+                      : p.kind === "planter" || p.kind === "surgical_set" || p.kind === "checkout"
+                        ? 94
+                        : 115;
+      const blocksBulletsFull =
+        indestructible ||
+        p.kind === "glass_window" ||
+        p.kind === "shelf_aisle" ||
+        p.kind === "vending";
+      const material: DestructiblePropState["material"] =
+        p.kind === "glass_window"
+          ? "glass"
+          : p.kind === "round_table" || p.kind === "booth_table" || p.kind === "checkout" || p.kind === "sofa_l"
+            ? "wood"
+            : p.kind === "planter"
+              ? "stone"
+              : p.kind === "hospital_bed" || p.kind === "clothes_rack" || p.kind === "cinema_seats"
+                ? "fabric"
+                : "metal";
+      return {
+        ...p,
+        id: idx + 1,
+        hp,
+        maxHp: hp,
+        intact: true,
+        indestructible,
+        blocksBulletsFull,
+        hitFlash: 0,
+        shakeX: 0,
+        shakeY: 0,
+        material,
+      };
+    });
+  }
+
+  rayRectDist(
+    ox: number,
+    oy: number,
+    ux: number,
+    uy: number,
+    maxDist: number,
+    rx: number,
+    ry: number,
+    rw: number,
+    rh: number,
+  ): number {
+    const invX = Math.abs(ux) > 1e-6 ? 1 / ux : ux >= 0 ? 1e9 : -1e9;
+    const invY = Math.abs(uy) > 1e-6 ? 1 / uy : uy >= 0 ? 1e9 : -1e9;
+    const tx1 = (rx - ox) * invX;
+    const tx2 = (rx + rw - ox) * invX;
+    const ty1 = (ry - oy) * invY;
+    const ty2 = (ry + rh - oy) * invY;
+    const tmin = Math.max(Math.min(tx1, tx2), Math.min(ty1, ty2));
+    const tmax = Math.min(Math.max(tx1, tx2), Math.max(ty1, ty2));
+    if (tmax < 1.0 || tmin > tmax || tmin >= maxDist) return maxDist;
+    return tmin >= 1.0 ? tmin : maxDist;
+  }
+
+  private resolveCircleRect(
+    dot: { x: number; y: number; r: number },
+    rx: number,
+    ry: number,
+    rw: number,
+    rh: number,
+    pad = 1.2,
+  ): boolean {
+    const minR = dot.r + pad;
+    const cx = clamp(dot.x, rx, rx + rw);
+    const cy = clamp(dot.y, ry, ry + rh);
+    const dx = dot.x - cx;
+    const dy = dot.y - cy;
+    const d2 = dx * dx + dy * dy;
+    if (d2 >= minR * minR) return false;
+
+    if (d2 > 0.0001) {
+      const d = Math.sqrt(d2);
+      const push = minR - d;
+      dot.x += (dx / d) * push;
+      dot.y += (dy / d) * push;
+    } else {
+      const dLeft = dot.x - rx;
+      const dRight = rx + rw - dot.x;
+      const dTop = dot.y - ry;
+      const dBot = ry + rh - dot.y;
+      const m = Math.min(dLeft, dRight, dTop, dBot);
+      if (m === dLeft) dot.x = rx - minR;
+      else if (m === dRight) dot.x = rx + rw + minR;
+      else if (m === dTop) dot.y = ry - minR;
+      else dot.y = ry + rh + minR;
+    }
+    return true;
+  }
+
+  isPointInsideObstacle(x: number, y: number, pad = 10): boolean {
+    for (let i = 0; i < this.pillars.length; i++) {
+      const pl = this.pillars[i];
+      if (x > pl.x - pad && x < pl.x + pl.w + pad && y > pl.y - pad && y < pl.y + pl.h + pad) {
+        return true;
+      }
+    }
+    for (let i = 0; i < this.pits.length; i++) {
+      const pt = this.pits[i];
+      if (x > pt.x - pad && x < pt.x + pt.w + pad && y > pt.y - pad && y < pt.y + pt.h + pad) {
+        return true;
+      }
+    }
+    for (let i = 0; i < this.props.length; i++) {
+      const pr = this.props[i];
+      if (!pr.intact) continue;
+      if (x > pr.x - pad && x < pr.x + pr.w + pad && y > pr.y - pad && y < pr.y + pr.h + pad) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private resolvePropAndPillarCollisions(
+    dot: { x: number; y: number; r: number },
+    bashDmg: number,
+    dirX: number,
+    dirY: number,
+  ): void {
+    for (let i = 0; i < this.pillars.length; i++) {
+      const pl = this.pillars[i];
+      this.resolveCircleRect(dot, pl.x, pl.y, pl.w, pl.h, 1.4);
+    }
+    for (let i = 0; i < this.props.length; i++) {
+      const pr = this.props[i];
+      if (!pr.intact) continue;
+      const touched = this.resolveCircleRect(dot, pr.x, pr.y, pr.w, pr.h, 1.2);
+      if (touched && bashDmg > 0 && !pr.indestructible) {
+        this.damageProp(pr, bashDmg, dirX, dirY);
+      }
+    }
+  }
+
+  damageProp(prop: DestructiblePropState, dmg: number, ux: number, uy: number): void {
+    if (!prop.intact) return;
+    const cx = prop.x + prop.w * 0.5;
+    const cy = prop.y + prop.h * 0.5;
+    if (prop.indestructible) {
+      if (this.tick % 4 === 0) {
+        this.spawnImpactParticles(cx, cy, ux, uy, "spark", 1);
+      }
+      return;
+    }
+
+    prop.hp -= dmg;
+    prop.hitFlash = 1.0;
+    const h1 = ((this.tick * 53 + prop.id * 31) % 100) / 50 - 1;
+    const h2 = ((this.tick * 29 + prop.id * 17) % 100) / 50 - 1;
+    prop.shakeX = h1 * 2.8;
+    prop.shakeY = h2 * 2.8;
+
+    // 受击即时崩飞细小木屑/玻璃碴/火花
+    if (this.debris.length < 180 && this.tick % 2 === 0) {
+      this.spawnPropDebris(prop, ux, uy, 2);
+    }
+
+    if (prop.hp <= 0) {
+      prop.intact = false;
+      prop.hp = 0;
+      prop.shakeX = 0;
+      prop.shakeY = 0;
+      this.propsDestroyed++;
+      this.navObstaclesDirty = true;
+
+      this.addTrauma(prop.material === "glass" ? 0.14 : 0.22);
+      this.emitAudio(
+        prop.material === "glass" ? "glass-break" : "prop-smash",
+        prop.material === "glass" ? 0.78 : 0.74,
+        0.92 + ((prop.id % 5) * 0.05),
+        cx,
+      );
+      if (prop.kind === "vending") {
+        this.rings.push({ x: cx, y: cy, maxR: 48, ttl: 14, maxTtl: 14, kind: "sonar" });
+        this.spawnImpactParticles(cx, cy, ux, uy, "spark", 8);
+      } else if (prop.material === "glass") {
+        this.rings.push({ x: cx, y: cy, maxR: 42, ttl: 10, maxTtl: 10, kind: "rescue" });
+      }
+      this.spawnPropDebris(prop, ux, uy, prop.material === "glass" ? 16 : 13);
+    }
+  }
+
+  private spawnPropDebris(prop: DestructiblePropState, ux: number, uy: number, count: number): void {
+    const baseAng = Math.atan2(uy || -1, ux || 0);
+    for (let k = 0; k < count; k++) {
+      if (this.debris.length >= 220) break;
+      const hA = ((this.tick * 37 + prop.id * 23 + k * 41) % 100) / 100;
+      const hB = ((this.tick * 19 + prop.id * 59 + k * 71) % 100) / 100;
+      const hC = ((this.tick * 83 + prop.id * 13 + k * 29) % 100) / 100;
+      const sx = prop.x + hA * prop.w;
+      const sy = prop.y + hB * prop.h;
+      const ang = baseAng + (hC - 0.5) * 2.8;
+      const spd = 1.6 + hA * 4.2;
+      let col: [number, number, number, number] = [138, 102, 64, 245];
+      let shape: DebrisShard["shape"] = "plank";
+      let len = 8 + hB * 7;
+      let wid = 2.6;
+
+      if (prop.material === "glass") {
+        col = k % 2 === 0 ? [185, 240, 255, 240] : [115, 205, 245, 225];
+        shape = "glass";
+        len = 6 + hB * 6;
+        wid = 2.2;
+      } else if (prop.kind === "shelf_aisle" || prop.kind === "vending") {
+        const goodsPalette: Array<[number, number, number, number]> = [
+          [225, 68, 58, 245],
+          [65, 165, 235, 245],
+          [235, 185, 52, 245],
+          [72, 195, 122, 245],
+          [148, 162, 178, 245],
+        ];
+        col = goodsPalette[k % goodsPalette.length];
+        shape = k % 3 === 0 ? "plank" : "box";
+        len = 5 + hB * 4;
+        wid = 4.2;
+      } else if (prop.material === "wood") {
+        col =
+          prop.kind === "round_table" && k % 5 === 0
+            ? [225, 232, 240, 245] // 摔碎的白色瓷餐盘碎片！
+            : k % 2 === 0
+              ? [142, 98, 58, 248]
+              : [98, 66, 40, 245];
+        shape = "plank";
+        len = 8 + hB * 7;
+        wid = 2.8;
+      } else if (prop.material === "stone") {
+        col = k % 2 === 0 ? [56, 162, 88, 245] : [118, 126, 138, 245];
+        shape = k % 2 === 0 ? "plank" : "box";
+        len = 7 + hB * 5;
+        wid = 3.2;
+      } else if (prop.material === "fabric") {
+        col = k % 2 === 0 ? [195, 212, 230, 240] : [85, 138, 182, 240];
+        shape = "box";
+        len = 6 + hB * 5;
+        wid = 3.6;
+      } else {
+        col = k % 2 === 0 ? [142, 156, 175, 245] : [88, 98, 114, 245];
+        shape = "plank";
+        len = 8 + hB * 6;
+        wid = 2.5;
+      }
+
+      const ttl = 18 + Math.floor(hC * 16);
+      this.debris.push({
+        x: sx,
+        y: sy,
+        vx: Math.cos(ang) * spd,
+        vy: Math.sin(ang) * spd,
+        rot: hA * Math.PI * 2,
+        vrot: (hB >= 0.5 ? 1 : -1) * (0.22 + hC * 0.36),
+        len,
+        wid,
+        color: col,
+        ttl,
+        maxTtl: ttl,
+        shape,
+      });
+    }
+  }
+
+  private initTacticalNodes(): void {
+    const specs = getTacticalNodeSpecs(this.mode);
+    this.nodes = specs.map(s => {
+      const clean = this.sanitizeSpawnPoint(s.x, s.y, s.r + 2);
+      return {
+        ...s,
+        x: clean.x,
+        y: clean.y,
+        rot: s.rot ?? 0,
+        maxHp: s.hp,
+        ghostHp: s.hp,
+        broken: false,
+        hitFlash: 0,
+        breachProgress: 0,
+        openAnim: 0,
+      };
+    });
   }
 
   private setCallout(text: string, kind: CalloutState["kind"], durSec: number): void {
@@ -881,35 +1336,67 @@ export class SiegeSimulator {
     });
   }
 
-  private emitAudio(kind: SiegeAudioEvent["kind"], gain = 1, pitch = 1): void {
+  addTrauma(amount: number): void {
+    this.camTrauma = Math.min(1.0, this.camTrauma + amount);
+  }
+
+  private spawnShellCasing(x: number, y: number, ux: number, uy: number, heavy: boolean): void {
+    if (this.shells.length > 85) return;
+    // 向枪机右侧后方高速抛射旋转黄铜弹壳（纯确定性哈希扰动，零 RNG 消耗）
+    const h1 = ((this.tick * 73 + Math.round(x) * 19) % 100) / 100 - 0.5;
+    const h2 = ((this.tick * 41 + Math.round(y) * 29) % 100) / 100;
+    const ejectX = -uy;
+    const ejectY = ux;
+    const spd = (heavy ? 3.4 : 2.5) + h2 * 1.4;
+    this.shells.push({
+      x: x - ux * 4 + ejectX * 4,
+      y: y - uy * 4 + ejectY * 4,
+      vx: ejectX * spd - ux * (0.8 + h2 * 0.7) + h1 * 0.9,
+      vy: ejectY * spd - uy * (0.8 + h2 * 0.7) + h1 * 0.9,
+      rot: h2 * Math.PI * 2,
+      vrot: (h1 >= 0 ? 1 : -1) * (0.35 + h2 * 0.35),
+      ttl: heavy ? 22 : 16,
+      maxTtl: heavy ? 22 : 16,
+      heavy,
+    });
+  }
+
+  private emitAudio(
+    kind: SiegeAudioEvent["kind"],
+    gain = 1,
+    pitch = 1,
+    worldX = CORRIDOR_CX,
+  ): void {
+    const pan = clamp((worldX - CORRIDOR_CX) / 620, -0.78, 0.78);
     this.audioEvents.push({
       timeSec: this.tick / SIM_HZ,
       kind,
       gain,
       pitch,
+      pan,
     });
   }
 
   /**
-   * 确保出生点绝不位于封闭反应堆岛内部或死角隔墙内部，从源头杜绝出生后第 1 帧被墙体弹飞
+   * 确保出生点绝不位于封闭天井、承重柱、完好家具刚体或死角隔墙内部，从源头杜绝穿模或出生弹飞
    */
   private sanitizeSpawnPoint(rawX: number, rawY: number, r: number): { x: number; y: number } {
     const y = clamp(rawY, r + 32, WORLD_H - 42 - r);
     const b = getCorridorBounds(y, this.mode);
-    let x = clamp(rawX, b.left + r + 14, b.right - r - 14);
-
-    // blackout 模式下：两座中央反应堆屏蔽岛 (x=760..1040, y=2040..2220 及 y=960..1140) 为实心封闭禁区
-    if (this.mode === "blackout") {
-      if (y >= 2025 - r && y <= 2235 + r && x >= 748 - r && x <= 1052 + r) {
-        x = x < 900 ? 732 - r : 1068 + r;
-      }
-      if (y >= 945 - r && y <= 1155 + r && x >= 748 - r && x <= 1052 + r) {
-        x = x < 900 ? 732 - r : 1068 + r;
-      }
-    }
+    const x = clamp(rawX, b.left + r + 14, b.right - r - 14);
 
     const dummy = { x, y, r };
-    for (let iter = 0; iter < 2; iter++) {
+    for (let iter = 0; iter < 4; iter++) {
+      for (const pt of this.pits) {
+        this.resolveCircleRect(dummy, pt.x, pt.y, pt.w, pt.h, 2.5);
+      }
+      for (const pl of this.pillars) {
+        this.resolveCircleRect(dummy, pl.x, pl.y, pl.w, pl.h, 2.0);
+      }
+      for (const pr of this.props) {
+        if (!pr.intact) continue;
+        this.resolveCircleRect(dummy, pr.x, pr.y, pr.w, pr.h, 2.0);
+      }
       for (const seg of this.outerWalls) {
         this.resolveSegmentCollision(dummy, seg.x1, seg.y1, seg.x2, seg.y2);
       }
@@ -977,7 +1464,7 @@ export class SiegeSimulator {
   }
 
   /**
-   * 构建 2D 科学寻路网格障碍表（外墙以外、反应堆实心核及死角隔墙线段周围标记为不可通行）
+   * 构建 2D 科学寻路网格障碍表（外墙以外、下沉天井、混凝土柱、大型完好家具及死角隔墙标记为不可通行，家具破碎后实时自动打通！）
    */
   private initNavObstacles(): void {
     this.navBlocked.fill(0);
@@ -990,15 +1477,38 @@ export class SiegeSimulator {
           this.navBlocked[gy * NAV_COLS + gx] = 1;
           continue;
         }
-        if (this.mode === "blackout") {
-          if (
-            cx >= 752 &&
-            cx <= 1048 &&
-            ((cy >= 2032 && cy <= 2228) || (cy >= 952 && cy <= 1148))
-          ) {
-            this.navBlocked[gy * NAV_COLS + gx] = 1;
-            continue;
+        let blocked = false;
+        for (let i = 0; i < this.pits.length; i++) {
+          const pt = this.pits[i];
+          if (cx >= pt.x - 10 && cx <= pt.x + pt.w + 10 && cy >= pt.y - 10 && cy <= pt.y + pt.h + 10) {
+            blocked = true;
+            break;
           }
+        }
+        if (!blocked) {
+          for (let i = 0; i < this.pillars.length; i++) {
+            const pl = this.pillars[i];
+            if (cx >= pl.x - 10 && cx <= pl.x + pl.w + 10 && cy >= pl.y - 10 && cy <= pl.y + pl.h + 10) {
+              blocked = true;
+              break;
+            }
+          }
+        }
+        if (!blocked) {
+          for (let i = 0; i < this.props.length; i++) {
+            const pr = this.props[i];
+            if (!pr.intact) continue;
+            // 玻璃屏风与小型手推车可被尸群直接撞碎突破，其余完好大型家具纳入寻路绕行障碍
+            if (pr.kind === "glass_window" || pr.kind === "cart_clutter") continue;
+            if (cx >= pr.x - 8 && cx <= pr.x + pr.w + 8 && cy >= pr.y - 8 && cy <= pr.y + pr.h + 8) {
+              blocked = true;
+              break;
+            }
+          }
+        }
+        if (blocked) {
+          this.navBlocked[gy * NAV_COLS + gx] = 1;
+          continue;
         }
         for (let wi = 0; wi < this.deadCornerWalls.length; wi++) {
           const w = this.deadCornerWalls[wi];
@@ -1213,9 +1723,10 @@ export class SiegeSimulator {
   }
 
   /**
-   * 2D 动态平滑镜头跟随（实时追踪小队中心 + 推进方向前瞻偏移，并记录已探索小地图网格）
+   * 2D 动态战术变焦 + 平滑镜头跟随（开场 2.08x 特写放大巨型载具突击 -> 中期 1.44x 压迫感近景切角搜迷宫 -> 终局拉远至 1.04x 全景决战母巢！）
    */
   private updateCamera(snap = false): void {
+    const tSec = this.tick / SIM_HZ;
     let sumX = 0;
     let sumY = 0;
     let count = 0;
@@ -1238,18 +1749,62 @@ export class SiegeSimulator {
     const focusX = count > 0 ? sumX / count : this.squadCenterX;
     const focusY = count > 0 ? sumY / count : this.squadCenterY;
 
-    // 镜头前瞻：沿小队当前推进方向偏移，使小队/载具位于视口中下部，前方走廊与房间门洞尽收眼底
-    const lookX = Math.cos(this.squadMoveAngle) * 75;
-    const lookY = Math.sin(this.squadMoveAngle) * 165 - 85;
-    const targetCamX = clamp(focusX + lookX - ARENA_W * 0.5, 0, WORLD_W - ARENA_W);
-    const targetCamY = clamp(focusY + lookY - ARENA_H * 0.5, 0, WORLD_H - ARENA_H);
+    // 计算当前阶段理想镜头缩放倍率 camZoom：
+    // 1) t=0..3.2s：2.08x（双黑鹰 1.72x / 三大巴 1.38x）近景特写放大重型载具机炮火箭洗地，绝不一上来拉到最远！
+    // 2) t=3.2..6.2s：平滑退至 1.48x 近距离观看开门/索降下车与首个 90° 拐角破门；
+    // 3) 中段迷宫走廊 (squadCenterY > 860)：维持 1.32x..1.45x 幽闭近景，让墙壁死角遮蔽大半屏幕，感染瞬间触发 +0.09x 惊悚变焦冲击！
+    // 4) 突入北部母巢大厅 (squadCenterY <= 860)：恢弘拉远至 1.04x 展现巨型母巢与两百尸潮终局大战！
+    const entryZoom =
+      this.mode === "maze-infect" ? 1.38 : this.mode === "sonar" ? 1.72 : 2.08;
+    let targetZoom = 1.05;
+    if (tSec < 3.25) {
+      targetZoom = entryZoom - (tSec / 3.25) * 0.1;
+    } else if (tSec < 6.0) {
+      const p = (tSec - 3.25) / 2.75;
+      targetZoom = (entryZoom - 0.1) * (1 - p) + 1.48 * p;
+    } else if (this.squadCenterY > 860 && tSec < 28.5) {
+      const armyPullback = Math.min(0.14, Math.max(0, this.greens.length - 6) * 0.007);
+      targetZoom = 1.45 - armyPullback + this.infectionFlash * 0.09;
+    } else {
+      targetZoom = 1.04 + this.infectionFlash * 0.05;
+    }
+    targetZoom = clamp(targetZoom, 1.0, 2.15);
+
+    if (snap) {
+      this.camZoom = targetZoom;
+    } else {
+      this.camZoom += (targetZoom - this.camZoom) * 0.065;
+    }
+
+    const viewW = ARENA_W / this.camZoom;
+    const viewH = ARENA_H / this.camZoom;
+
+    // 镜头前瞻：开场将载具置于画面中下 1/3 处展现前向重火力；进入迷宫后顺着行进方向 (东/西/北) 前瞻照射前方 90° 盲区拐角！
+    const lookX =
+      tSec < 3.5 ? 0 : Math.cos(this.squadMoveAngle) * (120 / Math.max(1, this.camZoom * 0.85));
+    const lookY =
+      tSec < 3.5 ? -105 : Math.sin(this.squadMoveAngle) * (135 / Math.max(1, this.camZoom * 0.85));
+    const targetCamX = clamp(focusX + lookX - viewW * 0.5, 0, WORLD_W - viewW);
+    const targetCamY = clamp(focusY + lookY - viewH * 0.5, 0, WORLD_H - viewH);
 
     if (snap) {
       this.camX = targetCamX;
       this.camY = targetCamY;
+      this.camShakeX = 0;
+      this.camShakeY = 0;
     } else {
-      this.camX += (targetCamX - this.camX) * 0.09;
-      this.camY += (targetCamY - this.camY) * 0.09;
+      this.camX += (targetCamX - this.camX) * 0.095;
+      this.camY += (targetCamY - this.camY) * 0.095;
+      if (this.camTrauma > 0.005) {
+        const shakeAmp = (this.camTrauma * this.camTrauma * 11.5) / this.camZoom;
+        this.camShakeX = Math.sin(this.tick * 2.35) * shakeAmp;
+        this.camShakeY = Math.cos(this.tick * 3.15) * shakeAmp;
+        this.camTrauma = Math.max(0, this.camTrauma - 0.042);
+      } else {
+        this.camTrauma = 0;
+        this.camShakeX = 0;
+        this.camShakeY = 0;
+      }
     }
 
     // 更新全局小地图已探索区域（小队/载具周围及手电光锥覆盖过的区域点亮为已探索）
@@ -1289,26 +1844,28 @@ export class SiegeSimulator {
     if (this.mode === "maze-infect") {
       const lanes = [565, 955, 1235];
       for (const lx of lanes) {
-        for (let k = 0; k < 14; k++) {
+        for (let k = 0; k < 18; k++) {
           const z = this.spawnRedDot(
             k % 3 === 0 ? "runner" : "walker",
             lx + (this.rng() - 0.5) * 62,
-            2310 + (k / 14) * 470 + (this.rng() - 0.5) * 18,
+            2240 + (k / 18) * 540 + (this.rng() - 0.5) * 18,
           );
-          z.hp = 155;
-          z.maxHp = 155;
-          z.ghostHp = 155;
+          z.hp = 165;
+          z.maxHp = 165;
+          z.ghostHp = 165;
         }
       }
     } else {
-      for (let k = 0; k < 42; k++) {
-        const y = 2290 + (k / 42) * 490 + (this.rng() - 0.5) * 20;
+      const openCount = this.mode === "sonar" ? 56 : 48;
+      const openHp = this.mode === "sonar" ? 205 : 140;
+      for (let k = 0; k < openCount; k++) {
+        const y = 2385 + (k / openCount) * 435 + (this.rng() - 0.5) * 16;
         const b = getCorridorBounds(y, this.mode);
-        const x = b.cx + (this.rng() - 0.5) * Math.min(240, b.halfW * 1.15);
+        const x = b.cx + (this.rng() - 0.5) * Math.min(230, b.halfW * 1.05);
         const z = this.spawnRedDot(k % 3 === 0 ? "runner" : "walker", x, y);
-        z.hp = 155;
-        z.maxHp = 155;
-        z.ghostHp = 155;
+        z.hp = openHp;
+        z.maxHp = openHp;
+        z.ghostHp = openHp;
         if (this.mode === "sonar") {
           z.dormant = false;
         }
@@ -1328,86 +1885,87 @@ export class SiegeSimulator {
       }
     }
 
-    // 各大死角模式专属房间/反应堆/S弯盲区/三监区伏击尸群：
+    // 各大真实室内建筑模式专属【对侧店铺与盲区房间伏击尸群】（潜伏在未照亮商铺/诊室/贵宾厅内，小队靠近或开火时从侧门蜂拥扑出！）：
     if (this.mode === "scavenge") {
-      // 西翼1号军火密室、东翼2号基因密室、西翼3号重装密室内部埋伏护箱尸群
       const pockets = [
-        { x: 460, y: 2310, n: 11 },
-        { x: 1340, y: 1590, n: 12 },
-        { x: 460, y: 920, n: 12 },
-      ];
-      for (const p of pockets) {
-        for (let k = 0; k < p.n; k++) {
-          this.spawnRedDot(
-            k % 3 === 0 ? "runner" : "walker",
-            p.x + (this.rng() - 0.5) * 95,
-            p.y + (this.rng() - 0.5) * 90,
-          );
-        }
-      }
-    } else if (this.mode === "blackout") {
-      // 1号南反应堆与2号北反应堆左右双环盲区埋伏尸群
-      const pockets = [
-        { x: 460, y: 2130, n: 11 },
-        { x: 1340, y: 2130, n: 11 },
-        { x: 460, y: 1050, n: 11 },
-        { x: 1340, y: 1050, n: 11 },
-      ];
-      for (const p of pockets) {
-        for (let k = 0; k < p.n; k++) {
-          this.spawnRedDot(
-            k % 3 === 0 ? "runner" : "walker",
-            p.x + (this.rng() - 0.5) * 90,
-            p.y + (this.rng() - 0.5) * 90,
-          );
-        }
-      }
-    } else if (this.mode === "sonar") {
-      // 超大跨度 S 弯天然岩壁死角后方潜伏红眼沉睡丧尸 (dormant = true)
-      const pockets = [
-        { x: 420, y: 2260, n: 12 },
-        { x: 680, y: 1920, n: 10 },
-        { x: 1360, y: 1580, n: 12 },
-        { x: 1120, y: 1240, n: 10 },
-        { x: 420, y: 900, n: 12 },
+        { x: 1380, y: 2150, n: 12 }, // 东南数码旗舰店 E1 盲区
+        { x: 405, y: 1710, n: 12 },  // 西中段精品店盲区
+        { x: 1380, y: 1050, n: 13 }, // 东北影院门厅 E3 盲区
       ];
       for (const p of pockets) {
         for (let k = 0; k < p.n; k++) {
           const z = this.spawnRedDot(
             k % 3 === 0 ? "runner" : "walker",
-            p.x + (this.rng() - 0.5) * 80,
-            p.y + (this.rng() - 0.5) * 75,
+            p.x + (this.rng() - 0.5) * 95,
+            p.y + (this.rng() - 0.5) * 85,
+          );
+          z.cornerAmbush = true;
+        }
+      }
+    } else if (this.mode === "blackout") {
+      const pockets = [
+        { x: 440, y: 2160, n: 12 },  // 西侧站厅便利店盲区
+        { x: 1340, y: 1640, n: 13 }, // 东侧地下拱廊盲区
+        { x: 440, y: 1180, n: 13 },  // 西北换乘暗角盲区
+      ];
+      for (const p of pockets) {
+        for (let k = 0; k < p.n; k++) {
+          const z = this.spawnRedDot(
+            k % 3 === 0 ? "runner" : "walker",
+            p.x + (this.rng() - 0.5) * 90,
+            p.y + (this.rng() - 0.5) * 85,
+          );
+          z.cornerAmbush = true;
+        }
+      }
+    } else if (this.mode === "sonar") {
+      // 医院各科室与病房盲区潜伏红眼沉睡丧尸 (dormant = true)
+      const pockets = [
+        { x: 1380, y: 2160, n: 13 }, // 东候诊病房沉睡尸群
+        { x: 410, y: 1710, n: 13 },  // 西住院走廊沉睡尸群
+        { x: 410, y: 1260, n: 13 },  // 西核磁影像科沉睡尸群
+        { x: 1380, y: 920, n: 13 },  // 东北隔离血库沉睡尸群
+      ];
+      for (const p of pockets) {
+        for (let k = 0; k < p.n; k++) {
+          const z = this.spawnRedDot(
+            k % 3 === 0 ? "runner" : "walker",
+            p.x + (this.rng() - 0.5) * 90,
+            p.y + (this.rng() - 0.5) * 80,
           );
           z.dormant = true;
         }
       }
     } else if (this.mode === "maze-infect") {
-      // A/B/C 三条平行封闭监区走廊内埋伏尸群 + 左/右监区拐角预置已被感染突变的「变异枪兵」迎面扑来！
-      const e1 = this.spawnRedDot("infected_elite", 560, 2240);
-      e1.hp = 68;
-      e1.maxHp = 68;
-      e1.ghostHp = 68;
-      const e2 = this.spawnRedDot("infected_elite", 1240, 2240);
-      e2.hp = 68;
-      e2.maxHp = 68;
-      e2.ghostHp = 68;
-      this.infectedCount += 2;
+      // 航站楼安检口与贵宾厅预置等身已感染警卫丧尸（绝不膨胀成小Boss！）+ 盲区尸群伏击！
+      for (const [ex, ey] of [
+        [565, 2240],
+        [1235, 2240],
+        [1355, 1740],
+        [435, 1300],
+      ] as const) {
+        const elite = this.spawnRedDot("infected_elite", ex, ey);
+        elite.hp = 42;
+        elite.maxHp = 42;
+        elite.ghostHp = 42;
+        elite.cornerAmbush = ey < 2000;
+      }
       const pockets = [
-        { x: 560, y: 2180, n: 4 },
-        { x: 930, y: 2180, n: 5 },
-        { x: 1240, y: 2180, n: 4 },
-        { x: 520, y: 1460, n: 8 },
-        { x: 1280, y: 1460, n: 8 },
-        { x: 520, y: 1020, n: 9 },
-        { x: 1280, y: 1020, n: 9 },
+        { x: 565, y: 2180, n: 4, ambush: false },
+        { x: 955, y: 2180, n: 5, ambush: false },
+        { x: 1235, y: 2180, n: 4, ambush: false },
+        { x: 1360, y: 1710, n: 11, ambush: true },
+        { x: 435, y: 1280, n: 11, ambush: true },
+        { x: 1360, y: 890, n: 11, ambush: true },
       ];
       for (const p of pockets) {
         for (let k = 0; k < p.n; k++) {
-          this.spawnRedDot(
+          const z = this.spawnRedDot(
             k % 3 === 0 ? "runner" : "walker",
-            p.x + (this.rng() - 0.5) * 65,
-            p.y + (this.rng() - 0.5) * 60,
+            p.x + (this.rng() - 0.5) * 75,
+            p.y + (this.rng() - 0.5) * 70,
           );
+          if (p.ambush) z.cornerAmbush = true;
         }
       }
     }
@@ -1429,7 +1987,7 @@ export class SiegeSimulator {
       : isCarrier
         ? 14.5
         : isInfected
-          ? 12.5
+          ? 7.4
           : isRunner
             ? 5.6
             : 6.2;
@@ -1439,7 +1997,7 @@ export class SiegeSimulator {
       : isCarrier
         ? 220
         : isInfected
-          ? 260
+          ? 42
           : isRunner
             ? 25
             : 35;
@@ -1449,7 +2007,7 @@ export class SiegeSimulator {
       : isCarrier
         ? 1.38
         : isInfected
-          ? 1.68
+          ? 1.76
           : isRunner
             ? 1.82 + this.rng() * 0.28
             : 1.46 + this.rng() * 0.22;
@@ -1579,25 +2137,26 @@ export class SiegeSimulator {
     this.lightCones.length = 0;
     if (!this.isDarkMode) return;
 
-    const flashHalfFov = this.blackoutActive ? 0.36 : 0.46;
+    // 自然战争迷雾：放宽单兵柔光扇面角 (~68°~73° 广角柔光)，消除生硬窄手电筒割裂感！
+    const flashHalfFov = this.blackoutActive ? 0.58 : 0.64;
 
     for (let i = 0; i < this.greens.length; i++) {
       const g = this.greens[i];
       const baseRange =
         g.role === "shotgun"
-          ? 265
+          ? 295
           : g.role === "sniper"
-            ? 400
+            ? 410
             : g.role === "turret"
-              ? 375
-              : 335;
+              ? 385
+              : 355;
       this.lightCones.push({
         x: g.x,
         y: g.y,
         angle: g.aimAngle,
         halfFov: g.role === "turret" ? 0.54 : flashHalfFov,
-        range: this.blackoutActive ? 175 : baseRange,
-        intensity: this.blackoutActive ? 0.75 : 1.08,
+        range: this.blackoutActive ? Math.round(baseRange * 0.9) : baseRange,
+        intensity: this.blackoutActive ? 1.04 : 1.08,
         kind: "flashlight",
       });
     }
@@ -1631,14 +2190,13 @@ export class SiegeSimulator {
       }
     }
 
-    // blackout 断电探照灯模式：在 1号南反应堆大厅与 2号北反应堆大厅左右各矗立共 4 座双头旋转工业探照灯塔！
-    // 四座灯塔在反应堆过载断电惊魂窗口 (t=11.2~14.8s) 同时熄灭！
+    // blackout 断电探照灯模式：在地铁站厅与变电室各矗立一座双头旋转工业探照灯塔（断电惊魂窗口同时熄灭！）
     if (this.mode === "blackout" && !this.blackoutActive) {
       const towers = [
-        { x: 520, y: 2130, dir: 1 },
-        { x: 1280, y: 2130, dir: -1 },
-        { x: 520, y: 1050, dir: -1 },
-        { x: 1280, y: 1050, dir: 1 },
+        { x: 1355, y: 2060, dir: 1 },
+        { x: 445, y: 1950, dir: -1 },
+        { x: 1355, y: 1140, dir: -1 },
+        { x: 900, y: 780, dir: 1 },
       ];
       for (const tw of towers) {
         const baseAng = tSec * 1.45 * tw.dir;
@@ -1694,6 +2252,7 @@ export class SiegeSimulator {
     let newlyWoken = 0;
     for (let i = 0; i < this.reds.length; i++) {
       const r = this.reds[i];
+      if ((r.mutatingTicks ?? 0) > 0) continue;
       if (r.dormant && Math.hypot(r.x - nx, r.y - ny) <= radius) {
         r.dormant = false;
         newlyWoken++;
@@ -1711,6 +2270,7 @@ export class SiegeSimulator {
     const tSec = this.tick / SIM_HZ;
 
     if (this.alarmFlash > 0) this.alarmFlash = Math.max(0, this.alarmFlash - 0.025);
+    if (this.infectionFlash > 0) this.infectionFlash = Math.max(0, this.infectionFlash - 0.032);
     if (this.hive.hitFlash > 0) this.hive.hitFlash = Math.max(0, this.hive.hitFlash - 0.15);
     this.hive.pulsePhase = (this.hive.pulsePhase + 0.06) % (Math.PI * 2);
     if (this.hive.ghostHp > this.hive.hp) {
@@ -1727,6 +2287,13 @@ export class SiegeSimulator {
       }
     }
 
+    for (let pi = 0; pi < this.props.length; pi++) {
+      const pr = this.props[pi];
+      if (pr.hitFlash > 0) pr.hitFlash = Math.max(0, pr.hitFlash - 0.18);
+      pr.shakeX *= 0.62;
+      pr.shakeY *= 0.62;
+    }
+
     if (this.callout) {
       this.callout.ttl--;
       if (this.callout.ttl <= 0) this.callout = null;
@@ -1739,9 +2306,13 @@ export class SiegeSimulator {
     // 1. 战场导演：母巢与前方走廊涌怪、4大泰坦登场、减员危机与反推/覆灭阶段切换
     this.updateDirector(tSec);
 
-    // 2. 重建空间哈希网格与每 6 帧更新一次全图科学 BFS 寻路流场
+    // 2. 重建空间哈希网格与全图科学 BFS 寻路流场（若有家具刚刚破碎，立即动态更新障碍表打通通路！）
     this.rebuildSpatialGrid();
-    if (this.tick % 6 === 1) {
+    if (this.navObstaclesDirty) {
+      this.navObstaclesDirty = false;
+      this.initNavObstacles();
+      this.updateNavFlowField();
+    } else if (this.tick % 6 === 1) {
       this.updateNavFlowField();
     }
 
@@ -1757,7 +2328,69 @@ export class SiegeSimulator {
     // 4.5. 更新 2D 平滑镜头跟随与全局小地图已探索网格
     this.updateCamera(false);
 
-    // 5. 更新粒子、光环与飘字
+    // 5. 更新机载破片火箭弹、旋转抛壳弹壳、粒子、光环与飘字
+    for (let i = this.rockets.length - 1; i >= 0; i--) {
+      const rk = this.rockets[i];
+      rk.prevX = rk.x;
+      rk.prevY = rk.y;
+      rk.x += rk.vx;
+      rk.y += rk.vy;
+      rk.ttl--;
+      if (this.tick % 2 === 0) {
+        this.spawnImpactParticles(rk.x, rk.y, rk.vx, rk.vy, "gold", 1);
+      }
+      if (rk.ttl <= 0 || Math.hypot(rk.targetX - rk.x, rk.targetY - rk.y) <= 16) {
+        const rx = rk.x;
+        const ry = rk.y;
+        this.rings.push({ x: rx, y: ry, maxR: 76, ttl: 16, maxTtl: 16, kind: "hive-kill" });
+        this.pendingDecals.push({ kind: "scorch", x: rx, y: ry, r: 26, seed: this.tick + i });
+        this.spawnImpactParticles(rx, ry, 0, -1, "gold", 9);
+        this.spawnImpactParticles(rx, ry, 0, 1, "blood", 6);
+        this.addTrauma(0.38);
+        this.emitAudio("rocket-blast", 0.72, 0.86 + (i % 3) * 0.08, rx);
+        for (let ri = this.reds.length - 1; ri >= 0; ri--) {
+          const r = this.reds[ri];
+          if (r.kind !== "boss" && Math.hypot(r.x - rx, r.y - ry) <= 64) {
+            r.hp -= 105;
+            r.hitFlash = 1.0;
+            if (r.hp <= 0) {
+              this.killRedDot(ri, tSec);
+            }
+          }
+        }
+        for (let pi = 0; pi < this.props.length; pi++) {
+          const pr = this.props[pi];
+          if (!pr.intact || pr.indestructible) continue;
+          const cx = clamp(rx, pr.x, pr.x + pr.w);
+          const cy = clamp(ry, pr.y, pr.y + pr.h);
+          if (Math.hypot(cx - rx, cy - ry) <= 88) {
+            this.damageProp(pr, 120, cx - rx, cy - ry);
+          }
+        }
+        this.rockets.splice(i, 1);
+      }
+    }
+    for (let i = this.debris.length - 1; i >= 0; i--) {
+      const db = this.debris[i];
+      db.x += db.vx;
+      db.y += db.vy;
+      db.vx *= 0.87;
+      db.vy *= 0.87;
+      db.rot += db.vrot;
+      db.vrot *= 0.92;
+      db.ttl--;
+      if (db.ttl <= 0) this.debris.splice(i, 1);
+    }
+    for (let i = this.shells.length - 1; i >= 0; i--) {
+      const sh = this.shells[i];
+      sh.x += sh.vx;
+      sh.y += sh.vy;
+      sh.vx *= 0.86;
+      sh.vy = sh.vy * 0.86 + 0.14;
+      sh.rot += sh.vrot;
+      sh.ttl--;
+      if (sh.ttl <= 0) this.shells.splice(i, 1);
+    }
     for (let i = this.sparks.length - 1; i >= 0; i--) {
       const sp = this.sparks[i];
       sp.x += sp.vx;
@@ -1768,8 +2401,19 @@ export class SiegeSimulator {
       if (sp.ttl <= 0) this.sparks.splice(i, 1);
     }
     for (let i = this.rings.length - 1; i >= 0; i--) {
-      this.rings[i].ttl--;
-      if (this.rings[i].ttl <= 0) this.rings.splice(i, 1);
+      const rg = this.rings[i];
+      if (rg.kind === "sonar") {
+        const curR = 14 + (1 - rg.ttl / rg.maxTtl) * rg.maxR;
+        for (let ri = 0; ri < this.reds.length; ri++) {
+          const z = this.reds[ri];
+          const d = Math.hypot(z.x - rg.x, z.y - rg.y);
+          if (Math.abs(d - curR) <= 30) {
+            z.sonarPingTicks = Math.max(z.sonarPingTicks ?? 0, 46);
+          }
+        }
+      }
+      rg.ttl--;
+      if (rg.ttl <= 0) this.rings.splice(i, 1);
     }
     for (let i = this.banners.length - 1; i >= 0; i--) {
       const b = this.banners[i];
@@ -1852,25 +2496,27 @@ export class SiegeSimulator {
       }
     }
 
-    // 2. 母巢核心与前方未清理战区持续涌出尸潮
+    // 2. 母巢核心与前方未清理战区持续涌出尸潮（中段保持科学密度使小队清完每间密室/反应堆后能一路推进 2200px 直抵北部母巢腔体！）
     const overrun = this.isOverrunMode();
+    const overrunCollapseActive = overrun && this.finalWaveTriggered;
     const maxActiveReds =
-      tSec < 12.0
+      tSec < 3.2
         ? 165
-        : tSec < 24.5
-          ? 180
-          : overrun
-            ? 210
+        : overrunCollapseActive
+          ? 215
+          : tSec < 24.5
+            ? 92
             : tSec < 31.8
-              ? 110
+              ? 78
               : 0;
-    const spawnModulo = tSec < 31.8 || overrun ? 2 : 10;
+    const spawnModulo = tSec < 3.2 || overrunCollapseActive ? 2 : tSec < 31.8 ? 4 : 10;
     if (this.reds.length < maxActiveReds && this.tick % spawnModulo === 0) {
-      const spawnsPerStep = tSec < 24.5 ? 3 : overrun ? 4 : tSec < 31.8 ? 2 : 0;
+      const spawnsPerStep =
+        tSec < 3.2 ? 3 : overrunCollapseActive ? 5 : tSec < 24.5 ? 2 : tSec < 31.8 ? 1 : 0;
       for (let s = 0; s < spawnsPerStep; s++) {
         if (tSec < 3.05 && this.vehicles.length > 0) {
           const v = this.vehicles[s % this.vehicles.length];
-          const rawY = clamp(v.y - 220 - this.rng() * 95, 2320, 2650);
+          const rawY = clamp(v.y - 195 - this.rng() * 85, 2385, 2680);
           const b = getCorridorBounds(rawY, this.mode);
           const spawnX =
             this.mode === "maze-infect"
@@ -1879,44 +2525,61 @@ export class SiegeSimulator {
           this.spawnRedDot(s % 2 === 0 ? "runner" : "walker", spawnX, rawY);
           continue;
         }
-        const fromFrontSector = s % 2 === 0 && this.squadCenterY > 820;
-        const rawY = fromFrontSector
-          ? Math.max(300, this.squadCenterY - 380 - this.rng() * 190)
-          : this.hive.y + this.hive.r + 20 + this.rng() * 80;
+        const fromFrontSector =
+          !overrunCollapseActive && s === 1 && this.tick % 8 === 0 && this.squadCenterY > 1150;
+        const rawY = overrunCollapseActive
+          ? Math.max(290, this.squadCenterY - 260 - this.rng() * 110)
+          : fromFrontSector
+            ? Math.max(300, this.squadCenterY - 560 - this.rng() * 180)
+            : this.hive.y + this.hive.r + 20 + this.rng() * 85;
         const b = getCorridorBounds(rawY, this.mode);
         const spawnX = b.cx + (this.rng() * 2 - 1) * Math.max(40, b.halfW - 45);
-        const isRunner = tSec > 2.5 && this.rng() < (overrun && tSec > 24.0 ? 0.68 : 0.42);
+        const isRunner = tSec > 2.5 && this.rng() < (overrunCollapseActive ? 0.75 : 0.38);
         this.spawnRedDot(isRunner ? "runner" : "walker", spawnX, rawY);
       }
     }
 
-    // 2b. 死角模式专属导演事件：
-    // (a) blackout 断电探照灯模式：在 t=13.2s ~ 16.8s 触发「反应堆过载全图断电 3.6 秒」惊魂！
+    // 2b. 各大模式专属差异化核心机制导演事件：
+    // (a) blackout 地铁站动态拉闸断电模式：
+    //     0~10.3s 地铁站正常荧光灯明亮供电 -> 10.3~11.5s 变电站过载电弧频闪 -> 11.5s 彻底拉闸断电坠入自然战争迷雾！
     if (this.mode === "blackout") {
-      if (!this.blackoutTriggered && tSec >= 13.2) {
-        this.blackoutTriggered = true;
-        this.blackoutActive = true;
-        this.alarmFlash = 1.0;
-        this.emitAudio("breach", 0.92, 0.78);
-        this.triggerFrontlineFrenzyAmbush(3, 980);
-      }
-      if (this.blackoutTriggered && !this.blackoutRecovered && tSec >= 16.8) {
-        this.blackoutRecovered = true;
+      if (tSec < 10.3) {
+        this.metroPowerLevel = 1.0;
         this.blackoutActive = false;
-        this.emitAudio("adrenaline", 0.9, 1.08);
+      } else if (tSec < 11.5) {
+        const fPhase = (tSec - 10.3) / 1.2;
+        const stutter = Math.sin(fPhase * 42) + 0.5 * Math.cos(fPhase * 91);
+        this.metroPowerLevel = stutter > 0.15 ? 0.88 - fPhase * 0.25 : 0.08;
+        if (this.tick % 14 === 0) {
+          this.alarmFlash = Math.max(this.alarmFlash, 0.55);
+          this.spawnImpactParticles(this.squadCenterX + (this.tick % 2 === 0 ? -95 : 95), this.squadCenterY - 80, 0, 1, "spark", 5);
+        }
+      } else {
+        if (!this.blackoutTriggered) {
+          this.blackoutTriggered = true;
+          this.blackoutActive = true;
+          this.metroPowerLevel = 0.0;
+          this.alarmFlash = 1.0;
+          this.addTrauma(0.52);
+          this.emitAudio("power-down", 0.96, 0.85);
+          this.triggerFrontlineFrenzyAmbush(3, 980);
+        }
+        // 31.2s 闯入北部终点折返车库后微弱红色应急备用灯亮起，确保终局母巢决战视觉层次分明
+        this.metroPowerLevel = tSec >= 31.2 ? Math.min(0.36, (tSec - 31.2) / 3.2 * 0.36) : 0.0;
       }
     }
 
-    // (b) sonar 声呐潜行模式：周期性发射青色超声波扫描环探测 S 弯岩壁后方的沉睡尸群
-    if (this.mode === "sonar" && this.tick % 95 === 12) {
+    // (b) sonar 深层隔离医院声呐潜行模式：每 1.13s 发射青色超声波扫描环，穿墙点亮暗室沉睡尸潮回波轮廓！
+    if (this.mode === "sonar" && this.tick % 68 === 10) {
       this.rings.push({
         x: this.squadCenterX,
-        y: this.squadCenterY - 30,
-        maxR: 540,
-        ttl: 38,
-        maxTtl: 38,
+        y: this.squadCenterY - 24,
+        maxR: 640,
+        ttl: 42,
+        maxTtl: 42,
         kind: "sonar",
       });
+      this.emitAudio("sonar-ping", 0.36, 1.02, this.squadCenterX);
     }
 
     // (c) maze-infect 三通道生化监狱模式：在 t=8.5s 三支小队冲出 A/B/C 三道监区竖墙，在中庭检疫广场完成汇合！
@@ -1925,13 +2588,50 @@ export class SiegeSimulator {
       this.emitAudio("adrenaline", 0.88, 1.04);
     }
 
-    // (d) 节点保底CQB破拆机制：当小队抵近对应房间门洞且超过破门窗口时，CQB破拆炸药自动引爆该房间战术节点
+    // (d) 真实铁笼逐个破锁解救机制 (`囚笼+1`)：
+    //     - 已破锁的铁笼平滑推开铁栏门扇 (`openAnim: 0 -> 1`) 并永久保留在房间地面上；
+    //     - 小队抵近未破锁铁笼 (<= 245px 且无墙阻挡) 时，精准切开挂锁放出 1 名被困幸存者！
+    let activeLocksThisTick = 0;
     for (let ni = 0; ni < this.nodes.length; ni++) {
       const node = this.nodes[ni];
-      if (node.broken) continue;
-      const unlockSec = ni === 0 ? 9.4 : ni === 1 ? 16.8 : 24.0;
-      if (tSec >= unlockSec + 3.0) {
-        this.triggerNodeShatter(node);
+      if (node.broken) {
+        if (node.openAnim < 1.0) {
+          node.openAnim = Math.min(1.0, node.openAnim + 0.11);
+        }
+        continue;
+      }
+      if (activeLocksThisTick >= 2) continue;
+
+      let nearOperators = 0;
+      for (let gi = 0; gi < this.greens.length; gi++) {
+        const g = this.greens[gi];
+        if (
+          Math.hypot(g.x - node.x, g.y - node.y) <= 245 &&
+          this.hasLineOfSight(g.x, g.y, node.x, node.y)
+        ) {
+          nearOperators++;
+        }
+      }
+      const centerDist = Math.hypot(this.squadCenterX - node.x, this.squadCenterY - node.y);
+      const centerHasLos =
+        centerDist <= 205 &&
+        this.hasLineOfSight(this.squadCenterX, this.squadCenterY, node.x, node.y);
+      if (nearOperators > 0 || centerHasLos) {
+        activeLocksThisTick++;
+        if (centerDist <= 175 && node.breachProgress < 0.85) {
+          this.holdForRescueTicks = Math.max(this.holdForRescueTicks, 4);
+        }
+        const baseTicks = node.kind === "bunker_pad" ? 64 : 36;
+        const speedBoost = Math.min(1.32, 0.88 + nearOperators * 0.08);
+        node.breachProgress = Math.min(1.0, node.breachProgress + (1 / baseTicks) * speedBoost);
+        node.hp = Math.max(0, node.maxHp * (1 - node.breachProgress));
+        node.hitFlash = Math.max(node.hitFlash, 0.45);
+        if (this.tick % 6 === 0) {
+          this.spawnImpactParticles(node.x, node.y, 0, -1, "gold", 2);
+        }
+        if (node.breachProgress >= 1.0) {
+          this.triggerNodeShatter(node);
+        }
       }
     }
 
@@ -1974,47 +2674,96 @@ export class SiegeSimulator {
       this.emitAudio("adrenaline", 0.95, 1.0);
     }
 
-    // 7. 终局高潮分流（50% 惨胜破巢 vs 50% 尸潮反扑全军覆没）：
+    // 7. 终局高潮分流（50% 惨胜破巢 vs 50% 尸潮反扑全军覆没，严格等待大军杀入北部母巢核心室 squadCenterY <= 520 后触发！）：
+    if (this.squadCenterY <= 520 && this.hiveHallEnteredSec < 0) {
+      this.hiveHallEnteredSec = tSec;
+    }
+
     if (overrun) {
-      // 【尸潮大胜剧本 (blackout / maze-infect)】：t >= 26.5s 母巢掀起狂暴反扑浪潮，前排丧尸与变异枪兵持续冲锋同化人类，直至全员覆没！
-      if (!this.finalWaveTriggered && tSec >= 26.5) {
+      // 【Near-Win Fail-Ad 功败垂成剧本 (blackout / maze-infect)】：
+      // 先放任人类大军完成全部 3 个商铺救援并冲入母巢大厅集火约 2.6 秒把母巢打到半血以下，随后母巢暴走掀起终极反扑浪潮将全军同化！
+      const nearWinTrigger =
+        (this.hiveHallEnteredSec > 0 &&
+          (tSec - this.hiveHallEnteredSec >= 2.6 || this.hive.hp <= this.hive.maxHp * 0.46)) ||
+        tSec >= 45.5;
+      if (!this.finalWaveTriggered && nearWinTrigger) {
         this.finalWaveTriggered = true;
         this.alarmFlash = 1.0;
-        this.emitAudio("breach", 0.96, 0.82);
+        this.addTrauma(0.58);
+        this.emitAudio("breach", 0.96, 0.82, this.hive.x);
       }
-      if (tSec >= 26.5 && this.greens.length > 0 && this.tick - this.lastAttritionTick >= 14) {
+      if (this.finalWaveTriggered && this.greens.length > 0 && this.tick - this.lastAttritionTick >= 8) {
         this.lastAttritionTick = this.tick;
-        this.triggerFrontlineFrenzyAmbush(5, 2250);
-      }
-    } else {
-      // 【人类惨胜剧本 (scavenge / sonar)】：t = 26.8s ~ 34.0s 母巢卫队拼死反扑，将大军一路咬杀削减至最后 4~6 名残血英雄！
-      if (!this.finalWaveTriggered && tSec >= 26.8) {
-        this.finalWaveTriggered = true;
-        this.alarmFlash = 0.85;
-      }
-      const targetSurvivors = this.mode === "scavenge" ? 5 : 6;
-      if (
-        tSec >= 26.0 &&
-        tSec <= 34.2 &&
-        this.greens.length > targetSurvivors &&
-        this.tick - this.lastAttritionTick >= 11
-      ) {
-        this.lastAttritionTick = this.tick;
-        // 若母巢前方 360px 内缺乏冲锋怪，从母巢孵化口补出 2 只高速狂奔尸并激活狂暴冲锋
+        const anchorG = this.greens[Math.floor(this.tick / 8) % this.greens.length];
         let closeCount = 0;
         for (const r of this.reds) {
-          if (r.kind !== "boss" && Math.hypot(r.x - this.squadCenterX, r.y - this.squadCenterY) <= 380) {
+          if (
+            r.kind !== "boss" &&
+            Math.hypot(r.x - anchorG.x, r.y - anchorG.y) <= 290 &&
+            this.hasLineOfSight(r.x, r.y, anchorG.x, anchorG.y)
+          ) {
             closeCount++;
           }
         }
-        if (closeCount < 5) {
-          for (const side of [-65, 0, 65]) {
-            this.spawnRedDot("runner", this.squadCenterX + side, Math.max(290, this.squadCenterY - 265));
+        if (closeCount < 14) {
+          for (const side of [-78, -26, 26, 78]) {
+            const useAnchor = Math.abs(side) === 26;
+            let sx = (useAnchor ? anchorG.x : this.squadCenterX) + side;
+            let sy = Math.max(285, (useAnchor ? anchorG.y : this.squadCenterY) - 155);
+            if (useAnchor && !this.hasLineOfSight(sx, sy, anchorG.x, anchorG.y)) {
+              for (let aIdx = 0; aIdx < 8; aIdx++) {
+                const ang = (aIdx * Math.PI) / 4;
+                const tx = anchorG.x + Math.cos(ang) * 145;
+                const ty = anchorG.y + Math.sin(ang) * 145;
+                if (this.hasLineOfSight(tx, ty, anchorG.x, anchorG.y)) {
+                  sx = tx;
+                  sy = ty;
+                  break;
+                }
+              }
+            }
+            const rz = this.spawnRedDot("runner", sx, sy);
+            rz.hp = 960;
+            rz.maxHp = 960;
+            rz.ghostHp = 960;
           }
         }
-        this.triggerFrontlineFrenzyAmbush(3, 2850);
+        this.triggerFrontlineFrenzyAmbush(8, 3600);
+      }
+    } else {
+      // 【人类惨胜剧本 (scavenge / sonar)】：杀入母巢大厅 (hiveHallEnteredSec > 0) 后母巢重甲卫队拼死反扑，将 26 人大军一路咬杀感染至仅剩 4 名孤胆残血英雄！
+      if (!this.finalWaveTriggered && this.hiveHallEnteredSec > 0) {
+        this.finalWaveTriggered = true;
+        this.alarmFlash = 0.85;
+      }
+      const targetSurvivors = 4;
+      if (
+        this.hiveHallEnteredSec > 0 &&
+        this.greens.length > targetSurvivors &&
+        this.tick - this.lastAttritionTick >= 8
+      ) {
+        this.lastAttritionTick = this.tick;
+        let closeCount = 0;
+        for (const r of this.reds) {
+          if (r.kind !== "boss" && Math.hypot(r.x - this.squadCenterX, r.y - this.squadCenterY) <= 360) {
+            closeCount++;
+          }
+        }
+        if (closeCount < 11) {
+          for (const side of [-95, -32, 32, 95]) {
+            const rz = this.spawnRedDot(
+              "runner",
+              this.squadCenterX + side,
+              Math.max(285, this.squadCenterY - 180),
+            );
+            rz.hp = 920;
+            rz.maxHp = 920;
+            rz.ghostHp = 920;
+          }
+        }
+        this.triggerFrontlineFrenzyAmbush(6, 3600);
       } else if (this.greens.length <= targetSurvivors) {
-        // 当仅剩最后 4~6 名孤胆老兵时，立即解除残余小怪的狂暴冲刺并压低残血，确保最后几名幸存英雄浴血死战引爆母巢惨胜！
+        // 当仅剩最后 4 名孤胆老兵时，立即解除残余小怪的狂暴冲刺并压低残血，确保最后几名幸存英雄浴血死战引爆母巢惨胜！
         for (const r of this.reds) {
           if (r.kind !== "boss") {
             r.frenzyTimer = 0;
@@ -2033,6 +2782,7 @@ export class SiegeSimulator {
     const candidates: Array<{ idx: number; dist: number; hasLos: boolean }> = [];
     for (let i = 0; i < this.reds.length; i++) {
       const r = this.reds[i];
+      if ((r.mutatingTicks ?? 0) > 0) continue;
       if (r.kind === "boss" || r.frenzyTimer) continue;
       let minD = Infinity;
       let hasLos = false;
@@ -2087,10 +2837,27 @@ export class SiegeSimulator {
         }
       }
 
-      // 声呐潜行模式下：处于沉睡态 (dormant) 的死角丧尸在小队逼近至 320px 内或纵向进入前线扇区时必定惊醒迎敌（绝不沦为被越过的木桩！）
-      if (d.dormant) {
-        if (nearestGreenDist < 320 || d.y > this.squadCenterY - 340) {
+      if (d.sonarPingTicks && d.sonarPingTicks > 0) {
+        d.sonarPingTicks--;
+      }
+
+      // (a) 被咬感染后的 0.40s 原地抽搐等身尸变演出 (mutatingTicks > 0)：快速痉挛转化为普通等身尸变士兵，绝不膨胀成小Boss！
+      if (d.mutatingTicks && d.mutatingTicks > 0) {
+        d.mutatingTicks--;
+        d.vx = 0;
+        d.vy = 0;
+        if (d.mutatingTicks === 0) {
+          this.rings.push({ x: d.x, y: d.y, maxR: 46, ttl: 13, maxTtl: 13, kind: "casualty" });
+          this.spawnImpactParticles(d.x, d.y, 0, -1, "bio", 5);
+        }
+        continue;
+      }
+
+      // (b) 声呐沉睡尸群 (dormant) 与 90° 盲区拐角伏击尸群 (cornerAmbush)：在小队抵近切角半径 (365px) 前潜伏在阴影墙后，切角瞬间暴起扑杀！
+      if (d.dormant || d.cornerAmbush) {
+        if (nearestGreenDist < 365) {
           d.dormant = false;
+          d.cornerAmbush = false;
         } else {
           d.vx *= 0.2;
           d.vy *= 0.2;
@@ -2202,6 +2969,13 @@ export class SiegeSimulator {
       d.x += stepX;
       d.y += stepY;
 
+      // 室内完好家具与承重柱刚性碰撞（杜绝穿模！泰坦碾碎挡路家具，尸群抓挠猛砸阻路桌椅与玻璃屏风！）
+      const bashDmg = d.kind === "boss" ? 18 : 1.8;
+      this.resolvePropAndPillarCollisions(d, bashDmg, dirX, dirY);
+      for (const pt of this.pits) {
+        this.resolveCircleRect(d, pt.x, pt.y, pt.w, pt.h, 1.5);
+      }
+
       // 外墙折线段与死角内部隔墙刚性碰撞滑动
       for (const seg of this.outerWalls) {
         this.resolveSegmentCollision(d, seg.x1, seg.y1, seg.x2, seg.y2);
@@ -2252,10 +3026,13 @@ export class SiegeSimulator {
           }
           d.dormant = false;
           if (g.role === "turret") {
-            // 重机枪碉堡具备装甲，受击扣血（尸潮反扑终局阶段一击必破）
-            g.hp -= this.isOverrunMode() && this.tick / SIM_HZ >= 26.0 ? 3 : 1;
+            // 重机枪碉堡具备装甲，受击扣血并刚性弹开丧尸（尸潮反扑终局阶段一击必破）
+            g.hp -= this.isOverrunMode() && this.finalWaveTriggered ? 3 : 1;
             const nx = dist > 0.1 ? dx / dist : 0;
             const ny = dist > 0.1 ? dy / dist : -1;
+            const push = touchDist - dist + 1.5;
+            d.x += nx * push;
+            d.y += ny * push;
             d.vx = nx * 2.2;
             d.vy = Math.min(-1.5, ny * 2.2);
             d.spawnGraceTicks = 14;
@@ -2273,6 +3050,28 @@ export class SiegeSimulator {
         }
       }
     }
+
+    // 二次刚性无重叠消解：防止刚进入蛹化抽搐/保护帧的变异体在多人包夹时与相邻士兵产生任何几何重叠 (仅移动变异体，确保 jumpsOver5 === 0 且 postStepTouching === 0！)
+    for (let iter = 0; iter < 8; iter++) {
+      for (let ri = 0; ri < this.reds.length; ri++) {
+        const d = this.reds[ri];
+        if ((d.spawnGraceTicks ?? 0) <= 0 && (d.mutatingTicks ?? 0) <= 0) continue;
+        for (let gi = 0; gi < this.greens.length; gi++) {
+          const g = this.greens[gi];
+          const dx = d.x - g.x;
+          const dy = d.y - g.y;
+          const dist = Math.hypot(dx, dy);
+          const minSep = d.r + g.r + 1.6;
+          if (dist < minSep) {
+            const nx = dist > 0.05 ? dx / dist : Math.cos((ri + gi) * 1.9);
+            const ny = dist > 0.05 ? dy / dist : -1;
+            const overlap = minSep - dist + 0.5;
+            d.x += nx * overlap;
+            d.y += ny * overlap;
+          }
+        }
+      }
+    }
   }
 
   /**
@@ -2285,8 +3084,10 @@ export class SiegeSimulator {
 
     this.casualties++;
     this.infectedCount++;
-    this.alarmFlash = Math.min(1.0, this.alarmFlash + 0.65);
-    this.emitAudio("breach", 0.78, 1.12);
+    this.alarmFlash = 1.0;
+    this.infectionFlash = 1.0;
+    this.addTrauma(0.38);
+    this.emitAudio("infect-bite", 0.94, 1.0, g.x);
 
     const gx = g.x;
     const gy = g.y;
@@ -2317,17 +3118,32 @@ export class SiegeSimulator {
       }
     }
 
-    // 4. 阵亡的人类士兵在扑咬交界处突变为「变异枪兵」精英丧尸，掉头扑向昔日队友！
-    const spawnX = attacker ? (gx + attacker.x) * 0.5 : gx;
-    const spawnY = attacker ? Math.min(gy - 18, attacker.y - 4) : gy - 20;
-    const mutated = this.spawnRedDot("infected_elite", spawnX, spawnY);
+    // 4. 阵亡的人类士兵在被咬位置原地进入 0.40s 等身抽搐尸变 (mutatingTicks = 24)，转化为戴残破头盔的普通等身尸变士兵（绝不变成血牛小Boss！）
+    const mutated = this.spawnRedDot("infected_elite", gx, gy);
+    mutated.r = 7.4;
     const isLastStand = !this.isOverrunMode() && this.greens.length <= 6;
-    mutated.hp = isLastStand ? 52 : 135;
+    mutated.hp = isLastStand ? 28 : 42;
     mutated.maxHp = mutated.hp;
     mutated.ghostHp = mutated.hp;
     mutated.vx = 0;
-    mutated.vy = isLastStand ? -1.4 : mutated.speed * 0.55;
-    mutated.spawnGraceTicks = isLastStand ? 42 : 28;
+    mutated.vy = 0;
+    mutated.mutatingTicks = isLastStand ? 18 : 24;
+    mutated.spawnGraceTicks = isLastStand ? 46 : 40;
+    for (let gi = 0; gi < this.greens.length; gi++) {
+      const g2 = this.greens[gi];
+      const mdx = mutated.x - g2.x;
+      const mdy = mutated.y - g2.y;
+      const mDist = Math.hypot(mdx, mdy);
+      const minSep = mutated.r + g2.r + 1.8;
+      if (mDist < minSep) {
+        const nx = mDist > 0.1 ? mdx / mDist : Math.cos(gi * 1.7);
+        const ny = mDist > 0.1 ? mdy / mDist : -1;
+        mutated.x += nx * (minSep - mDist);
+        mutated.y += ny * (minSep - mDist);
+      }
+    }
+    mutated.prevX = mutated.x;
+    mutated.prevY = mutated.y;
     if (isLastStand) {
       for (const r of this.reds) {
         if (r.kind !== "boss") {
@@ -2341,22 +3157,22 @@ export class SiegeSimulator {
     this.rings.push({
       x: gx,
       y: gy,
-      maxR: 68,
-      ttl: 20,
-      maxTtl: 20,
+      maxR: 92,
+      ttl: 24,
+      maxTtl: 24,
       kind: "casualty",
     });
     this.pendingDecals.push({
-      kind: "blood",
+      kind: "boss_blood",
       x: gx,
       y: gy,
-      r: 16,
+      r: 22,
       seed: this.tick + greenIdx,
     });
-    this.spawnImpactParticles(gx, gy, 0, 1, "bio", 8);
-    this.spawnImpactParticles(gx, gy, 0, -1, "blood", 6);
+    this.spawnImpactParticles(gx, gy, 0, 1, "bio", 14);
+    this.spawnImpactParticles(gx, gy, 0, -1, "blood", 10);
 
-    this.addBanner(gx, gy - 14, "+1", [255, 75, 165, 255]);
+    this.addBanner(gx, gy - 16, "-1", [255, 55, 185, 255]);
   }
 
   /**
@@ -2380,28 +3196,37 @@ export class SiegeSimulator {
       return { x: subX + (g.id % 2 === 0 ? -15 : 15), y: targetY };
     }
 
-    const baseGoalY = clamp(this.squadCenterY + g.slotY, 290, WORLD_H - 80);
-    const b = getCorridorBounds(baseGoalY, this.mode);
-    const baseGoalX = clamp(this.squadCenterX + g.slotX, b.left + 32, b.right - 32);
+    // 将战术阵位 (slotX, slotY) 按当前迷宫行进方向角 squadMoveAngle 实时旋转（横穿东/西走廊时尖兵自动转向走廊前方切角！）
+    const rot = this.squadMoveAngle + Math.PI * 0.5;
+    const cosR = Math.cos(rot);
+    const sinR = Math.sin(rot);
+    const rSlotX = g.slotX * cosR - g.slotY * sinR;
+    const rSlotY = g.slotX * sinR + g.slotY * cosR;
 
-    // 若从 squadCenter 到该阵位点畅通无阻且不在障碍格内，直接使用该阵位
+    const baseGoalY = clamp(this.squadCenterY + rSlotY, 290, WORLD_H - 80);
+    const b = getCorridorBounds(baseGoalY, this.mode);
+    const baseGoalX = clamp(this.squadCenterX + rSlotX, b.left + 32, b.right - 32);
+
+    // 若从 squadCenter 到该阵位点畅通无阻且不在墙体或完好家具内，直接使用该阵位
     const gx = clamp(Math.floor(baseGoalX / NAV_CELL), 0, NAV_COLS - 1);
     const gy = clamp(Math.floor(baseGoalY / NAV_CELL), 0, NAV_ROWS - 1);
     if (
       !this.navBlocked[gy * NAV_COLS + gx] &&
+      !this.isPointInsideObstacle(baseGoalX, baseGoalY, g.r + 2.5) &&
       this.hasLineOfSight(this.squadCenterX, this.squadCenterY, baseGoalX, baseGoalY)
     ) {
       return { x: baseGoalX, y: baseGoalY };
     }
 
-    // 若阵位点落在隔墙另一侧或反应堆屏蔽岛内，沿连线向 squadCenter 收缩直至无墙体阻隔
-    for (const scale of [0.6, 0.35, 0.15]) {
+    // 若阵位点落在隔墙另一侧或完好家具内部，沿连线向 squadCenter 收缩直至落点完全合法无穿模！
+    for (const scale of [0.72, 0.48, 0.28, 0.12]) {
       const tx = this.squadCenterX + (baseGoalX - this.squadCenterX) * scale;
       const ty = this.squadCenterY + (baseGoalY - this.squadCenterY) * scale;
       const tgx = clamp(Math.floor(tx / NAV_CELL), 0, NAV_COLS - 1);
       const tgy = clamp(Math.floor(ty / NAV_CELL), 0, NAV_ROWS - 1);
       if (
         !this.navBlocked[tgy * NAV_COLS + tgx] &&
+        !this.isPointInsideObstacle(tx, ty, g.r + 2.5) &&
         this.hasLineOfSight(this.squadCenterX, this.squadCenterY, tx, ty)
       ) {
         return { x: tx, y: ty };
@@ -2416,51 +3241,59 @@ export class SiegeSimulator {
   private updateGreenArmy(tSec: number): void {
     if (this.greens.length === 0) return;
 
-    // 1. 沿专属 CQB 战术航点折线 (this.waypoints) 的弧长参数 this.squadPathDist 物理匀速/变速推进：
-    //    核心铁律：「前排丧尸未肃清前绝不越过、绝不穿怪而过！」
+    // 1. 沿专属 90° 迷宫航点折线 (this.waypoints) 的弧长参数 this.squadPathDist 物理推进：
+    //    核心铁律：沿当前走廊朝向单位向量 (fwdX, fwdY) 精确检测前方丧尸——无论小队向东、向西还是向北推进，前方丧尸未肃清前绝不穿怪而过！
+    const fwdX = Math.cos(this.squadMoveAngle);
+    const fwdY = Math.sin(this.squadMoveAngle);
     let hasCloseFrontEnemy = false;
-    let maxSouthZombieY = -Infinity;
+    let minFrontClearance = Infinity;
     for (let i = 0; i < this.reds.length; i++) {
       const r = this.reds[i];
-      const ry = r.y + r.r;
-      if (ry > this.squadCenterY - 260) {
-        if (ry > maxSouthZombieY) maxSouthZombieY = ry;
+      if ((r.mutatingTicks ?? 0) > 0) continue;
+      if (r.dormant || r.cornerAmbush || (r.mutatingTicks ?? 0) > 0) continue;
+      const dx = r.x - this.squadCenterX;
+      const dy = r.y - this.squadCenterY;
+      const distToSquad = Math.hypot(dx, dy);
+      if (distToSquad > 295) continue;
+      if (!this.hasLineOfSight(this.squadCenterX, this.squadCenterY, r.x, r.y)) continue;
+
+      const fwdProj = dx * fwdX + dy * fwdY - r.r;
+      const sideProj = Math.abs(-dx * fwdY + dy * fwdX);
+      if (sideProj > 210) continue;
+      if (fwdProj > -55 && fwdProj < minFrontClearance) {
+        minFrontClearance = fwdProj;
       }
-      const dy = this.squadCenterY - ry;
-      if (
-        dy > -60 &&
-        dy < 165 &&
-        (Math.abs(r.x - this.squadCenterX) < 250 ||
-          this.hasLineOfSight(this.squadCenterX, this.squadCenterY, r.x, r.y))
-      ) {
+      if (fwdProj > -45 && fwdProj < 165) {
         hasCloseFrontEnemy = true;
       }
     }
 
-    const scheduleDist = clamp(Math.max(0, tSec - 3.9) / 21.0, 0, 1) * this.totalPathLen;
+    const paceSpan = 24.2;
+    const scheduleDist = clamp(Math.max(0, tSec - 3.9) / paceSpan, 0, 1) * this.totalPathLen;
     const maxSquadSpd =
       tSec < 4.5
-        ? 0.95
-        : tSec >= 23.0
-          ? 3.15
+        ? 1.65
+        : tSec >= 19.5
+          ? 4.62
           : this.counterPushActive
-            ? 2.75
-            : 2.4;
-    let pathAdvance = clamp((scheduleDist - this.squadPathDist) * 0.11, 0.7, maxSquadSpd);
+            ? 4.45
+            : 4.32;
+    let pathAdvance = clamp((scheduleDist - this.squadPathDist) * 0.24, 1.85, maxSquadSpd);
 
-    // 若前排仍有丧尸逼近小队前线 (maxSouthZombieY > squadCenterY - 175)，小队原地驻停集火清怪（若压入或处于小队南侧则后撤清剿），绝不越过任何一只活体丧尸！
-    if (maxSouthZombieY > this.squadCenterY - 110) {
-      pathAdvance = maxSouthZombieY > this.squadCenterY - 20 ? -2.4 : -0.85;
-    } else if (maxSouthZombieY > this.squadCenterY - 175) {
-      pathAdvance = 0;
+    // 若正在商铺内驻停破障救人 (holdForRescueTicks > 0) 或前排有丧尸贴近，小队原地驻停防守门口（让玩家彻底看清破障与救人全过程！）
+    if (minFrontClearance < 56) {
+      pathAdvance = minFrontClearance < 12 ? -2.0 : -0.75;
     } else if (this.holdForRescueTicks > 0) {
       this.holdForRescueTicks--;
-      pathAdvance = Math.min(pathAdvance, 0.55);
+      pathAdvance = 0;
+    } else if (minFrontClearance < 76) {
+      pathAdvance = 0;
     } else if (hasCloseFrontEnemy) {
-      pathAdvance = Math.min(pathAdvance, this.counterPushActive ? 0.65 : 0.4);
+      pathAdvance = Math.min(pathAdvance, this.counterPushActive ? 2.75 : 2.25);
     }
 
-    this.squadPathDist = clamp(this.squadPathDist + pathAdvance, 0, this.totalPathLen);
+    const minDistFloor = this.hiveHallEnteredSec > 0 ? Math.max(0, this.totalPathLen - 145) : 0;
+    this.squadPathDist = clamp(this.squadPathDist + pathAdvance, minDistFloor, this.totalPathLen);
 
     // 根据弧长 this.squadPathDist 在航点折线上精确插值 squadCenterX, squadCenterY 与行进朝向角
     const wps = this.waypoints;
@@ -2484,9 +3317,9 @@ export class SiegeSimulator {
     let dAng = targetMoveAng - this.squadMoveAngle;
     while (dAng > Math.PI) dAng -= Math.PI * 2;
     while (dAng < -Math.PI) dAng += Math.PI * 2;
-    this.squadMoveAngle += dAng * 0.1;
+    this.squadMoveAngle += dAng * 0.14;
 
-    // 2. 每名士兵依靠真实物理速度 (vx, vy) 与双向 BFS 寻路流场向各自固定战术阵位机动（严格限速 <= 3.15px/tick，绝无穿墙或瞬移！）
+    // 2. 每名士兵依靠真实物理速度 (vx, vy) 与双向 BFS 寻路流场向各自战术阵位机动（严格限速 <= 4.65px/tick，绝无穿墙或瞬移！）
     let totalUnits = this.greens.length;
 
     for (let idx = 0; idx < totalUnits; idx++) {
@@ -2500,15 +3333,15 @@ export class SiegeSimulator {
       const toGoalX = goal.x - g.x;
       const toGoalY = goal.y - g.y;
       const distToGoal = Math.hypot(toGoalX, toGoalY);
-      const maxUnitSpd = g.role === "turret" ? 2.65 : tSec >= 24.5 ? 3.05 : 2.85;
+      const maxUnitSpd = g.role === "turret" ? 3.35 : tSec >= 22.0 ? 4.45 : 4.15;
 
       let steerX = 0;
       let steerY = 0;
 
-      // 若士兵与阵位目标点之间无墙体阻挡，平滑驶向阵位；若隔着侧室墙壁、监区隔墙或反应堆岛，则沿 squadNavDist 流场科学绕出门口！
+      // 若士兵与阵位目标点之间无墙体阻挡，平滑驶向阵位；若隔着迷宫墙壁，则沿 squadNavDist 流场科学绕过 90° 拐角！
       if (this.hasLineOfSight(g.x, g.y, goal.x, goal.y)) {
         if (distToGoal > 0.5) {
-          const spd = Math.min(maxUnitSpd, distToGoal * 0.22);
+          const spd = Math.min(maxUnitSpd, distToGoal * 0.25);
           steerX = (toGoalX / distToGoal) * spd;
           steerY = (toGoalY / distToGoal) * spd;
         }
@@ -2518,42 +3351,51 @@ export class SiegeSimulator {
           steerX = flow.fx * maxUnitSpd;
           steerY = flow.fy * maxUnitSpd;
         } else if (distToGoal > 0.5) {
-          const spd = Math.min(maxUnitSpd, distToGoal * 0.18);
+          const spd = Math.min(maxUnitSpd, distToGoal * 0.2);
           steerX = (toGoalX / distToGoal) * spd;
           steerY = (toGoalY / distToGoal) * spd;
         }
       }
 
-      // 单兵 CQB 战术风筝后撤与防越过阻断：
-      // 1) 当非狂暴态普通丧尸逼近至 82px 以内时，士兵自动向后风筝拉扯边退边射（绝不傻站或主动撞向普通怪）；
-      // 2) 当本兵前方走廊仍有未清丧尸 (r.y + r.r > g.y - 95) 时，严禁该士兵向北跨过丧尸防线！
+      // 全向 2D CQB 战术风筝后撤与防穿怪阻断（支持东/西/北任意迷宫走廊方向）：
       let nearestRed: RedDot | null = null;
       let nearestRedDist = Infinity;
-      let maxLocalZombieY = -Infinity;
+      let blockedAlongSteer = false;
+      const steerMag = Math.hypot(steerX, steerY);
+      const sDirX = steerMag > 0.05 ? steerX / steerMag : fwdX;
+      const sDirY = steerMag > 0.05 ? steerY / steerMag : fwdY;
+
       for (let ri = 0; ri < this.reds.length; ri++) {
         const r = this.reds[ri];
-        const edgeDist = Math.hypot(r.x - g.x, r.y - g.y) - r.r - g.r;
-        if (edgeDist < 220 && this.hasLineOfSight(g.x, g.y, r.x, r.y)) {
+        if (r.dormant || r.cornerAmbush || (r.mutatingTicks ?? 0) > 0) continue;
+        const dx = r.x - g.x;
+        const dy = r.y - g.y;
+        const edgeDist = Math.hypot(dx, dy) - r.r - g.r;
+        if (edgeDist < 210 && this.hasLineOfSight(g.x, g.y, r.x, r.y)) {
           if (edgeDist < nearestRedDist) {
             nearestRedDist = edgeDist;
             nearestRed = r;
           }
-          if (Math.abs(r.x - g.x) < 190 && r.y + r.r > maxLocalZombieY) {
-            maxLocalZombieY = r.y + r.r;
+          const proj = dx * sDirX + dy * sDirY - r.r;
+          const lat = Math.abs(-dx * sDirY + dy * sDirX);
+          if (proj > -12 && proj < 86 && lat < 68) {
+            blockedAlongSteer = true;
           }
         }
       }
 
-      if (nearestRed && nearestRedDist < 82 && (nearestRed.frenzyTimer ?? 0) <= 0) {
+      if (nearestRed && nearestRedDist < 78 && (nearestRed.frenzyTimer ?? 0) <= 0) {
         const awayX = g.x - nearestRed.x;
-        const awayY = Math.max(24, g.y - nearestRed.y);
+        const awayY = g.y - nearestRed.y;
         const awayLen = Math.hypot(awayX, awayY) || 1;
-        steerX = (awayX / awayLen) * maxUnitSpd;
-        steerY = (awayY / awayLen) * maxUnitSpd;
-      } else if (maxSouthZombieY > g.y + 115) {
-        steerY = maxUnitSpd;
-      } else if ((maxLocalZombieY > g.y - 95 || maxSouthZombieY > g.y + 45) && steerY < 0) {
-        steerY = maxLocalZombieY > g.y - 52 || maxSouthZombieY > g.y + 85 ? 1.55 : 0;
+        steerX = (awayX / awayLen) * (maxUnitSpd * 0.85);
+        steerY = (awayY / awayLen) * (maxUnitSpd * 0.85);
+      } else if (blockedAlongSteer) {
+        const fwdComp = steerX * sDirX + steerY * sDirY;
+        if (fwdComp > 0) {
+          steerX -= sDirX * fwdComp;
+          steerY -= sDirY * fwdComp;
+        }
       }
 
       // 队友间柔和防重叠排斥力
@@ -2574,11 +3416,11 @@ export class SiegeSimulator {
         }
       }
 
-      g.vx = g.vx * 0.42 + (steerX + clamp(repelX, -1.2, 1.2)) * 0.58;
-      g.vy = g.vy * 0.42 + (steerY + clamp(repelY, -1.2, 1.2)) * 0.58;
+      g.vx = g.vx * 0.38 + (steerX + clamp(repelX, -1.3, 1.3)) * 0.62;
+      g.vy = g.vy * 0.38 + (steerY + clamp(repelY, -1.3, 1.3)) * 0.62;
 
       const stepMag = Math.hypot(g.vx, g.vy);
-      const maxAllowedStep = maxUnitSpd + 0.25;
+      const maxAllowedStep = maxUnitSpd + 0.18;
       if (stepMag > maxAllowedStep) {
         g.vx = (g.vx / stepMag) * maxAllowedStep;
         g.vy = (g.vy / stepMag) * maxAllowedStep;
@@ -2586,6 +3428,12 @@ export class SiegeSimulator {
 
       g.x += g.vx;
       g.y += g.vy;
+
+      // 室内完好家具、天井与混凝土柱刚性防穿模排斥（人类士兵 100% 沿桌椅/货架/病床边缘平滑绕行，绝不踩上或穿模家具！）
+      this.resolvePropAndPillarCollisions(g, 0, 0, 0);
+      for (const pt of this.pits) {
+        this.resolveCircleRect(g, pt.x, pt.y, pt.w, pt.h, 1.5);
+      }
 
       // 外墙与死角隔墙刚性碰撞排斥：士兵绝不可穿墙！
       for (const seg of this.outerWalls) {
@@ -2596,14 +3444,16 @@ export class SiegeSimulator {
       }
       g.y = clamp(g.y, 280, WORLD_H - 70);
 
-      // 物理铁律保底：单帧合成位移绝不可超过 3.6px/tick
+      // 物理铁律保底：单帧合成位移绝不可超过 4.65px/tick (< 5.0 零瞬移红线！)
       const finalDX = g.x - g.prevX;
       const finalDY = g.y - g.prevY;
       const finalDist = Math.hypot(finalDX, finalDY);
-      if (finalDist > 3.6) {
-        g.x = g.prevX + (finalDX / finalDist) * 3.6;
-        g.y = g.prevY + (finalDY / finalDist) * 3.6;
+      if (finalDist > 4.65) {
+        g.x = g.prevX + (finalDX / finalDist) * 4.65;
+        g.y = g.prevY + (finalDY / finalDist) * 4.65;
       }
+      // 二次确认完好家具零穿模
+      this.resolvePropAndPillarCollisions(g, 0, 0, 0);
     }
 
     // 士兵位移后再次执行「零免疫接触即感染」判定，确保双向移动均 100% 触发物理感染！
@@ -2630,6 +3480,7 @@ export class SiegeSimulator {
         this.squadBuffed || this.counterPushActive ? "heavy-mg" : "mg",
         0.24,
         0.9 + this.rng() * 0.18,
+        this.squadCenterX,
       );
     }
   }
@@ -2662,17 +3513,14 @@ export class SiegeSimulator {
       return;
     }
 
-    // 0. 优先检测该士兵近身扇区内是否存在紧迫丧尸威胁 (距离 < 215px 或已压至士兵前方 150px 内)：
-    //    若近身有怪，全员100%优先集火肃清贴脸前排怪，绝不分心去打侧面箱子或远处母巢！
+    // 0. 优先检测该士兵全向 2D 近身扇区内是否存在紧迫丧尸威胁 (距离 < 210px)：
+    //    若近身有怪（如刚从 90° 盲区拐角扑出的丧尸），全员 100% 优先集火肃清贴脸怪！
     let hasCloseZombieThreat = false;
     for (let i = 0; i < this.reds.length; i++) {
       const r = this.reds[i];
+      if ((r.mutatingTicks ?? 0) > 0) continue;
       const dist = Math.hypot(r.x - unit.x, r.y - unit.y) - r.r;
-      if (
-        (dist < 215 || r.y + r.r > unit.y - 150) &&
-        dist <= maxRange &&
-        this.hasLineOfSight(unit.x, unit.y, r.x, r.y)
-      ) {
+      if (dist < 210 && dist <= maxRange && this.hasLineOfSight(unit.x, unit.y, r.x, r.y)) {
         hasCloseZombieThreat = true;
         break;
       }
@@ -2685,27 +3533,29 @@ export class SiegeSimulator {
     let aimTargetY = this.hive.y;
     let foundTarget = false;
 
-    if (!hasCloseZombieThreat) {
-      for (let ni = 0; ni < this.nodes.length; ni++) {
-        const node = this.nodes[ni];
-        if (node.broken) continue;
-        const unlockSec = ni === 0 ? 6.5 : ni === 1 ? 14.0 : 21.2;
-        const distToNode = Math.hypot(node.x - unit.x, node.y - unit.y);
-        const isNodeShooter =
-          tSec >= unlockSec + 1.0
-            ? unitIdx % 2 === 0
-            : unitIdx === 0 || unitIdx === totalUnits - 1 || unitIdx % 3 === 0;
-        if (
-          tSec >= unlockSec &&
-          distToNode <= maxRange &&
-          isNodeShooter &&
-          this.hasLineOfSight(unit.x, unit.y, node.x, node.y)
-        ) {
-          const nodeSpread = ((unitIdx % 3) - 1) * 7;
-          aimTargetX = node.x + nodeSpread;
-          aimTargetY = node.y;
+    if (!hasCloseZombieThreat && tSec >= 4.4) {
+      const isNodeShooter = unitIdx === 0 || unitIdx % 4 === 0;
+      if (isNodeShooter) {
+        let bestNode: TacticalNodeState | null = null;
+        let bestNodeDist = 235;
+        for (let ni = 0; ni < this.nodes.length; ni++) {
+          const node = this.nodes[ni];
+          if (node.broken) continue;
+          const distToNode = Math.hypot(node.x - unit.x, node.y - unit.y);
+          if (
+            distToNode <= Math.min(maxRange, bestNodeDist) &&
+            this.hasLineOfSight(unit.x, unit.y, node.x, node.y)
+          ) {
+            bestNodeDist = distToNode;
+            bestNode = node;
+          }
+        }
+        if (bestNode) {
+          const rot = bestNode.rot ?? 0;
+          // 瞄准铁笼正门挂锁位置精准打飞锁头！
+          aimTargetX = bestNode.x - Math.sin(rot) * 14;
+          aimTargetY = bestNode.y + Math.cos(rot) * 14;
           foundTarget = true;
-          break;
         }
       }
     }
@@ -2731,6 +3581,7 @@ export class SiegeSimulator {
 
       for (let i = 0; i < this.reds.length; i++) {
         const r = this.reds[i];
+        if ((r.mutatingTicks ?? 0) > 0) continue;
         const dist = Math.hypot(r.x - unit.x, r.y - unit.y) - r.r;
         if (dist > maxRange) continue;
 
@@ -2746,9 +3597,10 @@ export class SiegeSimulator {
         const sticky = r.id === unit.lockedTargetId ? -18 : 0;
         const bossBonus = r.kind === "boss" && !hasCloseZombieThreat ? -115 : r.kind === "boss" ? -35 : 0;
         const carrierBonus = r.kind === "carrier" && unitIdx % 3 === 1 ? -40 : 0;
-        // 强烈前排优先权重：越靠南（r.y 越大，越逼近小队防线）或距离 < 175px 的丧尸优先级最高，必须先打死最前面的怪！
-        const frontUrgency = -Math.max(0, r.y + r.r - (unit.y - 260)) * 2.15 - (dist < 175 ? 190 : 0);
-        const sectorPenalty = Math.abs(r.x - (this.squadCenterX + sectorBiasX)) * 0.9;
+        const traitorBonus = r.kind === "infected_elite" ? -45 : 0;
+        // 强烈全向近身优先权重：距离 < 175px 扑出拐角的丧尸优先级最高，必须先打死贴脸怪！
+        const frontUrgency = -Math.max(0, 285 - dist) * 2.35 - (dist < 175 ? 215 : 0);
+        const sectorPenalty = Math.abs(r.x - (unit.x + sectorBiasX * 0.45)) * 0.45;
         const slotSpreadPenalty = r.kind === "boss" ? 0 : ((i + unitIdx) % 5) * 12;
         const score =
           dist * 0.85 +
@@ -2757,6 +3609,7 @@ export class SiegeSimulator {
           sticky +
           bossBonus +
           carrierBonus +
+          traitorBonus +
           frontUrgency;
         if (score < bestScore) {
           bestScore = score;
@@ -2844,17 +3697,42 @@ export class SiegeSimulator {
     let hitType: "boss" | "hive" | "node" | "minion" | "wall" = "wall";
     let hitRedIdx = -1;
     let hitNodeIdx = -1;
+    let hitPropIdx = -1;
 
-    // 2a. 走廊外墙边界交点 + 室内死角隔墙 (deadCornerWalls) 精确阻挡
+    // 2a. 走廊外墙边界交点 + 室内死角隔墙 (deadCornerWalls) + 混凝土承重柱精确阻挡
     const dOuter = this.castRayToWalls(mx, my, ux, uy, bestDist);
     if (dOuter < bestDist) {
       bestDist = dOuter;
       hitType = "wall";
     }
+    for (let pli = 0; pli < this.pillars.length; pli++) {
+      const pl = this.pillars[pli];
+      const tPl = this.rayRectDist(mx, my, ux, uy, bestDist, pl.x, pl.y, pl.w, pl.h);
+      if (tPl < bestDist) {
+        bestDist = tPl;
+        hitType = "wall";
+      }
+    }
+
+    // 2a-2. 室内完好家具与玻璃橱窗弹道拦截：
+    //       - 高耸货架/售货机/钢化玻璃窗 100% 物理挡弹直至被打碎坍塌！
+    //       - 半高餐桌/沙发/病床/检票闸机 33% 概率擦碰掩体表面飞溅木屑并逐步轰碎！
+    for (let pi = 0; pi < this.props.length; pi++) {
+      const prop = this.props[pi];
+      if (!prop.intact) continue;
+      if (!prop.blocksBulletsFull && (this.tick + unitIdx + prop.id) % 3 !== 0) continue;
+      const tProp = this.rayRectDist(mx, my, ux, uy, bestDist, prop.x, prop.y, prop.w, prop.h);
+      if (tProp < bestDist) {
+        bestDist = tProp;
+        hitType = "wall";
+        hitPropIdx = pi;
+      }
+    }
 
     // 2b. 检测所有丧尸与泰坦 Boss（前排怪结结实实挡住后排！）
     for (let i = 0; i < this.reds.length; i++) {
       const r = this.reds[i];
+      if ((r.mutatingTicks ?? 0) > 0) continue;
       const dx = r.x - mx;
       const dy = r.y - my;
       const proj = dx * ux + dy * uy;
@@ -2870,6 +3748,7 @@ export class SiegeSimulator {
           hitType = r.kind === "boss" ? "boss" : "minion";
           hitRedIdx = i;
           hitNodeIdx = -1;
+          hitPropIdx = -1;
         }
       }
     }
@@ -2893,6 +3772,7 @@ export class SiegeSimulator {
           hitType = "node";
           hitNodeIdx = ni;
           hitRedIdx = -1;
+          hitPropIdx = -1;
         }
       }
     }
@@ -2913,6 +3793,7 @@ export class SiegeSimulator {
             hitType = "hive";
             hitRedIdx = -1;
             hitNodeIdx = -1;
+            hitPropIdx = -1;
           }
         }
       }
@@ -2921,33 +3802,37 @@ export class SiegeSimulator {
     const hitX = mx + ux * bestDist;
     const hitY = my + uy * bestDist;
 
-    // 3. 伤害结算
+    // 3. 伤害结算（降低约 28% 瞬时秒怪 DPS，展现扎实可读的门口火力拉锯与丧尸受击硬直！）
     const overrun = this.isOverrunMode();
-    const scaleFactor = totalUnits <= 6 ? 0.92 : 2.95 / Math.pow(totalUnits, 0.52);
-    const buffMult = unit.buffed || this.squadBuffed ? 1.18 : 1.0;
-    const roleMult = unit.role === "turret" ? 1.22 : unit.role === "sniper" ? 1.15 : 1.0;
-    const darkMult = !overrun ? 1.58 : this.isDarkMode ? 1.2 : 1.0;
-    const baseDmg = 1.48 * scaleFactor * buffMult * roleMult * darkMult;
+    const overrunCollapse = overrun && this.finalWaveTriggered;
+    const scaleFactor = totalUnits <= 6 ? 0.92 : 2.95 / Math.pow(totalUnits, 0.54);
+    const buffMult = unit.buffed || this.squadBuffed ? 1.16 : 1.0;
+    const roleMult = unit.role === "turret" ? 1.2 : unit.role === "sniper" ? 1.14 : 1.0;
+    const darkMult = overrunCollapse ? 0.95 : 1.35;
+    const baseDmg = 1.08 * scaleFactor * buffMult * roleMult * darkMult;
 
-    if (hitType === "minion" || hitType === "boss") {
+    if (hitPropIdx >= 0 && this.props[hitPropIdx]) {
+      this.damageProp(this.props[hitPropIdx], baseDmg * 5.8, ux, uy);
+    } else if (hitType === "minion" || hitType === "boss") {
       const target = this.reds[hitRedIdx];
       if (target) {
-        const lateBoost = overrun
-          ? tSec >= 24.8
-            ? 0.78
+        const inHiveAttrition =
+          !overrun &&
+          this.hiveHallEnteredSec > 0 &&
+          this.greens.length > 4 &&
+          (target.frenzyTimer ?? 0) > 0;
+        const lateBoost = overrunCollapse || inHiveAttrition
+          ? 0.65
+          : tSec >= 27.0
+            ? 2.15
             : tSec >= 15.0
-              ? 1.4
-              : 1.08
-          : tSec >= 24.5
-            ? 2.45
-            : tSec >= 14.0
-              ? 1.65
-              : 1.18;
-        const dmg = (target.kind === "boss" ? baseDmg * 1.18 : baseDmg * 1.42) * lateBoost;
+              ? 1.45
+              : 1.08;
+        const dmg = (target.kind === "boss" ? baseDmg * 1.15 : baseDmg * 1.32) * lateBoost;
         target.hp -= dmg;
         target.hitFlash = 1.0;
 
-        const kb = target.kind === "boss" ? 0.04 : (target.frenzyTimer ?? 0) > 0 ? 0.04 : 0.24;
+        const kb = target.kind === "boss" ? 0.04 : (target.frenzyTimer ?? 0) > 0 ? 0.04 : 0.28;
         target.vx = clamp(target.vx + ux * kb, -3.2, 3.2);
         target.vy = clamp(target.vy + uy * kb, -3.2, 3.2);
 
@@ -2962,54 +3847,72 @@ export class SiegeSimulator {
     } else if (hitType === "node") {
       const node = this.nodes[hitNodeIdx];
       if (node && !node.broken) {
-        const unlockSec = hitNodeIdx === 0 ? 8.5 : hitNodeIdx === 1 ? 15.8 : 22.8;
-        if (tSec >= unlockSec) {
-          node.hp -= baseDmg * 3.8;
-          node.hitFlash = 1.0;
-          if ((this.tick + unitIdx) % 4 === 0) {
-            this.spawnImpactParticles(hitX, hitY, ux, uy, "gold", 1);
-          }
-          if (node.hp <= 0) {
-            this.triggerNodeShatter(node);
-          }
-        } else {
-          node.hitFlash = 0.35;
+        // 枪兵对路障锁扣进行精确破拆切割（配合约 2 秒环形进度条，绝不一枪秒碎！）
+        node.breachProgress = Math.min(1.0, node.breachProgress + 0.00045);
+        node.hp = Math.max(0, node.maxHp * (1 - node.breachProgress));
+        node.hitFlash = 1.0;
+        if ((this.tick + unitIdx) % 5 === 0) {
+          this.spawnImpactParticles(hitX, hitY, ux, uy, "gold", 1);
+        }
+        if (node.breachProgress >= 1.0) {
+          this.triggerNodeShatter(node);
         }
       }
     } else if (hitType === "hive" && this.hive.alive) {
       const hiveDmg = overrun
-        ? baseDmg * 1.15
-        : tSec >= 33.4
-          ? baseDmg * 11.5
-          : tSec >= 29.8
-            ? baseDmg * 4.8
-            : tSec >= 25.8
-              ? baseDmg * 2.1
-              : baseDmg * 0.1;
+        ? overrunCollapse
+          ? baseDmg * 0.55
+          : baseDmg * 6.8
+        : tSec >= 39.0
+          ? baseDmg * 14.5
+          : tSec >= 33.5
+            ? baseDmg * 6.4
+            : tSec >= 27.5
+              ? baseDmg * 3.2
+              : baseDmg * 0.2;
       this.hive.hp -= hiveDmg;
       this.hive.hitFlash = 1.0;
       if ((this.tick + unitIdx) % 4 === 0) {
         this.spawnImpactParticles(hitX, hitY, ux, uy, "spark", 1);
       }
       if (overrun) {
-        // 尸潮大胜模式下，母巢甲壳坚守至最后一名人类沦陷（血量最低保留 18%）
         if (this.hive.hp < this.hive.maxHp * 0.18) {
           this.hive.hp = this.hive.maxHp * 0.18;
         }
       } else {
-        if (this.hive.hp <= 0 && tSec >= 34.6) {
+        const readyBlast =
+          this.hiveHallEnteredSec > 0 &&
+          ((this.greens.length <= 5 && tSec - this.hiveHallEnteredSec >= 3.0) ||
+            tSec - this.hiveHallEnteredSec >= 7.8);
+        if (this.hive.hp <= 0 && readyBlast) {
           this.triggerHiveDestruction();
-        } else if (this.hive.hp < 80 && tSec < 34.6) {
+        } else if (this.hive.hp < 80 && !readyBlast) {
           this.hive.hp = 80;
         }
       }
     }
 
-    // 人类惨胜模式保底引爆：当时间 >= 34.6s 且残存的 3~6 名孤胆老兵浴血坚持到最后时刻时，引爆高能C4彻底炸毁母巢！
-    if (!overrun && this.hive.alive && tSec >= 34.6 && this.greens.length > 0) {
+    // 人类惨胜模式保底引爆：当大军已在母巢前惨烈牺牲至仅剩 <= 5 名孤胆英雄 (进大厅 >= 3.2s) 或在大厅血战满 7.8s 时，引爆高能C4彻底炸毁母巢！
+    if (
+      !overrun &&
+      this.hive.alive &&
+      this.hiveHallEnteredSec > 0 &&
+      this.greens.length > 0 &&
+      ((this.greens.length <= 5 && tSec - this.hiveHallEnteredSec >= 3.2) ||
+        tSec - this.hiveHallEnteredSec >= 7.8)
+    ) {
       this.triggerHiveDestruction();
     }
 
+    if ((this.tick + unitIdx) % 4 === 0) {
+      this.spawnShellCasing(
+        mx,
+        my,
+        ux,
+        uy,
+        unit.role === "turret" || unit.role === "sniper",
+      );
+    }
     this.firingLines.push({
       x1: mx,
       y1: my,
@@ -3029,7 +3932,8 @@ export class SiegeSimulator {
     node.broken = true;
     node.hp = 0;
     this.phase = this.counterPushActive ? "counterpush" : "evolve";
-    this.emitAudio("adrenaline", 0.95, 1.08);
+    this.addTrauma(0.38);
+    this.emitAudio("adrenaline", 0.95, 1.08, node.x);
 
     this.pendingDecals.push({
       kind: "crystals",
@@ -3040,16 +3944,23 @@ export class SiegeSimulator {
     });
 
     if (node.kind === "rescue_cage") {
+      node.openAnim = 0.14;
       const addCount = Math.min(node.rewardValue, 26 - this.greens.length);
       const role = node.rewardRole ?? "rifle";
+      const rot = node.rot ?? 0;
+      const doorAng = rot + Math.PI * 0.5;
       for (let i = 0; i < addCount; i++) {
-        const ang = (i / Math.max(1, addCount)) * Math.PI * 2;
-        this.spawnGreenUnit(role, node.x + Math.cos(ang) * 16, node.y + Math.sin(ang) * 16);
+        const sx = node.x + Math.cos(doorAng) * 16 + (i - (addCount - 1) * 0.5) * 10;
+        const sy = node.y + Math.sin(doorAng) * 16;
+        const clean = this.sanitizeSpawnPoint(sx, sy, 10);
+        this.spawnGreenUnit(role, clean.x, clean.y);
       }
-      this.holdForRescueTicks = Math.max(this.holdForRescueTicks, 68);
+      this.holdForRescueTicks = Math.max(this.holdForRescueTicks, 5);
       this.rescuedCount += addCount;
-      this.rings.push({ x: node.x, y: node.y, maxR: 110, ttl: 20, maxTtl: 20, kind: "rescue" });
-      this.addBanner(node.x, node.y - 10, `+${addCount}`, [85, 255, 165, 255]);
+      this.rings.push({ x: node.x, y: node.y, maxR: 58, ttl: 16, maxTtl: 16, kind: "rescue" });
+      if (addCount > 0) {
+        this.addBanner(node.x, node.y - 12, `+${addCount}`, [85, 255, 165, 255]);
+      }
     } else if (node.kind === "multiply_crystal") {
       const currentCount = this.greens.length;
       const addCount =
@@ -3068,7 +3979,7 @@ export class SiegeSimulator {
       this.squadBuffed = true;
       for (const g of this.greens) g.buffed = true;
       this.rings.push({ x: node.x, y: node.y, maxR: 125, ttl: 22, maxTtl: 22, kind: "multiply" });
-      this.addBanner(node.x, node.y - 10, `×2`, [255, 225, 75, 255]);
+      this.addBanner(node.x, node.y - 10, node.label || "x2", [255, 225, 75, 255]);
     } else if (node.kind === "bunker_pad") {
       // 部署 2 座前线重机枪碉堡 + 4 名护卫步兵（从工事箱位置按物理速度展开阵型）
       for (const side of [-1, 1]) {
@@ -3082,7 +3993,7 @@ export class SiegeSimulator {
         const ang = (i / Math.max(1, addInf)) * Math.PI * 2;
         this.spawnGreenUnit("rifle", node.x + Math.cos(ang) * 16, node.y + Math.sin(ang) * 16);
       }
-      this.holdForRescueTicks = Math.max(this.holdForRescueTicks, 45);
+      this.holdForRescueTicks = Math.max(this.holdForRescueTicks, 16);
       this.squadBuffed = true;
       this.rings.push({ x: node.x, y: node.y, maxR: 115, ttl: 20, maxTtl: 20, kind: "multiply" });
       this.addBanner(node.x, node.y - 10, "+2", [95, 225, 255, 255]);
@@ -3105,7 +4016,8 @@ export class SiegeSimulator {
     if (!this.hive.alive) return;
     this.hive.alive = false;
     this.hive.hp = 0;
-    this.emitAudio("hive-blast", 1.0, 1.0);
+    this.addTrauma(1.0);
+    this.emitAudio("hive-blast", 1.0, 1.0, this.hive.x);
 
     this.rings.push({
       x: this.hive.x,
@@ -3192,7 +4104,8 @@ export class SiegeSimulator {
       this.addBanner(d.x, d.y - 10, `+${addCount}`, [75, 255, 155, 255]);
     } else if (d.kind === "boss") {
       this.bossesKilled++;
-      this.emitAudio("boss-kill", 1.0, d.isFinalBoss ? 0.82 : 1.0);
+      this.addTrauma(d.isFinalBoss ? 0.72 : 0.48);
+      this.emitAudio("boss-kill", 1.0, d.isFinalBoss ? 0.82 : 1.0, d.x);
       this.rings.push({
         x: d.x,
         y: d.y,
@@ -3210,7 +4123,7 @@ export class SiegeSimulator {
       });
     }
     if (this.kills % 2 === 0) {
-      this.emitAudio("kill-pop", 0.36, 0.9 + (this.kills % 7) * 0.04);
+      this.emitAudio("kill-pop", 0.36, 0.9 + (this.kills % 7) * 0.04, d.x);
     }
     if (this.kills % 6 === 0 && tSec > 1.0 && d.kind !== "boss" && d.kind !== "carrier") {
       this.pendingDecals.push({

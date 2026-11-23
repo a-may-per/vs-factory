@@ -5,7 +5,7 @@
 //   2. 指定音乐片段（--song ./my.mp3 --clip 00:42-00:57 或 --start 42 --duration 15）：精准截取指定时间段并自动淡入淡出+重算节拍轴。
 //   3. 外部曲库目录扫描（--audio-dir ./songs --count 10）：扫描目录下所有 mp3/wav/m4a/flac/mp4，自动提取每首歌的高潮片段批量成片。
 //   4. 无外部音乐时自动使用内置 4 大无版权电音合成器。
-import { mkdirSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readdirSync, writeFileSync, existsSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderMusicBallVideo } from "./music-ball/src/render.ts";
@@ -27,7 +27,7 @@ import {
   type SynthGenre,
 } from "./music-ball/src/synth-song.ts";
 import { simulate } from "./duel/src/sim.ts";
-import { DUEL_MATCHUPS } from "./duel/src/fighters.ts";
+import { CURATED_ALL_MATCHUPS } from "./duel/src/fighters.ts";
 import { renderDuel } from "./duel/src/render.ts";
 import { SIEGE_MAPS, SIEGE_MAP_IDS } from "./siege/src/config.ts";
 import { renderSiegeVideo } from "./siege/src/render.ts";
@@ -224,34 +224,67 @@ for (let i = 0; i < count; i++) {
       hashtags: ["#丧尸模拟", "#沙盒推演", "#电子斗蛐蛐", "#解压视频", "#策略塔防", `#${mapCfg.name}`],
     });
   } else {
-    const preset = DUEL_MATCHUPS[i % DUEL_MATCHUPS.length];
-    const id = `duel_${String(i + 1).padStart(2, "0")}_${preset.id}_s${seed}`;
+    const preset = CURATED_ALL_MATCHUPS[i % CURATED_ALL_MATCHUPS.length];
+    let bestSeed = seed;
+    let bestScore = -1e9;
+    let bestEvents = simulate(preset.fighterA, preset.fighterB, seed, 55);
+    for (let k = 0; k < 24; k++) {
+      const candSeed = seed + k * 17;
+      const evs = simulate(preset.fighterA, preset.fighterB, candSeed, 55);
+      const endEvC = evs.find(e => e.type === "end") as any;
+      const durC = endEvC?.duration ?? 55;
+      const winnerC = endEvC?.winner ?? "A";
+      let hpA = preset.fighterA.maxHp;
+      let hpB = preset.fighterB.maxHp;
+      for (const ev of evs as any[]) {
+        if ((ev.type === "damage" || ev.type === "heal") && typeof ev.hp === "number") {
+          if (ev.id === "A") hpA = ev.hp;
+          if (ev.id === "B") hpB = ev.hp;
+        }
+      }
+      const winMax = winnerC === "A" ? preset.fighterA.maxHp : preset.fighterB.maxHp;
+      const winPct = ((winnerC === "A" ? hpA : hpB) / Math.max(1, winMax)) * 100;
+      const inSweet = durC >= 20.0 && durC <= 23.4;
+      const sc = (inSweet ? 60 : -Math.abs(durC - 21.8) * 12) - winPct * 2.5;
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestSeed = candSeed;
+        bestEvents = evs;
+      }
+    }
+
+    const id = `duel_${String(i + 1).padStart(2, "0")}_${preset.id}_s${bestSeed}`;
     const eventsPath = join(outDir, `${id}.jsonl`);
     const outMp4 = join(outDir, `${id}.mp4`);
+    const outCover = join(outDir, `${id}_cover_3x4.png`);
 
-    console.log(`\n[${i + 1}/${count}] 正在模拟并渲染 Duel 对战 (${preset.title}, seed=${seed}) ...`);
-    const events = simulate(preset.fighterA, preset.fighterB, seed, 26);
-    writeFileSync(eventsPath, events.map(e => JSON.stringify(e)).join("\n"));
-    await renderDuel(eventsPath, outMp4, { coldOpen: true, bgm: true, hookText: preset.hook });
+    console.log(`\n[${i + 1}/${count}] 正在渲染 V4.0 Duel 丝血绝杀对局 (${preset.title}, seed=${bestSeed}) ...`);
+    writeFileSync(eventsPath, bestEvents.map(e => JSON.stringify(e)).join("\n"));
+    await renderDuel(eventsPath, outMp4, { coldOpen: true, bgm: true, hookText: preset.hook, coverPath: outCover });
+    try {
+      unlinkSync(eventsPath);
+    } catch {
+      // ignore
+    }
 
-    const endEv = events.find(e => e.type === "end") as any;
+    const endEv = bestEvents.find(e => e.type === "end") as any;
     const winnerName = endEv?.winner === "A" ? preset.fighterA.name : preset.fighterB.name;
 
     manifest.push({
       index: i + 1,
       id,
       workflow: "duel",
-      mode: "arena-duel",
+      mode: "arena-duel-v4",
       outMp4,
       resolution: "1080x1920",
-      durationSec: Number(((endEv?.duration ?? 20) + 3.1).toFixed(1)),
-      seed,
-      theme: "红蓝电竞擂台",
+      durationSec: Number(((endEv?.duration ?? 21.5) + 0.64).toFixed(1)),
+      seed: bestSeed,
+      theme: "暗黑霓虹几何竞技场",
       skinOrMatchup: preset.title,
-      bgmInfo: "程序化战斗交响电子乐",
-      publishTitle: `【电子斗蛐蛐】${preset.title}！${preset.hook}`,
-      pinnedComment: `恭喜【${winnerName}】极限拿下本场胜利！下期想看哪两个流派互殴？评论区点播！⚔️`,
-      hashtags: ["#电子斗蛐蛐", "#AI对战", "#游戏解说", "#解压競技", `#${preset.fighterA.name}`, `#${preset.fighterB.name}`],
+      bgmInfo: "五声音阶律动电音 + 粒子碰撞打击音效",
+      publishTitle: `${preset.fighterA.name} VS ${preset.fighterB.name}！${preset.hook} 看到最后谁赢了？`,
+      pinnedComment: `开局你押谁赢？恭喜【${winnerName}】丝血绝杀翻盘！下期想看哪两个机制对决？评论区点播安排！🔥`,
+      hashtags: ["#小球碰撞", "#物理模拟", "#解压视频", "#电子斗蛐蛐", `#${preset.fighterA.name}`, `#${preset.fighterB.name}`],
     });
   }
 }
